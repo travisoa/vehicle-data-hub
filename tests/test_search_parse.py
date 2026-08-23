@@ -41,6 +41,12 @@ def test_brand_class_name_is_not_a_series():
     assert hit.is_series is False
 
 
+def test_subjects_without_class_name_are_series():
+    data = _subjects_response([{"id": "5678", "subject_s_name": "某车系"}])
+    (hit,) = parse_series_hits(data)
+    assert (hit.series_id, hit.name, hit.is_series) == ("5678", "某车系", True)
+
+
 def test_names_shorter_than_ids_leaves_name_empty():
     data = _subjects_response([{"id": "1,2", "class_name": "CarSeries", "subject_s_name": "只有一个"}])
     assert [(hit.series_id, hit.name) for hit in parse_series_hits(data)] == [
@@ -51,7 +57,8 @@ def test_names_shorter_than_ids_leaves_name_empty():
 
 def test_falls_back_to_queryintent_then_term():
     intent_only = {"simple_result": {"queryintent": [{"id": "-1"}, {"id": "555", "entityName": "某车系"}]}}
-    assert [(hit.series_id, hit.name) for hit in parse_series_hits(intent_only)] == [("555", "某车系")]
+    (hit,) = parse_series_hits(intent_only)
+    assert (hit.series_id, hit.name, hit.is_series) == ("555", "某车系", True)
 
     term_only = {"qp_result": {"term": [{"id": 7927, "entityName": "示例车型S1", "ruleType": 4}]}}
     (hit,) = parse_series_hits(term_only)
@@ -93,7 +100,63 @@ def test_search_series_rejects_brand_only_result(monkeypatch):
         search_series("示例品牌")
 
 
-def test_searcher_ranks_non_series_candidates_last():
+def test_queryintent_ruletype_marks_series():
+    data = {"simple_result": {"queryintent": [{"id": "555", "entityName": "某车系", "ruleType": 4}]}}
+    assert parse_series_hits(data)[0].is_series is True
+
+
+def test_queryintent_brand_class_name_is_not_a_series():
+    data = {"simple_result": {"queryintent": [{"id": "609", "entityName": "某品牌", "class_name": "Brand"}]}}
+    assert parse_series_hits(data)[0].is_series is False
+
+
+def test_searcher_keeps_untyped_queryintent(monkeypatch):
+    data = {"simple_result": {"queryintent": [{"id": "5678", "entityName": "某车系"}]}}
+
+    class _Response:
+        @staticmethod
+        def json() -> dict:
+            return data
+
+    class _HttpClient:
+        @staticmethod
+        def get_response(*args, **kwargs) -> _Response:
+            return _Response()
+
+    class _Logger:
+        @staticmethod
+        def warning(*args, **kwargs):
+            return None
+
+    searcher = AutohomeSearcher(_HttpClient(), logger=_Logger())
+    candidates = searcher.search("某车系")
+    assert [candidate.series_id for candidate in candidates] == ["5678"]
+
+
+def test_searcher_keeps_untyped_subjects():
+    data = _subjects_response([{"id": "5678", "subject_s_name": "某车系"}])
+
+    class _Response:
+        @staticmethod
+        def json() -> dict:
+            return data
+
+    class _HttpClient:
+        @staticmethod
+        def get_response(*args, **kwargs) -> _Response:
+            return _Response()
+
+    class _Logger:
+        @staticmethod
+        def warning(*args, **kwargs):
+            return None
+
+    searcher = AutohomeSearcher(_HttpClient(), logger=_Logger())
+    candidates = searcher.search("某车系")
+    assert [candidate.series_id for candidate in candidates] == ["5678"]
+
+
+def test_searcher_skips_non_series_candidates():
     data = _subjects_response(
         [
             {"id": "609", "class_name": "Brand", "subject_s_name": "EXB 示例品牌"},
@@ -111,6 +174,11 @@ def test_searcher_ranks_non_series_candidates_last():
         def get_response(*args, **kwargs) -> _Response:
             return _Response()
 
-    searcher = AutohomeSearcher(_HttpClient(), logger=None)
+    class _Logger:
+        @staticmethod
+        def warning(*args, **kwargs):
+            return None
+
+    searcher = AutohomeSearcher(_HttpClient(), logger=_Logger())
     candidates = searcher.search("示例品牌")
-    assert [candidate.series_id for candidate in candidates] == ["5678", "609"]
+    assert [candidate.series_id for candidate in candidates] == ["5678"]

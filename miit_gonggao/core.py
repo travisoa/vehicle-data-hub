@@ -74,11 +74,21 @@ def find_mapping(vehicle: str | None, mappings: list[QueryProfile]) -> QueryProf
         keys = [item.name, *item.aliases]
         if any(normalize_key(key) == needle for key in keys):
             return item
+    # 子串模糊匹配按键长度取最长，避免短名（D9/M9）绑到先出现的无关档案
+    fuzzy: list[tuple[int, QueryProfile]] = []
     for item in mappings:
         keys = [item.name, *item.aliases]
-        if any(needle in normalize_key(key) or normalize_key(key) in needle for key in keys):
-            return item
-    return None
+        overlap = [
+            len(normalized)
+            for key in keys
+            if (normalized := normalize_key(key)) and (needle in normalized or normalized in needle)
+        ]
+        if overlap:
+            fuzzy.append((max(overlap), item))
+    if not fuzzy:
+        return None
+    fuzzy.sort(key=lambda item: -item[0])
+    return fuzzy[0][1]
 
 
 def parse_key_value_pairs(values: list[str] | None, option_name: str) -> dict[str, str]:
@@ -218,8 +228,39 @@ def random_validate_token(length: int = 65) -> str:
 
 
 def safe_part(value: str) -> str:
-    value = re.sub(r"[\\/:*?\"<>|\s]+", "_", value.strip())
-    return value.strip("_") or "unknown"
+    value = re.sub(r"[\\/:*?\"<>|\s]+", "_", str(value).strip())
+    value = value.strip("._")
+    if not value or value in {".", ".."}:
+        return "unknown"
+    return value
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("必须是 >= 1 的整数")
+    return parsed
+
+
+def is_pdf_bytes(content: bytes) -> bool:
+    """只认 %PDF 魔数；Content-Type 不能当依据（验证页也可能标 application/pdf）。"""
+    return content.startswith(b"%PDF")
+
+
+# 下载类命令的退出码：区分「一份 PDF 都没拿到」和「拿到了但有条目需人工检查」，
+# 让 main.py fetch 不把常见的部分非 PDF 当成整车型失败。
+EXIT_OK = 0
+EXIT_DOWNLOAD_FAILED = 1
+EXIT_DOWNLOAD_PARTIAL = 2
+
+
+def download_exit_code(*, ok_pdf_count: int, problem_count: int) -> int:
+    """0=全部成功；1=全失败（没有任何 PDF）；2=部分成功（有 PDF，但有失败或非 PDF）。"""
+    if problem_count <= 0:
+        return EXIT_OK
+    if ok_pdf_count <= 0:
+        return EXIT_DOWNLOAD_FAILED
+    return EXIT_DOWNLOAD_PARTIAL
 
 
 def save_workbook_atomic(workbook: Any, out_path: Path) -> None:
@@ -338,7 +379,7 @@ def download_param_page(row: dict[str, Any], output_dir: Path) -> tuple[Path, bo
         "gid": row.get("cpid") or row.get("gid", ""),
         "pc": str(row.get("gppc") or row.get("pc") or ""),
     }
-    content, headers = post_form(PDF_URL, payload)
+    content, _headers = post_form(PDF_URL, payload)
     stem = "_".join(
         safe_part(str(part))
         for part in [
@@ -349,7 +390,7 @@ def download_param_page(row: dict[str, Any], output_dir: Path) -> tuple[Path, bo
         ]
         if part
     )
-    is_pdf = content.startswith(b"%PDF") or "application/pdf" in headers.get("content-type", "")
+    is_pdf = is_pdf_bytes(content)
     suffix = ".pdf" if is_pdf else ".html"
     path = output_dir / f"{stem}{suffix}"
     path.write_bytes(content)
@@ -376,7 +417,7 @@ def download_detail_html(row: dict[str, Any], output_dir: Path) -> Path:
 
 
 def print_rows(rows: list[dict[str, Any]], limit: int | None = None) -> None:
-    shown = rows[:limit] if limit else rows
+    shown = rows[:limit] if limit is not None else rows
     if not shown:
         print("未查询到公告产品。")
         return
@@ -442,9 +483,13 @@ def command_query(args: argparse.Namespace) -> int:
     filters = dict(mapping.filters if mapping else {})
     company = args.company or filters.get("qymc", "")
     model_code = args.model_code or filters.get("clxh", "")
-    if not trademark and not model_code and not company:
+    profile_prefixes = [
+        *(mapping.model_prefixes if mapping else []),
+        *(args.model_prefix or []),
+    ]
+    if not trademark and not model_code and not company and not profile_prefixes:
         raise SystemExit(
-            "未能确定查询条件；请提供 --trademark / --model-code / --company 之一，"
+            "未能确定查询条件；请提供 --trademark / --model-code / --company / --model-prefix 之一，"
             "或先用 jianmian search 从减免税目录反查车辆型号"
         )
     vehicle_name = args.vehicle_name or filters.get("clmc", "")
@@ -459,11 +504,6 @@ def command_query(args: argparse.Namespace) -> int:
         "pc": args.pc or "",
     }
     row_filters = parse_key_value_pairs(args.row_filter, "--row-filter")
-
-    profile_prefixes = [
-        *(mapping.model_prefixes if mapping else []),
-        *(args.model_prefix or []),
-    ]
     if args.all_pages or args.download:
         rows = query_all_pages(
             trademark=trademark,
@@ -528,7 +568,10 @@ def command_query(args: argparse.Namespace) -> int:
     print(f"查询结果: {snapshot}")
 
     if args.download:
-        selected = rows[: args.limit] if args.limit else rows
+        selected = rows[: args.limit] if args.limit is not None else rows
+        if not selected:
+            print("查询结果为空，没有可下载的公告。", file=sys.stderr)
+            return 1
         manifest_entries: list[dict[str, Any]] = []
         download_dir = output_dir
         if not args.flat_output:
@@ -541,13 +584,14 @@ def command_query(args: argparse.Namespace) -> int:
                 vehicle_name=vehicle_name,
             )
         print(f"下载目录: {download_dir}")
-        failed: list[str] = []
+        errors: list[str] = []
+        non_pdf: list[str] = []
         for row in selected:
             label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
             try:
                 path, is_pdf, byte_count = download_param_page(row, download_dir)
             except Exception as exc:  # 单条下载失败不中断整批
-                failed.append(label)
+                errors.append(label)
                 print(f"下载失败，跳过: {label} ({exc})", file=sys.stderr)
                 continue
             manifest_entries.append(
@@ -566,13 +610,37 @@ def command_query(args: argparse.Namespace) -> int:
                 }
             )
             print(f"已下载: {path}")
+            if not is_pdf:
+                non_pdf.append(label)
+                print(f"下载内容不是 PDF，已存为 HTML: {path}", file=sys.stderr)
             if args.detail_html:
-                detail_path = download_detail_html(row, download_dir)
-                print(f"已保存详情: {detail_path}")
+                try:
+                    detail_path = download_detail_html(row, download_dir)
+                    print(f"已保存详情: {detail_path}")
+                except Exception as exc:  # 详情失败不影响已下载的参数页
+                    print(f"详情页保存失败，跳过: {label} ({exc})", file=sys.stderr)
         manifest_path = write_download_manifest(manifest_entries, output_dir)
         print(f"下载索引: {manifest_path}")
-        if failed:
-            print(f"以下 {len(failed)} 条下载失败: {'; '.join(failed)}", file=sys.stderr)
+        if errors:
+            print(f"以下 {len(errors)} 条下载失败: {'; '.join(errors)}", file=sys.stderr)
+        if non_pdf:
+            print(
+                f"以下 {len(non_pdf)} 条返回的不是 PDF，已存为 HTML 供人工检查: {'; '.join(non_pdf)}",
+                file=sys.stderr,
+            )
+        ok_pdf_count = sum(1 for entry in manifest_entries if entry.get("ok_pdf"))
+        code = download_exit_code(
+            ok_pdf_count=ok_pdf_count, problem_count=len(errors) + len(non_pdf)
+        )
+        if code == EXIT_DOWNLOAD_FAILED:
+            print("没有成功下载任何 PDF。", file=sys.stderr)
+        elif code == EXIT_DOWNLOAD_PARTIAL:
+            print(
+                f"部分成功：已下载 {ok_pdf_count} 份 PDF，"
+                f"另有 {len(errors) + len(non_pdf)} 条需人工检查。",
+                file=sys.stderr,
+            )
+        return code
     return 0
 
 
@@ -615,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--detail-html", action="store_true", help="同时保存主要技术参数 HTML")
     query_parser.add_argument("--vehicle-folder", help="下载时使用的车型目录名；默认按查询配置或查询条件自动生成")
     query_parser.add_argument("--flat-output", action="store_true", help="下载文件直接保存到输出目录根目录，兼容旧版平铺结构")
-    query_parser.add_argument("--limit", type=int, help="限制展示或下载条数")
+    query_parser.add_argument("--limit", type=positive_int, help="限制展示或下载条数")
     query_parser.add_argument("--output-dir", default=os.fspath(DEFAULT_OUTPUT_DIR), help="输出目录")
     query_parser.set_defaults(func=command_query)
 

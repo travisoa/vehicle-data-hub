@@ -161,6 +161,16 @@ def _model_token(name: str) -> str:
     return token.lower() if len(token) >= 2 else ""
 
 
+def _name_has_model_token(name: str, token: str) -> bool:
+    """数字型号要求完整段匹配，避免 009 命中 1009；字母型号仍用子串。"""
+    token = token.lower()
+    if not token or not name:
+        return False
+    if token.isdigit():
+        return bool(re.search(rf"(^|[^0-9]){re.escape(token)}([^0-9]|$)", name))
+    return token in name
+
+
 def match_sales(sales_rows: list[dict[str, Any]], series_name: str) -> dict[str, Any] | None:
     """在销量榜中按车系名匹配（忽略空格大小写），并支持中英文型号标识的跨语言兜底。"""
 
@@ -178,7 +188,11 @@ def match_sales(sales_rows: list[dict[str, Any]], series_name: str) -> dict[str,
     # 跨语言兜底：按型号标识匹配（中文品牌009 ↔ LATIN 009），仅当唯一命中才采用以避免误配
     token = _model_token(series_name)
     if token:
-        hits = [row for row in sales_rows if token in norm(row.get("series_name", ""))]
+        hits = [
+            row
+            for row in sales_rows
+            if _name_has_model_token(norm(row.get("series_name", "")), token)
+        ]
         if len(hits) == 1:
             return hits[0]
     return None

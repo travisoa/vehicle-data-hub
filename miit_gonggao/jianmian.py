@@ -28,6 +28,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urljoin
+
 from miit_gonggao import core
 
 EIDC_BASE = "https://www.miit-eidc.org.cn"
@@ -161,7 +163,7 @@ def list_articles(max_pages: int = 10, page_size: int = 25) -> list[CatalogArtic
             articles.append(
                 CatalogArticle(
                     art_id=art_id,
-                    url=href,
+                    url=href if href.startswith("http") else urljoin(EIDC_BASE, href),
                     title=title,
                     pub_date="-".join(date_match.groups()) if date_match else "",
                 )
@@ -259,16 +261,32 @@ def peek_catalog_info_docx(docx_path: Path) -> tuple[str, str]:
     return probe.catalog, probe.batch
 
 
+def safe_cache_child(folder: Path, name: str) -> Path | None:
+    """只允许落在 folder 内的单层文件名，拒绝 ../ 与绝对路径。"""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        return None
+    folder = folder.resolve()
+    path = (folder / name).resolve()
+    try:
+        path.relative_to(folder)
+    except ValueError:
+        return None
+    return path
+
+
 def rename_attachment(doc_path: Path, url_name: str, stem: str) -> Path:
     """按给定主干重命名附件及其派生缓存(.html/.lo.docx/.word.docx)，并登记 manifest。"""
-    if not stem or doc_path.stem == stem or re.fullmatch(re.escape(stem) + r"_\d+", doc_path.stem):
+    stem = core.safe_part(stem)
+    if stem == "unknown" or doc_path.stem == stem or re.fullmatch(re.escape(stem) + r"_\d+", doc_path.stem):
         return doc_path
     folder = doc_path.parent
     target_stem, index = stem, 1
     while (folder / f"{target_stem}{doc_path.suffix}").exists():
         index += 1
         target_stem = f"{stem}_{index}"
-    new_doc = folder / f"{target_stem}{doc_path.suffix}"
+    new_doc = safe_cache_child(folder, f"{target_stem}{doc_path.suffix}")
+    if new_doc is None:
+        return doc_path
     doc_path.rename(new_doc)
     for suffix in DERIVED_SUFFIXES:
         derived = doc_path.with_suffix(suffix)
@@ -297,20 +315,34 @@ def article_folder(article: CatalogArticle, cache_dir: Path) -> Path:
     return preferred
 
 
-def download_attachment(url: str, article: CatalogArticle, cache_dir: Path) -> Path:
+def invalidate_derived_caches(doc_path: Path) -> None:
+    for suffix in DERIVED_SUFFIXES:
+        derived = doc_path.with_suffix(suffix)
+        if derived.exists():
+            derived.unlink()
+
+
+def download_attachment(
+    url: str, article: CatalogArticle, cache_dir: Path, *, force: bool = False
+) -> Path:
     folder = article_folder(article, cache_dir)
-    url_name = url.rsplit("/", 1)[-1]
+    url_name = Path(url.rsplit("/", 1)[-1]).name
     mapped = load_attachment_manifest(folder).get(url_name)
-    if mapped:
-        mapped_path = folder / mapped
-        if mapped_path.exists() and mapped_path.stat().st_size > 1024:
-            return mapped_path
-    path = folder / url_name
-    if path.exists() and path.stat().st_size > 1024:
+    mapped_path = safe_cache_child(folder, mapped) if mapped else None
+    if mapped_path and mapped_path.exists() and mapped_path.stat().st_size > 1024 and not force:
+        return mapped_path
+    path = safe_cache_child(folder, url_name)
+    if path is None:
+        raise ValueError(f"非法附件文件名: {url_name!r}")
+    if path.exists() and path.stat().st_size > 1024 and not force:
         return path
+    target = mapped_path if (force and mapped_path) else path
+    if force:
+        invalidate_derived_caches(target)
     content = http_get(url, referer=article.url, timeout=180)
-    path.write_bytes(content)
-    return path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
 
 
 # .doc -> .docx 转换器：优先 LibreOffice（headless 无窗口），失败/超时回退本机 Word；
@@ -360,13 +392,19 @@ def doc_to_docx_via_soffice(doc_path: Path) -> Path | None:
     return docx_path
 
 
-def convert_doc_to_docx(doc_path: Path) -> Path | None:
+def convert_doc_to_docx(doc_path: Path, *, force: bool = False) -> Path | None:
     """统一入口：已有缓存(.lo.docx/.word.docx)直接复用；否则 LibreOffice 优先，
-    转换失败/超时再回退本机 Word。"""
-    for suffix in (".lo.docx", ".word.docx"):
-        cached = doc_path.with_suffix(suffix)
-        if cached.exists() and cached.stat().st_size > 0:
-            return cached
+    转换失败/超时再回退本机 Word。`--force` 时删除派生缓存再转。"""
+    if force:
+        for suffix in (".lo.docx", ".word.docx"):
+            cached = doc_path.with_suffix(suffix)
+            if cached.exists():
+                cached.unlink()
+    else:
+        for suffix in (".lo.docx", ".word.docx"):
+            cached = doc_path.with_suffix(suffix)
+            if cached.exists() and cached.stat().st_size > 0:
+                return cached
     converted = doc_to_docx_via_soffice(doc_path)
     if converted:
         return converted
@@ -501,10 +539,12 @@ def parse_catalog_docx(docx_path: Path) -> tuple[str, str, list[dict[str, Any]]]
     return ctx.catalog, ctx.batch, rows
 
 
-def doc_to_html(doc_path: Path) -> Path | None:
+def doc_to_html(doc_path: Path, *, force: bool = False) -> Path | None:
     """textutil(.doc -> .html)，结果缓存在附件旁边。仅 macOS。"""
     html_path = doc_path.with_suffix(".html")
-    if html_path.exists() and html_path.stat().st_size > 0:
+    if force and html_path.exists():
+        html_path.unlink()
+    elif html_path.exists() and html_path.stat().st_size > 0:
         return html_path
     if not shutil.which("textutil"):
         raise SystemExit("缺少 textutil（macOS 自带）；其他平台请先人工转换 .doc 为 .html")
@@ -695,6 +735,34 @@ def peek_catalog_title(html_path: Path) -> str:
     return peek_catalog_info(html_path)[0]
 
 
+def is_non_catalog_peek(catalog_hint: str) -> bool:
+    """仅在嗅探到明确非目录信号时跳过；空嗅探必须继续走完整解析。
+
+    「目录」= 公告附件自带目录页的退化标题；「推荐」= 2020~2022 推荐车型目录（不入库）。
+    """
+    hint = (catalog_hint or "").strip()
+    if not hint:
+        return False
+    return hint == "目录" or "推荐" in hint
+
+
+def looks_like_failed_catalog(
+    *, catalog: str, catalog_hint: str, converted: bool = True
+) -> bool:
+    """全文解析 0 行后是否按目录解析失败处理。
+
+    `converted` 指 .docx 精确解析这条可信路径是否跑成功。它失败时无从判断附件是不是
+    目录——textutil 压平文本的启发式提取不到标题并不能证明「不是目录」，此时必须标
+    zero_rows 以便下次重试，宁可重试也不要静默漏掉一个批次。
+    """
+    if not converted:
+        return True
+    if catalog.strip():
+        return True
+    hint = (catalog_hint or "").strip()
+    return bool(hint) and not is_non_catalog_peek(hint)
+
+
 def parse_catalog_html(html_path: Path) -> tuple[str, str, list[dict[str, Any]]]:
     """解析转换后的 HTML，返回 (目录名, 目录批次, 行列表)。
 
@@ -837,38 +905,119 @@ def store_article(
     status: str = "ok",
     error: str = "",
 ) -> int:
-    conn.execute("DELETE FROM catalog_rows WHERE art_id = ?", (article.art_id,))
-    count = 0
-    for attachment, rows in parsed:
-        for row in rows:
-            extra_payload = {"raw_cells": row.get("raw_cells", [])}
-            extra_payload.update(row.get("extra", {}))
-            values = [
-                article.art_id, attachment,
-                row.get("catalog", ""), row.get("batch", ""), row.get("part", ""),
-                row.get("energy_type", ""), row.get("category", ""),
-                row.get("seq", ""), row.get("company", ""), row.get("trademark", ""),
-                row.get("model_code", ""), row.get("common_name", ""), row.get("product_name", ""),
-                row.get("range_km", ""), row.get("fuel_consumption", ""), row.get("displacement_ml", ""),
-                row.get("curb_mass", ""), row.get("battery_mass", ""), row.get("battery_energy", ""),
-                row.get("remark", ""), json.dumps(extra_payload, ensure_ascii=False),
-            ]
-            conn.execute(
-                f"INSERT INTO catalog_rows ({', '.join(ROW_COLUMNS)}) "
-                f"VALUES ({', '.join('?' * len(ROW_COLUMNS))})",
-                values,
-            )
-            count += 1
-    conn.execute(
-        "INSERT OR REPLACE INTO articles (art_id, url, title, pub_date, fetched_at, status, error, row_count) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            article.art_id, article.url, article.title, article.pub_date,
-            time.strftime("%Y-%m-%d %H:%M:%S"), status, error, count,
-        ),
+    try:
+        conn.execute("DELETE FROM catalog_rows WHERE art_id = ?", (article.art_id,))
+        count = 0
+        for attachment, rows in parsed:
+            for row in rows:
+                extra_payload = {"raw_cells": row.get("raw_cells", [])}
+                extra_payload.update(row.get("extra") or {})
+                values = [
+                    article.art_id, attachment,
+                    row.get("catalog", ""), row.get("batch", ""), row.get("part", ""),
+                    row.get("energy_type", ""), row.get("category", ""),
+                    row.get("seq", ""), row.get("company", ""), row.get("trademark", ""),
+                    row.get("model_code", ""), row.get("common_name", ""), row.get("product_name", ""),
+                    row.get("range_km", ""), row.get("fuel_consumption", ""), row.get("displacement_ml", ""),
+                    row.get("curb_mass", ""), row.get("battery_mass", ""), row.get("battery_energy", ""),
+                    row.get("remark", ""), json.dumps(extra_payload, ensure_ascii=False),
+                ]
+                conn.execute(
+                    f"INSERT INTO catalog_rows ({', '.join(ROW_COLUMNS)}) "
+                    f"VALUES ({', '.join('?' * len(ROW_COLUMNS))})",
+                    values,
+                )
+                count += 1
+        conn.execute(
+            "INSERT OR REPLACE INTO articles (art_id, url, title, pub_date, fetched_at, status, error, row_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                article.art_id, article.url, article.title, article.pub_date,
+                time.strftime("%Y-%m-%d %H:%M:%S"), status, error, count,
+            ),
+        )
+        conn.commit()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def load_existing_parsed(
+    conn: sqlite3.Connection, art_id: str
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    cursor = conn.execute(
+        f"SELECT {', '.join(ROW_COLUMNS)} FROM catalog_rows WHERE art_id = ?",
+        (art_id,),
     )
-    conn.commit()
-    return count
+    for values in cursor:
+        row = dict(zip(ROW_COLUMNS, values))
+        attachment = row.pop("attachment", "") or ""
+        row.pop("art_id", None)
+        extra_raw = row.get("extra") or "{}"
+        try:
+            extra = json.loads(extra_raw) if isinstance(extra_raw, str) else dict(extra_raw)
+        except json.JSONDecodeError:
+            extra = {}
+        raw_cells = extra.pop("raw_cells", []) if isinstance(extra, dict) else []
+        row["raw_cells"] = raw_cells
+        row["extra"] = extra if isinstance(extra, dict) else {}
+        grouped.setdefault(attachment, []).append(row)
+    return list(grouped.items())
+
+
+def merge_parsed_with_existing(
+    conn: sqlite3.Connection,
+    art_id: str,
+    parsed: list[tuple[str, list[dict[str, Any]]]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    existing = dict(load_existing_parsed(conn, art_id))
+    merged: list[tuple[str, list[dict[str, Any]]]] = []
+    seen: set[str] = set()
+    for attachment, rows in parsed:
+        merged.append((attachment, rows))
+        seen.add(attachment)
+    for attachment, rows in existing.items():
+        if attachment not in seen:
+            merged.append((attachment, rows))
+    return merged
+
+
+def finalize_article_sync(
+    conn: sqlite3.Connection,
+    article: CatalogArticle,
+    parsed: list[tuple[str, list[dict[str, Any]]]],
+    zero_attachments: list[str],
+) -> tuple[int, str]:
+    """根据本轮解析结果写入库并返回 (行数, ok|zero|skipped)。"""
+    existing_count = conn.execute(
+        "SELECT COUNT(*) FROM catalog_rows WHERE art_id = ?", (article.art_id,)
+    ).fetchone()[0]
+    if zero_attachments:
+        error = f"附件解析0行: {', '.join(zero_attachments)}"
+        if parsed:
+            merged = merge_parsed_with_existing(conn, article.art_id, parsed)
+            count = store_article(conn, article, merged, status="zero_rows", error=error)
+            print(
+                f"  [警告] 本次解析不完整，已写入成功附件并保留其余旧行（共 {count} 行）",
+                file=sys.stderr,
+            )
+            return count, "zero"
+        if existing_count:
+            mark_article(conn, article, status="zero_rows", error=error)
+            print(
+                f"  [警告] 本次解析不完整，保留库内已有 {existing_count} 行不覆盖",
+                file=sys.stderr,
+            )
+            return existing_count, "zero"
+        count = store_article(conn, article, [], status="zero_rows", error=error)
+        return count, "zero"
+    if parsed:
+        return store_article(conn, article, parsed), "ok"
+    # 全部是明确的非目录附件：记 ok 以免每周重试，但不假装解析过目录
+    mark_article(conn, article, status="ok", error="无目录附件")
+    return 0, "skipped"
 
 
 def mark_article(conn: sqlite3.Connection, article: CatalogArticle, *, status: str, error: str = "") -> None:
@@ -914,74 +1063,70 @@ def command_sync(args: argparse.Namespace) -> int:
             parsed: list[tuple[str, list[dict[str, Any]]]] = []
             zero_attachments: list[str] = []
             for url in article_attachments(article):
-                doc_path = download_attachment(url, article, cache_dir)
+                url_name = Path(url.rsplit("/", 1)[-1]).name
+                try:
+                    doc_path = download_attachment(url, article, cache_dir, force=args.force)
+                except ValueError as exc:
+                    print(f"  跳过非法附件名: {exc}", file=sys.stderr)
+                    continue
                 if doc_path.suffix.lower() not in (".doc", ".docx"):
                     print(f"  跳过暂不支持的附件: {doc_path.name}", file=sys.stderr)
                     continue
-                url_name = url.rsplit("/", 1)[-1]
-                # 先用 textutil 廉价嗅探：非目录附件(公告附件1等)与推荐目录跳过入库，
-                # 但仍按 公告第N批附件 / 推荐目录 命名
-                html_path = doc_to_html(doc_path)
+                # 先用 textutil 廉价嗅探：仅明确的非目录附件(公告附件/推荐目录)跳过入库
+                html_path = doc_to_html(doc_path, force=args.force)
+                catalog_hint, batch_hint = "", ""
                 if html_path:
                     catalog_hint, batch_hint = peek_catalog_info(html_path)
-                    # 公告附件自带目录页，嗅探常退化成"目录"二字，同样视为非目录附件
-                    if not catalog_hint or catalog_hint == "目录" or "推荐" in catalog_hint:
+                    if is_non_catalog_peek(catalog_hint):
                         stem = friendly_attachment_stem(catalog_hint, batch_hint) or stem_from_article_title(
                             catalog_hint, article.title
                         )
                         rename_attachment(doc_path, url_name, stem)
                         continue
-                # 目录附件优先走 Word 转 docx 按真实表格精确解析；
-                # 无 Word 环境时退回 textutil 压平文本的启发式重建
+                # 空嗅探也继续解析，避免标题靠后的真目录被永久标成 ok/0 行
                 catalog, batch, rows = "", "", []
-                docx_path = convert_doc_to_docx(doc_path)
+                docx_path = convert_doc_to_docx(doc_path, force=args.force)
                 if docx_path:
                     catalog, batch, rows = parse_catalog_docx(docx_path)
                 if not rows and html_path:
                     catalog, batch, rows = parse_catalog_html(html_path)
                 if rows:
-                    # 解析成功后用权威的目录/批次重命名，入库 attachment 字段使用新名
                     doc_path = rename_attachment(
                         doc_path, url_name, friendly_attachment_stem(catalog, batch)
                     )
                     print(f"  {doc_path.name}: {catalog}（第{batch}批）{len(rows)} 行")
                     parsed.append((doc_path.name, rows))
-                else:
+                elif looks_like_failed_catalog(
+                    catalog=catalog,
+                    catalog_hint=catalog_hint,
+                    converted=bool(docx_path),
+                ):
                     zero_attachments.append(doc_path.name)
                     print(
-                        f"  [警告] {doc_path.name}: {catalog or '目录附件'} 解析到 0 行，"
-                        "本篇标记为 zero_rows，下次 sync 默认重试",
-                        file=sys.stderr,
-                    )
-            if zero_attachments:
-                error = f"附件解析0行: {', '.join(zero_attachments)}"
-                existing_rows = conn.execute(
-                    "SELECT COUNT(*) FROM catalog_rows WHERE art_id = ?", (article.art_id,)
-                ).fetchone()[0]
-                if existing_rows:
-                    # 该文章历史上解析成功过，本次却有附件出 0 行（多半是转换器偶发失败）：
-                    # 保留旧行、只标状态，避免一次偶发把已入库的正确数据清掉
-                    mark_article(conn, article, status="zero_rows", error=error)
-                    count = existing_rows
-                    print(
-                        f"  [警告] 本次解析不完整，保留库内已有 {existing_rows} 行不覆盖",
+                        f"  [警告] {doc_path.name}: {catalog or catalog_hint or '目录附件'} 解析到 0 行，"
+                        "本篇标记为 zero_rows，下次 sync 默认重试"
+                        + ("（.docx 转换未成功，建议安装 LibreOffice 后重试）" if not docx_path else ""),
                         file=sys.stderr,
                     )
                 else:
-                    count = store_article(
-                        conn,
-                        article,
-                        parsed,
-                        status="zero_rows",
-                        error=error,
-                    )
+                    # 全文解析后仍无目录标题：按非目录附件跳过，不把整篇钉在 zero_rows
+                    stem = stem_from_article_title(catalog_hint, article.title)
+                    rename_attachment(doc_path, url_name, stem)
+                    print(f"  跳过非目录附件: {doc_path.name}", file=sys.stderr)
+            count, outcome = finalize_article_sync(conn, article, parsed, zero_attachments)
+            if outcome == "ok":
+                synced += 1
+            elif outcome == "zero":
                 zero += 1
             else:
-                count = store_article(conn, article, parsed)
-                synced += 1
+                skipped += 1
             print(f"  入库 {count} 行")
         except Exception as exc:  # noqa: BLE001
             failed += 1
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             mark_article(conn, article, status="error", error=str(exc))
             print(f"  [失败] {exc}", file=sys.stderr)
     total = conn.execute("SELECT COUNT(*) FROM catalog_rows").fetchone()[0]
@@ -1055,18 +1200,54 @@ def command_search(args: argparse.Namespace) -> int:
     if not resolved:
         print("公告接口未返回匹配产品。")
         return 1
+    if getattr(args, "latest_batch", False) and not getattr(args, "all_batches", False):
+        resolved = core.filter_latest_batch(resolved)
     print("\n公告产品:")
     core.print_rows(resolved)
     trademarks = sorted({row.get("cpsb", "") for row in resolved if row.get("cpsb")})
     print(f"公告商标: {', '.join(trademarks)}")
+    if getattr(args, "latest_batch", False) and resolved:
+        print(f"最新批次: {resolved[0].get('gppc') or resolved[0].get('pc')}")
 
     if args.download:
         base_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else core.DEFAULT_OUTPUT_DIR
         folder = base_dir / core.safe_part(args.keyword)
         print(f"下载目录: {folder}")
+        errors: list[str] = []
+        non_pdf: list[str] = []
+        ok_pdf_count = 0
         for row in resolved:
-            path, is_pdf, _ = core.download_param_page(row, folder)
+            label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
+            try:
+                path, is_pdf, _ = core.download_param_page(row, folder)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(label)
+                print(f"下载失败，跳过: {label} ({exc})", file=sys.stderr)
+                continue
             print(f"已下载: {path}{'' if is_pdf else ' (非PDF，需人工检查)'}")
+            if is_pdf:
+                ok_pdf_count += 1
+            else:
+                non_pdf.append(label)
+        if errors:
+            print(f"以下 {len(errors)} 条下载失败: {'; '.join(errors)}", file=sys.stderr)
+        if non_pdf:
+            print(
+                f"以下 {len(non_pdf)} 条返回的不是 PDF，已存为 HTML 供人工检查: {'; '.join(non_pdf)}",
+                file=sys.stderr,
+            )
+        code = core.download_exit_code(
+            ok_pdf_count=ok_pdf_count, problem_count=len(errors) + len(non_pdf)
+        )
+        if code == core.EXIT_DOWNLOAD_FAILED:
+            print("没有成功下载任何 PDF。", file=sys.stderr)
+        elif code == core.EXIT_DOWNLOAD_PARTIAL:
+            print(
+                f"部分成功：已下载 {ok_pdf_count} 份 PDF，"
+                f"另有 {len(errors) + len(non_pdf)} 条需人工检查。",
+                file=sys.stderr,
+            )
+        return code
     return 0
 
 
@@ -1232,7 +1413,7 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     sync_parser = jm_sub.add_parser("sync", help="抓取目录文章附件并解析入库")
     sync_parser.add_argument("--max-pages", type=int, default=10, help="文章列表最多翻页数，默认 10（每页 25 篇）")
     sync_parser.add_argument("--max-articles", type=int, help="最多处理的目录文章数（新→旧）")
-    sync_parser.add_argument("--force", action="store_true", help="已入库文章也重新下载解析")
+    sync_parser.add_argument("--force", action="store_true", help="已入库文章也重新下载并作废转换缓存后解析")
     sync_parser.add_argument("--cache-dir", help=f"附件缓存目录，默认 {CACHE_DIR}")
     sync_parser.add_argument("--db", help=f"SQLite 路径，默认 {DB_PATH}")
     sync_parser.set_defaults(func=command_sync)
@@ -1241,7 +1422,9 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     search_parser.add_argument("keyword", help="检索词，例如 <市场名>")
     search_parser.add_argument("--resolve", action="store_true", help="用公告接口按型号反查商标与批次")
     search_parser.add_argument("--download", action="store_true", help="反查后下载公告参数页 PDF（隐含 --resolve）")
-    search_parser.add_argument("--limit", type=int, help="限制展示条数")
+    search_parser.add_argument("--latest-batch", action="store_true", help="--resolve/--download 时只保留最高公告批次")
+    search_parser.add_argument("--all-batches", action="store_true", help="下载全部历史批次（覆盖 --latest-batch）")
+    search_parser.add_argument("--limit", type=core.positive_int, help="限制展示条数")
     search_parser.add_argument("--output-dir", help=f"--download 时的下载根目录，默认 {core.DEFAULT_OUTPUT_DIR}")
     search_parser.add_argument("--db", help=f"SQLite 路径，默认 {DB_PATH}")
     search_parser.set_defaults(func=command_search)

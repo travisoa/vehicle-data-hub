@@ -46,6 +46,16 @@ def build_search_params(model_name: str) -> dict[str, str]:
     return {"qptype": "1", "q": model_name}
 
 
+def _hit_is_series(item: dict) -> bool:
+    """有 class_name/ruleType 时按约定判断；缺字段视为车系，避免兜底层被整层丢掉。"""
+    class_name = str(item.get("class_name", "")).strip()
+    if class_name:
+        return class_name == "CarSeries"
+    if "ruleType" in item and item.get("ruleType") is not None:
+        return item.get("ruleType") == 4
+    return True
+
+
 def parse_series_hits(data: dict) -> list[SeriesHit]:
     """从搜索响应解析候选条目，按接口原始顺序去重。
 
@@ -63,7 +73,7 @@ def parse_series_hits(data: dict) -> list[SeriesHit]:
         raw_names = normalize_whitespace(str(subject.get("subject_s_name", "")))
         ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
         names = [item.strip() for item in raw_names.split(",") if item.strip()]
-        is_series = str(subject.get("class_name", "")).strip() == "CarSeries"
+        is_series = _hit_is_series(subject)
         for index, series_id in enumerate(ids):
             hits.append(
                 SeriesHit(
@@ -82,7 +92,7 @@ def parse_series_hits(data: dict) -> list[SeriesHit]:
                 SeriesHit(
                     series_id=intent_id,
                     name=normalize_whitespace(str(intent.get("entityName", ""))),
-                    is_series=True,
+                    is_series=_hit_is_series(intent),
                 )
             )
 
@@ -93,7 +103,7 @@ def parse_series_hits(data: dict) -> list[SeriesHit]:
             if not term_id or term_id == "-1" or not entity_name:
                 continue
             hits.append(
-                SeriesHit(series_id=term_id, name=entity_name, is_series=term.get("ruleType") == 4)
+                SeriesHit(series_id=term_id, name=entity_name, is_series=_hit_is_series(term))
             )
 
     seen: set[str] = set()
@@ -134,13 +144,12 @@ class AutohomeSearcher:
 
         candidates: list[SearchCandidate] = []
         for rank, hit in enumerate(parse_series_hits(data), start=1):
+            if not hit.is_series:
+                continue
             title = hit.name or model_name
             score = 100 - rank
             if normalize_whitespace(title).lower() == normalize_whitespace(model_name).lower():
                 score += 20
-            # 品牌等非车系条目的详情页取不到配置，排到全部车系候选之后再尝试
-            if not hit.is_series:
-                score -= 50
 
             candidates.append(
                 SearchCandidate(

@@ -239,6 +239,10 @@ def test_match_sales_cross_language():
     ]
     assert match_sales(rows, "示例品牌009")["count"] == 1536  # 示例品牌009 ↔ LATINBRAND 009
     assert match_sales(rows, "示例品牌007")["count"] == 5335
+    # 数字型号按完整段匹配，009 不得命中 1009
+    colliding = [{"series_name": "LATIN 1009", "count": 99}]
+    assert match_sales(colliding, "示例品牌009") is None
+    assert match_sales(colliding, "示例品牌1009")["count"] == 99
     # 型号标识歧义（多命中）时不误配：全中文查询无 009/007 token 命中
     ambiguous = [{"series_name": "丙品牌M9", "count": 1}, {"series_name": "LATIN M9", "count": 2}]
     assert match_sales(ambiguous, "示例车型M9") is None  # M9 命中 2 条，非唯一 -> 不猜

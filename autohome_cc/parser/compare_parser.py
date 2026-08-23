@@ -242,8 +242,12 @@ def merge_compare_datasets(datasets: list[CompareDataset]) -> CompareDataset:
             key = (str(row["section"]), str(row["param"]))
             if key not in row_map:
                 row_map[key] = ["-"] * total_columns
-            for index, value in enumerate(row["values"]):
-                row_map[key][offset + index] = clean_compare_value(str(value))
+            values = list(row.get("values") or [])
+            width = len(dataset.models)
+            if len(values) < width:
+                values.extend(["-"] * (width - len(values)))
+            for index in range(min(width, total_columns - offset)):
+                row_map[key][offset + index] = clean_compare_value(str(values[index]))
 
         for row in dataset.color_rows:
             copied = dict(row)

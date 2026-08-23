@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -473,7 +474,13 @@ def _collect_pdfs(inputs: list[str], download_dir: Path) -> tuple[list[Path], st
             pdfs.extend(sorted(path.glob("*.pdf")))
             label = label or path.name
         elif (download_dir / item).is_dir():
-            pdfs.extend(sorted((download_dir / item).glob("*.pdf")))
+            candidate = (download_dir / item).resolve()
+            root = download_dir.expanduser().resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise SystemExit(f"拒绝读取下载目录之外的路径: {item}") from exc
+            pdfs.extend(sorted(candidate.glob("*.pdf")))
             label = label or item
         else:
             raise SystemExit(f"找不到 PDF 或目录: {item}（也不在 {download_dir} 下）")
@@ -545,12 +552,20 @@ def main(argv: list[str] | None = None) -> int:
 
     db_path = Path(args.db).expanduser() if args.db else DEFAULT_DB_PATH
     parsed_list: list[dict[str, str]] = []
+    failed_pdfs: list[str] = []
     for pdf in pdfs:
         print(f"解析 {pdf.name} ...")
-        fields = parse_gonggao_pdf(pdf)
+        try:
+            fields = parse_gonggao_pdf(pdf)
+        except Exception as exc:  # noqa: BLE001
+            failed_pdfs.append(pdf.name)
+            print(f"[失败] {pdf.name}: {exc}", file=sys.stderr)
+            continue
         if not args.no_catalog:
             fields.update({k: v for k, v in lookup_catalog(db_path, fields.get("model_code", "")).items() if v})
         parsed_list.append(fields)
+    if not parsed_list:
+        raise SystemExit("全部 PDF 解析失败。")
 
     if args.output:
         output_path = Path(args.output).expanduser()
@@ -563,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
 
     export_review_excel(parsed_list, output_path, title=args.title or label or None)
     print(f"已导出公告参数表（{len(parsed_list)} 个配置）: {output_path}")
+    if failed_pdfs:
+        print(f"以下 {len(failed_pdfs)} 个 PDF 解析失败已跳过: {'; '.join(failed_pdfs)}", file=sys.stderr)
     return 0
 
 

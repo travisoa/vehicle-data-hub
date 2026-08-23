@@ -274,10 +274,22 @@ CI 在 ubuntu 上执行离线单测，验证的即是这部分平台无关逻辑
 .venv/bin/python main.py report <本品> --vs <竞品1> <竞品2>
 ```
 
-`fetch` 的工信部查询默认仅保留**最新公告批次**（等价于 `gonggao query --latest-batch`），
+`fetch` 的工信部查询默认仅保留**最新公告批次**（档案命中走 `gonggao query --latest-batch`，
+未命中档案的减免目录反查同样带 `--latest-batch`），
 使用 `--all-batches` 保留全部批次。未命中档案的车型，工信部侧自动转为按市场名走减免税目录反查，
 成功后提示将建议的 `model_prefixes` 沉淀至档案。输出目录可按来源分别指定：
 `--autohome-output-dir`（Excel，默认 `output/`）与 `--gonggao-output-dir`（PDF，默认 `downloads/`）。
+
+`--download` 的退出码分三档，便于脚本区分「白跑一趟」和「拿到了但需人工检查」：
+
+| 退出码 | 含义 |
+| :---: | --- |
+| `0` | 全部成功，每条都是 PDF |
+| `1` | 全失败——一份 PDF 都没拿到（含查询结果为空） |
+| `2` | 部分成功——已拿到 PDF，另有条目下载失败或返回的不是 PDF |
+
+接口未返回 PDF 属预期情形（保留同名 `.html` 供人工检查），因此不会让整批算作失败。
+`main.py fetch` 据此把退出码 2 视为成功，仅在结尾单独列出「部分成功」的车型。
 
 ---
 
@@ -311,8 +323,8 @@ CI 在 ubuntu 上执行离线单测，验证的即是这部分平台无关逻辑
 `--latest-batch` 仅保留最高批次 / `--all-pages` 拉取全部分页 / `--download` 下载 PDF /
 `--detail-html` 同时保存技术参数 HTML / `--vehicle-folder` 指定下载目录名 / `--limit` 条数限制
 
-**`gonggao jianmian`**：`sync`（`--max-pages` / `--max-articles` / `--force` 重新解析）、
-`search <关键词>`（`--resolve` 经公告接口反查 / `--download` 反查后下载，隐含 `--resolve`）、
+**`gonggao jianmian`**：`sync`（`--max-pages` / `--max-articles` / `--force` 重新下载并作废转换缓存）、
+`search <关键词>`（`--resolve` 经公告接口反查 / `--download` 反查后下载，隐含 `--resolve` / `--latest-batch` 只下最高批次）、
 `export`（`--keyword` 过滤 / `--by-category` 分 6 类导出）、`rename`（存量附件按批次改名迁移）
 
 **`review`**：`-o` 输出路径 / `--title` 报表标题中的车型名 / `--db` 目录库路径 /
@@ -361,13 +373,14 @@ LibreOffice 转换失败或超时（默认 300s，数十 MB 的多目录合刊�
 购置税目录第 1~30 批已全量覆盖（历史附件均有 `.word.docx` 缓存，不会再触发转换）。
 
 `sync` 在 `articles` 表中记录每篇文章的 `status/error/row_count`：目录附件解析出 0 行标记为
-`zero_rows`，异常标记为 `error`，两者均不计为已同步，下次 `sync` 默认重试。解析异常，
-以及已入库文章重试时解析出 0 行，均不会清除该文章已入库的历史行。
+`zero_rows`，异常标记为 `error`，两者均不计为已同步，下次 `sync` 默认重试。解析异常会先回滚
+再标状态，避免半截 DELETE 清掉旧行；部分附件成功时写入成功附件并保留其余旧行。空嗅探先完整解析；`.docx` 精确转换失败时按 `zero_rows` 重试（仅 textutil html 不算已转出），docx 已转出但仍无目录标题的按非目录跳过。
+`--force` 会重新下载并删除 `.html` / `.lo.docx` / `.word.docx` 后再解析。
 
 附件文件与缓存目录按批次自动命名（原始 cms 哈希名与文章 ID 不具可读性）：目录形如
 `downloads/jianmian/12168_公告第404批/`，文件形如 `购置税目录第28批.doc`、`车船税目录第83批.doc`、
 `公告第404批附件.doc`、`推荐目录2022年第5批.doc`，派生缓存（`.html` / `.lo.docx` / `.word.docx`）同步改名。
-各文章目录下的 `manifest.json` 维护 URL 名到本地名的映射，确保 `--force` 时不会重复下载；
+各文章目录下的 `manifest.json` 维护 URL 名到本地名的映射（`--force` 仍按映射写回同一本地名）；
 旧版纯 ID 目录在 sync 时自动迁移，存量可通过 `main.py gonggao jianmian rename` 一次性迁移
 （同时更新库内 attachment 字段）。
 
@@ -531,7 +544,7 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 Autohome 返回权限或验证页时，有三种处理方式：
 
 1. `--browser-login`：调起浏览器扫码登录（需先执行 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 Chromium），登录态保存至 `.browser/autohome`
-2. `--cookie-file ./cookies.txt`：导入浏览器导出的 cookies（支持 header 与 Netscape 两种格式）
+2. `--cookie-file ./cookies.txt`：导入浏览器导出的 cookies（支持 header 与 Netscape 两种格式；Netscape 的 `#HttpOnly_` 行会按 cookie 解析）
 3. `--browser-fallback`：requests 请求失败时由浏览器渲染页面兜底
 
 工信部公告接口无需登录，但仍应保持低频串行访问。

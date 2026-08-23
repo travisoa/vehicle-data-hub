@@ -58,7 +58,7 @@ def build_fetch_parser() -> argparse.ArgumentParser:
     # 工信部公告选项
     parser.add_argument("--all-batches", action="store_true", help="公告查询保留全部批次（默认只取最新批次）")
     parser.add_argument("--detail-html", action="store_true", help="公告下载时同时保存主要技术参数 HTML")
-    parser.add_argument("--limit", type=int, help="公告下载条数限制")
+    parser.add_argument("--limit", type=gonggao_core.positive_int, help="公告下载条数限制")
     # 汽车之家选项
     parser.add_argument("--cookies", help="Autohome Cookie header 字符串")
     parser.add_argument("--cookie-file", help="Autohome Cookie 文件路径")
@@ -71,13 +71,14 @@ def build_fetch_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_gonggao_for_vehicle(vehicle: str, args: argparse.Namespace) -> bool:
+def run_gonggao_for_vehicle(vehicle: str, args: argparse.Namespace) -> int:
+    """返回 gonggao 退出码语义：0 全部成功 / 1 失败 / 2 部分成功。"""
     argv = ["query", vehicle, "--download"]
     if not args.all_batches:
         argv.append("--latest-batch")
     if args.detail_html:
         argv.append("--detail-html")
-    if args.limit:
+    if args.limit is not None:
         argv.extend(["--limit", str(args.limit)])
     if args.mapping_file:
         argv.extend(["--mapping-file", args.mapping_file])
@@ -85,36 +86,42 @@ def run_gonggao_for_vehicle(vehicle: str, args: argparse.Namespace) -> bool:
         argv.extend(["--output-dir", args.gonggao_output_dir])
     print(f"\n=== [工信部公告] {vehicle} ===")
     try:
-        return gonggao_core.main(argv) == 0
+        return gonggao_core.main(argv)
     except SystemExit as exc:
+        if exc.code in (0, None):
+            return gonggao_core.EXIT_OK
         print(f"[工信部公告] {vehicle} 失败: {exc}", file=sys.stderr)
-        return False
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
     except Exception as exc:  # noqa: BLE001
         print(f"[工信部公告] {vehicle} 失败: {exc}", file=sys.stderr)
-        return False
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
 
 
-def run_jianmian_fallback(vehicle: str, args: argparse.Namespace) -> bool:
-    """档案没有公告查询条件时，按市场名从减免税目录反查公告型号并下载参数页。"""
+def run_jianmian_fallback(vehicle: str, args: argparse.Namespace) -> int:
+    """档案没有公告查询条件时，按市场名从减免税目录反查公告型号并下载参数页。
+
+    返回值与 run_gonggao_for_vehicle 一致：0 全部成功 / 1 失败 / 2 部分成功。
+    """
     print(f"\n=== [工信部公告] {vehicle}（档案未命中，走减免税目录反查）===")
     argv = ["jianmian", "search", vehicle, "--download"]
+    if not args.all_batches:
+        argv.append("--latest-batch")
     if args.gonggao_output_dir:
         argv.extend(["--output-dir", args.gonggao_output_dir])
     try:
         code = gonggao_core.main(argv)
     except SystemExit as exc:
         print(f"[工信部公告] {vehicle} 反查失败: {exc}", file=sys.stderr)
-        return False
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
     except Exception as exc:  # noqa: BLE001
         print(f"[工信部公告] {vehicle} 反查失败: {exc}", file=sys.stderr)
-        return False
-    if code == 0:
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
+    if code in (gonggao_core.EXIT_OK, gonggao_core.EXIT_DOWNLOAD_PARTIAL):
         print(
             f"[提示] {vehicle} 不在车型档案中；可按上方“建议 model_prefixes”"
             "把公告条件沉淀进 data/vehicle_profiles.json"
         )
-        return True
-    return False
+    return code
 
 
 def run_autohome(model_names: list[str], args: argparse.Namespace) -> bool:
@@ -162,6 +169,7 @@ def command_fetch(argv: list[str]) -> int:
     profiles = gonggao_core.load_mappings(mapping_path)
 
     failures: list[str] = []
+    partials: list[str] = []
 
     if args.source in ("both", "autohome"):
         autohome_models: list[str] = []
@@ -186,18 +194,24 @@ def command_fetch(argv: list[str]) -> int:
                     or profile.model_prefixes
                 )
             )
-            ok = (
+            code = (
                 run_gonggao_for_vehicle(vehicle, args)
                 if has_conditions
                 else run_jianmian_fallback(vehicle, args)
             )
-            if not ok:
+            if code == gonggao_core.EXIT_DOWNLOAD_PARTIAL:
+                partials.append(f"gonggao:{vehicle}")
+            elif code != gonggao_core.EXIT_OK:
                 failures.append(f"gonggao:{vehicle}")
 
     print()
+    if partials:
+        print(f"以下任务部分成功（已拿到 PDF，另有条目需人工检查）: {', '.join(partials)}")
     if failures:
         print(f"完成，但以下任务失败: {', '.join(failures)}")
         return 1
+    if partials:
+        return 0
     print("全部任务完成。")
     return 0
 

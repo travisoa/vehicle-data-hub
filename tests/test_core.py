@@ -82,6 +82,72 @@ def test_filter_latest_batch_handles_zero_padded():
 def test_safe_part():
     assert core.safe_part("示例车型 2025款") == "示例车型_2025款"
     assert core.safe_part(" / : * ") == "unknown"
+    assert core.safe_part("..") == "unknown"
+    assert core.safe_part(".") == "unknown"
+    assert core.safe_part("../downloads") == "downloads"
+
+
+def test_is_pdf_bytes():
+    assert core.is_pdf_bytes(b"%PDF-1.4 rest")
+    assert not core.is_pdf_bytes(b"<html>application/pdf</html>")
+
+
+def test_apply_row_filters_include_and_exclude():
+    rows = [
+        {"clxh": "ABC6520MT", "clmc": "多用途乘用车"},
+        {"clxh": "ABC6520AP1", "clmc": "多用途乘用车"},
+        {"clxh": "XYZ1234", "clmc": "轿车"},
+    ]
+    filtered = core.apply_row_filters(
+        rows,
+        include_prefixes=["ABC6520"],
+        exclude_prefixes=["ABC6520AP"],
+        row_filters={"clmc": "多用途"},
+    )
+    assert [row["clxh"] for row in filtered] == ["ABC6520MT"]
+
+
+def test_find_mapping_prefers_longest_fuzzy_key(tmp_path):
+    mapping_file = tmp_path / "p.json"
+    mapping_file.write_text(
+        json.dumps(
+            [
+                {"name": "其它D9", "gonggao": {"trademark": "甲牌"}},
+                {"name": "示例D9旗舰", "gonggao": {"trademark": "乙牌"}},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    loaded = core.load_mappings(mapping_file)
+    hit = core.find_mapping("D9", loaded)
+    assert hit is not None
+    assert hit.name == "示例D9旗舰"
+
+
+def test_download_param_page_requires_magic(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "post_form",
+        lambda *args, **kwargs: (b"<html>captcha</html>", {"content-type": "application/pdf"}),
+    )
+    path, is_pdf, size = core.download_param_page(
+        {"cpsb": "示例牌", "clxh": "ABC1", "gppc": "406", "cpid": "1", "dataTag": "x"},
+        tmp_path,
+    )
+    assert is_pdf is False
+    assert path.suffix == ".html"
+    assert size == len(b"<html>captcha</html>")
+
+
+def test_positive_int_rejects_zero_and_negative():
+    import argparse
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        core.positive_int("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        core.positive_int("-1")
+    assert core.positive_int("3") == 3
 
 
 class _FakeResponse:
@@ -140,3 +206,107 @@ def test_http_request_no_retry_on_4xx(monkeypatch):
     with pytest.raises(core.error.HTTPError):
         core.http_request("https://example.com/api")
     assert calls["n"] == 1
+
+
+def _query_args(tmp_path, **overrides):
+    from types import SimpleNamespace
+
+    defaults = dict(
+        mapping_file=str(tmp_path / "missing.json"),
+        vehicle=None,
+        trademark="示例牌",
+        company="",
+        model_code="",
+        model_prefix=[],
+        vehicle_name="",
+        page_size=50,
+        pc="",
+        row_filter=[],
+        all_pages=True,
+        download=True,
+        latest_batch=False,
+        exclude_model_prefix=[],
+        limit=None,
+        output_dir=str(tmp_path),
+        flat_output=True,
+        vehicle_folder="",
+        detail_html=False,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_command_query_download_all_non_pdf_is_total_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "load_mappings", lambda path: [])
+    monkeypatch.setattr(
+        core,
+        "query_all_pages",
+        lambda **kwargs: [{"cpsb": "示例牌", "clxh": "ABC1", "gppc": "406", "cpid": "1", "dataTag": "x"}],
+    )
+    monkeypatch.setattr(
+        core,
+        "download_param_page",
+        lambda row, folder: (folder / "x.html", False, 12),
+    )
+    assert core.command_query(_query_args(tmp_path)) == core.EXIT_DOWNLOAD_FAILED
+
+
+def test_command_query_download_empty_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "load_mappings", lambda path: [])
+    monkeypatch.setattr(core, "query_all_pages", lambda **kwargs: [])
+    assert core.command_query(_query_args(tmp_path)) == core.EXIT_DOWNLOAD_FAILED
+
+
+def test_download_exit_code_matrix():
+    """0 全部成功 / 1 一份 PDF 都没拿到 / 2 拿到了但有条目需人工检查。"""
+    assert core.download_exit_code(ok_pdf_count=3, problem_count=0) == core.EXIT_OK
+    assert core.download_exit_code(ok_pdf_count=0, problem_count=3) == core.EXIT_DOWNLOAD_FAILED
+    assert core.download_exit_code(ok_pdf_count=11, problem_count=1) == core.EXIT_DOWNLOAD_PARTIAL
+    # 没有下载任务时不算失败
+    assert core.download_exit_code(ok_pdf_count=0, problem_count=0) == core.EXIT_OK
+
+
+def _rows(count):
+    return [
+        {"cpsb": "示例牌", "clxh": f"ABC{i}", "gppc": "406", "cpid": str(i), "dataTag": "x"}
+        for i in range(count)
+    ]
+
+
+def test_command_query_download_partial_returns_two(tmp_path, monkeypatch):
+    """11 份 PDF + 1 份非 PDF 是部分成功，不能和全失败共用退出码 1。"""
+    monkeypatch.setattr(core, "load_mappings", lambda path: [])
+    monkeypatch.setattr(core, "query_all_pages", lambda **kwargs: _rows(12))
+
+    def fake_download(row, folder):
+        if row["clxh"] == "ABC7":
+            return folder / "x.html", False, 12
+        return folder / f"{row['clxh']}.pdf", True, 2048
+
+    monkeypatch.setattr(core, "download_param_page", fake_download)
+    assert core.command_query(_query_args(tmp_path)) == core.EXIT_DOWNLOAD_PARTIAL
+
+
+def test_command_query_download_partial_on_exception(tmp_path, monkeypatch):
+    """单条抛异常但其余拿到 PDF，同样是部分成功。"""
+    monkeypatch.setattr(core, "load_mappings", lambda path: [])
+    monkeypatch.setattr(core, "query_all_pages", lambda **kwargs: _rows(3))
+
+    def fake_download(row, folder):
+        if row["clxh"] == "ABC0":
+            raise RuntimeError("boom")
+        return folder / f"{row['clxh']}.pdf", True, 2048
+
+    monkeypatch.setattr(core, "download_param_page", fake_download)
+    assert core.command_query(_query_args(tmp_path)) == core.EXIT_DOWNLOAD_PARTIAL
+
+
+def test_command_query_download_all_pdf_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "load_mappings", lambda path: [])
+    monkeypatch.setattr(core, "query_all_pages", lambda **kwargs: _rows(2))
+    monkeypatch.setattr(
+        core,
+        "download_param_page",
+        lambda row, folder: (folder / f"{row['clxh']}.pdf", True, 2048),
+    )
+    assert core.command_query(_query_args(tmp_path)) == core.EXIT_OK

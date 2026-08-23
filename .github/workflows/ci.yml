@@ -23,3 +23,5 @@ jobs:
         run: python -m ruff check .
       - name: 单元测试
         run: python -m pytest
+      - name: 离线 smoke
+        run: python scripts/smoke_test.py

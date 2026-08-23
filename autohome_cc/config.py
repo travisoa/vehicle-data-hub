@@ -23,16 +23,23 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+ACCESS_BLOCK_WEAK_KEYWORDS = [
+    "验证码",
+    "登录后可查看",
+]
 ACCESS_BLOCK_KEYWORDS = [
     "请先登录",
     "扫码登录",
     "访问验证",
     "安全验证",
-    "验证码",
-    "登录后可查看",
+    *ACCESS_BLOCK_WEAK_KEYWORDS,
     "访问过于频繁",
     "异常访问",
     "robot check",
+]
+# 单独出现即视为拦截页；弱词也可能出现在正常配置页文案里
+ACCESS_BLOCK_STRONG_KEYWORDS = [
+    keyword for keyword in ACCESS_BLOCK_KEYWORDS if keyword not in ACCESS_BLOCK_WEAK_KEYWORDS
 ]
 
 CAPTURE_NOISE_KEYWORDS = [

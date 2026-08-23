@@ -130,7 +130,12 @@ def parse_cookie_file(path: str) -> dict[str, str]:
     cookies: dict[str, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
+            continue
+        # Netscape 把 HttpOnly cookie 写成 #HttpOnly_.example.com\t...
+        if stripped.startswith("#HttpOnly_"):
+            stripped = stripped[len("#HttpOnly_"):]
+        elif stripped.startswith("#"):
             continue
         parts = stripped.split("\t")
         if len(parts) >= 7:

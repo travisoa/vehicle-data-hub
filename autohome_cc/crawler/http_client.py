@@ -11,7 +11,15 @@ from requests import Response, Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from autohome_cc.config import ACCESS_BLOCK_KEYWORDS, DEFAULT_HEADERS, REQUEST_RETRY_BACKOFF, REQUEST_RETRY_TOTAL, REQUEST_SLEEP_RANGE, REQUEST_TIMEOUT
+from autohome_cc.config import (
+    ACCESS_BLOCK_KEYWORDS,
+    ACCESS_BLOCK_STRONG_KEYWORDS,
+    DEFAULT_HEADERS,
+    REQUEST_RETRY_BACKOFF,
+    REQUEST_RETRY_TOTAL,
+    REQUEST_SLEEP_RANGE,
+    REQUEST_TIMEOUT,
+)
 
 
 @dataclass
@@ -124,7 +132,15 @@ class HttpClient:
         if response.status_code in {401, 403}:
             raise LoginRequiredError(self._build_login_hint(final_url, response.status_code))
 
-        if any(keyword.lower() in body.lower() for keyword in ACCESS_BLOCK_KEYWORDS):
+        lowered = body.lower()
+        strong = [keyword for keyword in ACCESS_BLOCK_STRONG_KEYWORDS if keyword.lower() in lowered]
+        hits = [keyword for keyword in ACCESS_BLOCK_KEYWORDS if keyword.lower() in lowered]
+        loginish = any(
+            part in final_url.lower()
+            for part in ("login", "passport", "verify", "captcha", "account")
+        )
+        # 强信号单关键词即可（访问验证/过于频繁等）；弱信号（验证码）需叠加其它证据
+        if strong or len(hits) >= 2 or (hits and (response.status_code != 200 or loginish)):
             raise LoginRequiredError(self._build_login_hint(final_url, response.status_code))
 
     @staticmethod
