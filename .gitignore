@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+.browser/
+output/
+downloads/
+logs/
+.DS_Store
+cookies.txt
+data/jianmian_catalog.sqlite
+# 真实车型档案含未上市车型的商标与型号前缀，不纳入版本管理
+# 新环境从 data/vehicle_profiles.example.json 复制后自行填写
+data/vehicle_profiles.json
+.pytest_cache/
+.ruff_cache/
+AI应用成果报告.md
+release/
+.workbuddy/
+.backup/

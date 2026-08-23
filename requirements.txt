@@ -1,0 +1,9 @@
+# 运行依赖。仅支持 macOS：.doc 转换依赖 textutil / Microsoft Word AppleScript / LibreOffice。
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+openpyxl>=3.1.2
+# 保留 1.x 上限：升级到 urllib3 2.x 需重新验证 autohome_cc/crawler/http_client.py 的 Retry
+# 配置，以及运行环境的 OpenSSL 版本（2.x 要求 OpenSSL 1.1.1+，系统自带 LibreSSL 会直接报错）。
+urllib3<2
+chardet>=5.2.0
+pdfplumber>=0.11.0

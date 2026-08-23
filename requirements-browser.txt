@@ -1,0 +1,2 @@
+# 可选：浏览器扫码登录 / 浏览器兜底（--browser-login / --browser-fallback）
+playwright>=1.52.0

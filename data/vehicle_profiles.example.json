@@ -1,0 +1,26 @@
+[
+  {
+    "name": "示例车型",
+    "aliases": ["示例车型", "example model", "EX1"],
+    "autohome": {
+      "models": ["示例车型"]
+    },
+    "gonggao": {
+      "trademark": "示例牌",
+      "filters": { "clmc": "多用途乘用车" },
+      "model_prefixes": ["ABC6520M"],
+      "exclude_model_prefixes": ["ABC6520AP", "ABC6530AB"]
+    }
+  },
+  {
+    "name": "示例车型2",
+    "aliases": ["示例车型2", "EX2"],
+    "autohome": {
+      "models": ["示例车型2"]
+    },
+    "gonggao": {
+      "trademark": "另一示例牌",
+      "model_prefixes": ["XYZ6540BEV"]
+    }
+  }
+]
