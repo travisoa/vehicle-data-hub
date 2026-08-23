@@ -60,6 +60,17 @@
 - 2020~2022 年的《新能源汽车推广应用推荐车型目录》表头无"通用名称"列，不入库（警告跳过属预期）
 - 典型用途：新车只知道市场名时 `jianmian search <市场名> --resolve` 反查公告型号与商标，再沉淀进车型档案
 
+### Linux 原生增量同步适配规范
+
+当目标运行环境为 Linux，且需要支持 `jianmian sync` / `rename` 时，应按照以下规范实施跨平台适配：
+
+1. 将 `.docx` 嗅探和解析设为主链路。原生 `.docx` 不再重复转换，直接调用 `peek_catalog_info_docx` / `parse_catalog_docx`；嗅探到明确的公告附件或推荐目录时沿用现有跳过语义。
+2. 老式 `.doc` 先复用已有 `.lo.docx` 缓存；未命中缓存时通过 `find_soffice()` 定位 Linux `PATH` 中的 LibreOffice，并在独立临时目录执行 `soffice --headless --convert-to docx --outdir <临时目录> <附件.doc>`。转换成功后校验产物非空且是包含 `word/document.xml` 的有效 DOCX，再原子移动为附件旁的 `.lo.docx` 缓存；继续保持低频串行，不为转换引入激进并发。
+3. `soffice` 必须保留有界超时和失败清理，超时值应允许通过环境变量或 CLI 配置。Linux 缺少 `soffice`、转换失败或超时只将对应附件计入 `zero_rows` / `error` 并继续其他附件，不得中止整批同步，也不得覆盖已入库旧行。
+4. 将 `textutil` 降为 macOS 可选回退：仅在命令存在时生成 HTML，用于快速嗅探或 DOCX 精确解析无结果时的启发式重建；Linux 缺少 `textutil` 属正常路径，不得报致命错误。`rename` 同样先从原生或缓存 DOCX 嗅探目录名和批次，不得强制调用 `textutil`。
+5. 保持现有 `manifest.json` 映射、派生缓存同步重命名、`--force` 缓存失效、`zero_rows` / `error` 重试、事务回滚和部分成功保留旧行语义。不得为了跨平台而退回只提取纯文本、丢失表格边界的实现。
+6. 至少补充以下回归：模拟 Linux 无 `textutil` 且有 `soffice` 时可完成同步；原生 `.docx` 不调用转换器；`soffice` 缺失/失败/超时时不中止整批且不清旧行；`rename` 可仅凭 DOCX 工作。随后用真实目录附件核对目录名、批次、解析行数及关键字段，并运行本文件“开发规则”中的完整验证命令，再更新 README 的平台支持结论。
+
 ## 统一车型档案
 
 `data/vehicle_profiles.json`，每条同时描述两个来源。该文件与 `data/jianmian_catalog.sqlite` 均为

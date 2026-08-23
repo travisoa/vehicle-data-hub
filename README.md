@@ -228,8 +228,13 @@ Python 3.11+。**大部分功能为纯 Python 实现，macOS 与 Linux 均可运
 | `gonggao jianmian search` / `export` | ✅ | ✅ 读取既有 SQLite，无平台依赖 |
 | `gonggao jianmian sync` / `rename` | ✅ | ⚠️ 需要 `textutil` 嗅探附件类型，缺失时会中止 |
 
-因此在 Linux 上部署时，随包分发一份已同步好的 `data/jianmian_catalog.sqlite`，即可完整使用目录反查
-与 `review` 的目录补参数能力；目录的增量同步仍需在 macOS 侧执行。
+Linux 环境在目录数据已初始化的前提下，可使用目录反查及 `review` 的目录补参数能力；目录增量同步的
+跨平台适配方案如下。
+
+Linux 原生目录增量同步的目标架构是以 `.docx` 嗅探和解析作为主链路：老式 `.doc` 先由
+LibreOffice `soffice` 转换为 `.docx`，再统一按真实表格结构解析；macOS 专有的 `textutil`
+仅作为可选的 HTML 嗅探和启发式回退。现有实现尚未完成该链路的跨平台适配，实施要求见
+`AGENTS.md` 的“Linux 原生增量同步适配规范”。
 
 `.doc` 转 `.docx` 的转换器本身跨平台：`find_soffice()` 优先通过 `shutil.which("soffice")` 定位
 LibreOffice，Linux 发行版安装后即在 `PATH` 中；Microsoft Word 的 AppleScript 通道为 macOS 专有。
