@@ -4,6 +4,7 @@
 
 > 车型数据一站式采集：汽车之家配置对比、工信部公告参数页、减免税目录反查、口碑销量竞品对标。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Platform: macOS | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey.svg)](#运行环境)
 [![CI](https://github.com/travisoa/vehicle-data-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/travisoa/vehicle-data-hub/actions/workflows/ci.yml)
@@ -584,7 +585,23 @@ Autohome 返回权限或验证页时，有三种处理方式：
 ## 参考文档
 
 - [AGENTS.md](AGENTS.md)：Agent 执行流程、抓取与输出规则、开发约定
-- [data/vehicle_profiles.json](data/vehicle_profiles.json)：统一车型档案（含现有车型样例）
+- [data/vehicle_profiles.example.json](data/vehicle_profiles.example.json)：统一车型档案的脱敏模板（真实档案为本地数据，不纳入版本管理）
 - `miit_gonggao/jianmian.py` 模块注释：目录附件 .doc 转 .docx 的转换与表格解析细则
 - `autohome_cc/crawler/search.py`：汽车之家搜索接口的地址、参数与响应解析（接口变化仅需修改此处）
 - [.github/workflows/ci.yml](.github/workflows/ci.yml)：CI 配置
+
+---
+
+## 许可
+
+本项目以 [MIT License](LICENSE) 发布。
+
+许可覆盖的是本仓库的代码，**不包括**通过本工具抓取到的任何数据。汽车之家、工信部装备工业发展中心、
+懂车帝等来源的数据，其权利归属与使用条件由各来源方规定。使用者需自行遵守目标站点的服务条款与
+`robots.txt`，控制访问频率，并对由此产生的合规责任负责。本工具按「原样」提供，不附带任何担保。
+
+<div align="center">
+
+MIT License © [travisoa](https://github.com/travisoa/)
+
+</div>
