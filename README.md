@@ -220,31 +220,41 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 
 ### 运行环境
 
-Python 3.11+。**大部分功能为纯 Python 实现，macOS 与 Linux 均可运行**；仅减免税目录的附件同步链路
-依赖 macOS 自带的 `textutil`。具体边界如下：
+Python 3.11+，**macOS / Windows / Linux 三平台均可运行**。全部功能都不依赖任何平台专有工具，
+唯一的外部依赖是减免税目录同步时用来转换 `.doc` 附件的 LibreOffice：
 
-| 功能 | macOS | Linux / Windows |
-| --- | :---: | --- |
-| `fetch` / `autohome` / `gonggao query` / `review` / `report` / `profiles` | ✅ | ✅ 纯 Python，无平台依赖 |
-| `gonggao jianmian search` / `export` | ✅ | ✅ 读取既有 SQLite，无平台依赖 |
-| `gonggao jianmian sync` / `rename` | ✅ | ⚠️ 需要 `textutil` 嗅探附件类型，缺失时会中止 |
+| 功能 | 额外依赖 |
+| --- | --- |
+| `fetch` / `autohome` / `gonggao query` / `review` / `report` / `profiles` | 无，纯 Python |
+| `gonggao jianmian search` / `export` | 无，读取本地 SQLite |
+| `gonggao jianmian sync` / `rename` | **LibreOffice**（把目录附件的老式 `.doc` 转成 `.docx`） |
 
-Linux 环境在目录数据已初始化的前提下，可使用目录反查及 `review` 的目录补参数能力；目录增量同步的
-跨平台适配方案如下。
+`find_soffice()` 先查 `PATH`，再探测三平台的默认安装位置——Windows 版 LibreOffice 装完
+**默认不写入 PATH**，由代码自动补上 `C:\Program Files\LibreOffice\program\soffice.exe`。
 
-Linux 原生目录增量同步的目标架构是以 `.docx` 嗅探和解析作为主链路：老式 `.doc` 先由
-LibreOffice `soffice` 转换为 `.docx`，再统一按真实表格结构解析；macOS 专有的 `textutil`
-仅作为可选的 HTML 嗅探和启发式回退。现有实现尚未完成该链路的跨平台适配，实施要求见
-`AGENTS.md` 的“Linux 原生增量同步适配规范”。
+macOS 上还有两条额外的加速与兜底通道，其他平台没有也不影响正确性：
 
-`.doc` 转 `.docx` 的转换器本身跨平台：`find_soffice()` 优先通过 `shutil.which("soffice")` 定位
-LibreOffice，Linux 发行版安装后即在 `PATH` 中；Microsoft Word 的 AppleScript 通道为 macOS 专有。
+- **`textutil` 廉价嗅探**（macOS 自带）：在昂贵的 `.docx` 转换之前先花几十毫秒判断附件是不是目录，
+  把公告附件直接筛掉。其他平台没有它，改为转换后用 `peek_catalog_info_docx` 判定——结论一致，
+  但非目录附件也要经过一次转换。实测缓存中 32% 的附件（按体积 51%）属于这一类，
+  因此**首次全量同步的转换工作量约为 macOS 的两倍**。转换结果有缓存、判定为非目录的文章会标记为
+  已同步，所以这是一次性成本，后续增量同步没有差异。
+- **Microsoft Word AppleScript 通道**：LibreOffice 转换失败或超时后的兜底，仅 macOS 可用。
+  其他平台只有 LibreOffice 一条路，遇到几十 MB 的多目录合刊附件可能触发默认 300 秒超时，
+  可通过环境变量调大：`SOFFICE_TIMEOUT=900`。
+
 CI 在 ubuntu 上执行离线单测，验证的即是这部分平台无关逻辑。
 
 ### 安装
 
 ```bash
 ./scripts/bootstrap.sh
+```
+
+Windows 使用 PowerShell 版本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 ```
 
 依赖分三层，按需安装：
@@ -255,8 +265,8 @@ CI 在 ubuntu 上执行离线单测，验证的即是这部分平台无关逻辑
 | `requirements-browser.txt` | Playwright（含 Chromium） | 仅 `--browser-login` / `--browser-fallback` 需要，通过 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 |
 | `requirements-dev.txt` | pytest / ruff | 开发与测试，通过 `INSTALL_DEV=1 ./scripts/bootstrap.sh` 安装 |
 
-可选：安装 LibreOffice（macOS 为 `brew install --cask libreoffice`，Linux 使用发行版包管理器）以启用
-无窗口的目录附件转换；未安装时回退至 Microsoft Word 通道或启发式解析。
+目录同步需要 LibreOffice：macOS `brew install --cask libreoffice`、Windows `winget install TheDocumentFoundation.LibreOffice`、Linux 用发行版包管理器。
+其余功能不需要它。macOS 上未安装时可回退至 Microsoft Word 通道。
 
 ### 验证安装
 

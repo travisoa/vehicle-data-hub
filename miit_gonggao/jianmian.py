@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -347,9 +349,20 @@ def download_attachment(
 
 # .doc -> .docx 转换器：优先 LibreOffice（headless 无窗口），失败/超时回退本机 Word；
 # 都没有时 command_sync 退回 textutil 压平文本的启发式重建
-SOFFICE_PATHS = ("/Applications/LibreOffice.app/Contents/MacOS/soffice",)
-# 大合刊附件（如31MB、2万行的批次26）LibreOffice 转不完，超时后交给 Word
-SOFFICE_TIMEOUT = 300
+SOFFICE_PATHS = (
+    # macOS
+    "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    # Windows：安装后默认不写入 PATH，必须显式探测
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    # Linux 发行版包管理器安装位置
+    "/usr/bin/soffice",
+    "/usr/lib/libreoffice/program/soffice",
+    "/snap/bin/libreoffice",
+)
+# 大合刊附件（如31MB、2万行的批次26）LibreOffice 转不完，超时后交给 Word。
+# 无 Word 通道的平台（Windows/Linux）遇到大附件可调大：SOFFICE_TIMEOUT=900
+SOFFICE_TIMEOUT = int(os.environ.get("SOFFICE_TIMEOUT", "300"))
 
 
 def find_soffice() -> str | None:
@@ -360,6 +373,17 @@ def find_soffice() -> str | None:
         if Path(candidate).exists():
             return candidate
     return None
+
+
+def is_valid_docx(path: Path) -> bool:
+    """产物必须是非空且含 word/document.xml 的 zip，否则视为转换失败。"""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return "word/document.xml" in archive.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def doc_to_docx_via_soffice(doc_path: Path) -> Path | None:
@@ -388,13 +412,20 @@ def doc_to_docx_via_soffice(doc_path: Path) -> Path | None:
                 file=sys.stderr,
             )
             return None
+        if not is_valid_docx(produced):
+            print(f"[警告] LibreOffice 产物不是有效 DOCX: {doc_path.name}", file=sys.stderr)
+            return None
         shutil.move(str(produced), docx_path)
     return docx_path
 
 
 def convert_doc_to_docx(doc_path: Path, *, force: bool = False) -> Path | None:
     """统一入口：已有缓存(.lo.docx/.word.docx)直接复用；否则 LibreOffice 优先，
-    转换失败/超时再回退本机 Word。`--force` 时删除派生缓存再转。"""
+    转换失败/超时再回退本机 Word。`--force` 时删除派生缓存再转。
+
+    原生 .docx 附件直接返回自身，不再送进转换器空转一遍。"""
+    if doc_path.suffix.lower() == ".docx" and is_valid_docx(doc_path):
+        return doc_path
     if force:
         for suffix in (".lo.docx", ".word.docx"):
             cached = doc_path.with_suffix(suffix)
@@ -426,7 +457,8 @@ def doc_to_docx_via_word(doc_path: Path) -> Path | None:
     docx_path = doc_path.with_suffix(".word.docx")
     if docx_path.exists() and docx_path.stat().st_size > 0:
         return docx_path
-    if not WORD_APP.exists():
+    # AppleScript 通道仅 macOS 可用；其他平台只依赖 LibreOffice
+    if sys.platform != "darwin" or not WORD_APP.exists():
         return None
 
     WORD_CONTAINER_TMP.mkdir(parents=True, exist_ok=True)
@@ -540,14 +572,20 @@ def parse_catalog_docx(docx_path: Path) -> tuple[str, str, list[dict[str, Any]]]
 
 
 def doc_to_html(doc_path: Path, *, force: bool = False) -> Path | None:
-    """textutil(.doc -> .html)，结果缓存在附件旁边。仅 macOS。"""
+    """textutil(.doc -> .html)，结果缓存在附件旁边。
+
+    textutil 是 macOS 自带工具，在这条链路上承担两件事：廉价嗅探附件是不是目录、
+    以及 .docx 转换失败时的启发式兜底。其他平台没有它，返回 None 让调用方改走
+    .docx 路径（嗅探用 peek_catalog_info_docx，解析用 parse_catalog_docx），
+    代价是非目录附件也要经过一次转换才能判定。已有的 .html 缓存在任何平台都直接复用。
+    """
     html_path = doc_path.with_suffix(".html")
     if force and html_path.exists():
         html_path.unlink()
     elif html_path.exists() and html_path.stat().st_size > 0:
         return html_path
     if not shutil.which("textutil"):
-        raise SystemExit("缺少 textutil（macOS 自带）；其他平台请先人工转换 .doc 为 .html")
+        return None
     result = subprocess.run(
         ["textutil", "-convert", "html", str(doc_path), "-output", str(html_path)],
         capture_output=True,
@@ -1072,7 +1110,8 @@ def command_sync(args: argparse.Namespace) -> int:
                 if doc_path.suffix.lower() not in (".doc", ".docx"):
                     print(f"  跳过暂不支持的附件: {doc_path.name}", file=sys.stderr)
                     continue
-                # 先用 textutil 廉价嗅探：仅明确的非目录附件(公告附件/推荐目录)跳过入库
+                # 有 textutil（macOS）时先廉价嗅探，明确的非目录附件(公告附件/推荐目录)
+                # 直接跳过，省掉一次昂贵的 .docx 转换
                 html_path = doc_to_html(doc_path, force=args.force)
                 catalog_hint, batch_hint = "", ""
                 if html_path:
@@ -1087,6 +1126,16 @@ def command_sync(args: argparse.Namespace) -> int:
                 catalog, batch, rows = "", "", []
                 docx_path = convert_doc_to_docx(doc_path, force=args.force)
                 if docx_path:
+                    # 无 textutil 的平台在这里才拿到嗅探信息：转换已经发生，
+                    # 用 docx 补上 hint，让后续的非目录判定与 macOS 保持一致
+                    if not catalog_hint:
+                        catalog_hint, batch_hint = peek_catalog_info_docx(docx_path)
+                        if is_non_catalog_peek(catalog_hint):
+                            stem = friendly_attachment_stem(
+                                catalog_hint, batch_hint
+                            ) or stem_from_article_title(catalog_hint, article.title)
+                            rename_attachment(doc_path, url_name, stem)
+                            continue
                     catalog, batch, rows = parse_catalog_docx(docx_path)
                 if not rows and html_path:
                     catalog, batch, rows = parse_catalog_html(html_path)

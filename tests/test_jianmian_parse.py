@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from miit_gonggao import jianmian
 
@@ -267,3 +268,111 @@ def test_article_folder_migrates_legacy_dir(tmp_path):
     assert not legacy.exists()
     # 再次调用幂等
     assert jianmian.article_folder(article, tmp_path) == folder
+
+
+def test_doc_to_html_degrades_without_textutil(tmp_path, monkeypatch):
+    """非 macOS 平台没有 textutil：返回 None 让流程改走 .docx，而不是中止整个 sync。"""
+    monkeypatch.setattr(jianmian.shutil, "which", lambda name: None)
+    doc = tmp_path / "购置税目录第31批.doc"
+    doc.write_bytes(b"stub")
+    assert jianmian.doc_to_html(doc) is None
+
+
+def test_doc_to_html_reuses_html_cache_on_any_platform(tmp_path, monkeypatch):
+    """已有 .html 缓存时任何平台都直接复用，不依赖 textutil 是否存在。"""
+    monkeypatch.setattr(jianmian.shutil, "which", lambda name: None)
+    doc = tmp_path / "购置税目录第31批.doc"
+    doc.write_bytes(b"stub")
+    html = doc.with_suffix(".html")
+    html.write_text("<html>cached</html>", encoding="utf-8")
+    assert jianmian.doc_to_html(doc) == html
+
+
+def test_word_channel_skipped_off_darwin(tmp_path, monkeypatch):
+    """AppleScript 通道仅 macOS 可用，其他平台直接返回 None，不调用 osascript。"""
+    called = []
+    monkeypatch.setattr(jianmian.subprocess, "run", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(jianmian.sys, "platform", "win32")
+    doc = tmp_path / "购置税目录第31批.doc"
+    doc.write_bytes(b"stub")
+    assert jianmian.doc_to_docx_via_word(doc) is None
+    assert called == []
+
+
+def test_soffice_paths_cover_three_platforms():
+    """LibreOffice 候选路径需覆盖三平台——Windows 版安装后默认不写入 PATH。"""
+    joined = " ".join(jianmian.SOFFICE_PATHS)
+    assert "/Applications/LibreOffice.app" in joined          # macOS
+    assert "Program Files" in joined                          # Windows
+    assert "/usr/bin/soffice" in joined                       # Linux
+
+
+def test_find_soffice_falls_back_to_candidate_paths(tmp_path, monkeypatch):
+    """PATH 里没有 soffice 时（Windows 的常态）应回退到候选安装路径。"""
+    fake = tmp_path / "soffice.exe"
+    fake.write_text("stub", encoding="utf-8")
+    monkeypatch.setattr(jianmian.shutil, "which", lambda name: None)
+    monkeypatch.setattr(jianmian, "SOFFICE_PATHS", (str(fake),))
+    assert jianmian.find_soffice() == str(fake)
+
+
+def _make_docx(path, with_document_xml=True):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        if with_document_xml:
+            archive.writestr("word/document.xml", "<w:document/>")
+        else:
+            archive.writestr("junk.txt", "not a docx")
+    return path
+
+
+def test_is_valid_docx(tmp_path):
+    good = _make_docx(tmp_path / "good.docx")
+    bad_zip = _make_docx(tmp_path / "bad.docx", with_document_xml=False)
+    not_zip = tmp_path / "raw.docx"
+    not_zip.write_bytes(b"not a zip")
+    empty = tmp_path / "empty.docx"
+    empty.write_bytes(b"")
+    assert jianmian.is_valid_docx(good)
+    assert not jianmian.is_valid_docx(bad_zip)
+    assert not jianmian.is_valid_docx(not_zip)
+    assert not jianmian.is_valid_docx(empty)
+    assert not jianmian.is_valid_docx(tmp_path / "missing.docx")
+
+
+def test_native_docx_skips_converter(tmp_path, monkeypatch):
+    """原生 .docx 附件直接返回自身，不送进 LibreOffice/Word 空转一遍。"""
+    called = []
+    monkeypatch.setattr(jianmian, "doc_to_docx_via_soffice", lambda p: called.append(p))
+    monkeypatch.setattr(jianmian, "doc_to_docx_via_word", lambda p: called.append(p))
+    native = _make_docx(tmp_path / "购置税目录第31批.docx")
+    assert jianmian.convert_doc_to_docx(native) == native
+    assert called == []
+
+
+def test_soffice_rejects_invalid_product(tmp_path, monkeypatch):
+    """转换器返回 0 但产物不是有效 DOCX 时，按失败处理而不是把垃圾缓存下来。"""
+    doc = tmp_path / "购置税目录第31批.doc"
+    doc.write_bytes(b"stub")
+    monkeypatch.setattr(jianmian, "find_soffice", lambda: "/fake/soffice")
+
+    def fake_run(cmd, **kwargs):
+        outdir = Path(cmd[cmd.index("--outdir") + 1])
+        (outdir / f"{doc.stem}.docx").write_bytes(b"not a zip")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(jianmian.subprocess, "run", fake_run)
+    assert jianmian.doc_to_docx_via_soffice(doc) is None
+    assert not doc.with_suffix(".lo.docx").exists()
+
+
+def test_soffice_timeout_configurable(monkeypatch):
+    """无 Word 通道的平台遇到大附件需要能调大超时。"""
+    import importlib
+
+    monkeypatch.setenv("SOFFICE_TIMEOUT", "900")
+    reloaded = importlib.reload(jianmian)
+    assert reloaded.SOFFICE_TIMEOUT == 900
+    monkeypatch.delenv("SOFFICE_TIMEOUT")
+    importlib.reload(jianmian)

@@ -60,16 +60,26 @@
 - 2020~2022 年的《新能源汽车推广应用推荐车型目录》表头无"通用名称"列，不入库（警告跳过属预期）
 - 典型用途：新车只知道市场名时 `jianmian search <市场名> --resolve` 反查公告型号与商标，再沉淀进车型档案
 
-### Linux 原生增量同步适配规范
+### 跨平台运行（macOS / Windows / Linux）
 
-当目标运行环境为 Linux，且需要支持 `jianmian sync` / `rename` 时，应按照以下规范实施跨平台适配：
+三平台均可运行，全部功能无平台专有依赖。`jianmian sync` / `rename` 需要 LibreOffice 把目录附件
+的老式 `.doc` 转成 `.docx`；其余命令纯 Python。已落地的适配约定，改动时不要破坏：
 
-1. 将 `.docx` 嗅探和解析设为主链路。原生 `.docx` 不再重复转换，直接调用 `peek_catalog_info_docx` / `parse_catalog_docx`；嗅探到明确的公告附件或推荐目录时沿用现有跳过语义。
-2. 老式 `.doc` 先复用已有 `.lo.docx` 缓存；未命中缓存时通过 `find_soffice()` 定位 Linux `PATH` 中的 LibreOffice，并在独立临时目录执行 `soffice --headless --convert-to docx --outdir <临时目录> <附件.doc>`。转换成功后校验产物非空且是包含 `word/document.xml` 的有效 DOCX，再原子移动为附件旁的 `.lo.docx` 缓存；继续保持低频串行，不为转换引入激进并发。
-3. `soffice` 必须保留有界超时和失败清理，超时值应允许通过环境变量或 CLI 配置。Linux 缺少 `soffice`、转换失败或超时只将对应附件计入 `zero_rows` / `error` 并继续其他附件，不得中止整批同步，也不得覆盖已入库旧行。
-4. 将 `textutil` 降为 macOS 可选回退：仅在命令存在时生成 HTML，用于快速嗅探或 DOCX 精确解析无结果时的启发式重建；Linux 缺少 `textutil` 属正常路径，不得报致命错误。`rename` 同样先从原生或缓存 DOCX 嗅探目录名和批次，不得强制调用 `textutil`。
-5. 保持现有 `manifest.json` 映射、派生缓存同步重命名、`--force` 缓存失效、`zero_rows` / `error` 重试、事务回滚和部分成功保留旧行语义。不得为了跨平台而退回只提取纯文本、丢失表格边界的实现。
-6. 至少补充以下回归：模拟 Linux 无 `textutil` 且有 `soffice` 时可完成同步；原生 `.docx` 不调用转换器；`soffice` 缺失/失败/超时时不中止整批且不清旧行；`rename` 可仅凭 DOCX 工作。随后用真实目录附件核对目录名、批次、解析行数及关键字段，并运行本文件“开发规则”中的完整验证命令，再更新 README 的平台支持结论。
+1. **`.docx` 是主链路**。原生 `.docx` 附件由 `convert_doc_to_docx` 直接返回自身，不送进转换器空转；
+   `.doc` 先复用 `.lo.docx` / `.word.docx` 缓存，未命中才调 LibreOffice。
+2. **`find_soffice()` 三平台探测**：先 `PATH`，再 `SOFFICE_PATHS` 里的默认安装位置。Windows 版
+   LibreOffice 装完不写入 `PATH`，删掉这些候选路径会让 Windows 直接不可用。
+3. **转换产物必须过 `is_valid_docx()`**（非空 + 含 `word/document.xml`）才落缓存，避免把垃圾
+   产物缓存下来导致后续解析恒为 0 行。
+4. **`SOFFICE_TIMEOUT` 可配**（环境变量，默认 300s）。无 Word 兜底的平台遇到大合刊附件需要调大。
+5. **`textutil` 是 macOS 可选加速，不是必需品**。`doc_to_html` 在缺失时返回 `None`（不得改回
+   `raise SystemExit`），调用方改用 `peek_catalog_info_docx` 嗅探。已有 `.html` 缓存在任何平台都复用。
+6. **Word AppleScript 通道有 `sys.platform != "darwin"` 守卫**，其他平台不得调用 `osascript`。
+7. **性能差异要如实告知**：macOS 靠 textutil 在转换前筛掉非目录附件（缓存中占 32% 个数、51% 体积），
+   其他平台需转换后才能判定，首次全量同步的转换量约为两倍。这是一次性成本——转换有缓存，
+   判定为非目录的文章标 `ok` 进入 `known`，增量同步无差异。不要为了抹平它退回纯文本提取而丢失表格边界。
+8. 保持 `manifest.json` 映射、派生缓存同步重命名、`--force` 缓存失效、`zero_rows` / `error` 重试、
+   事务回滚与部分成功保留旧行等既有语义。
 
 ## 统一车型档案
 
