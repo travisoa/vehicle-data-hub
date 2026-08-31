@@ -6,8 +6,8 @@
 储电量）尽力从减免税目录库（data/jianmian_catalog.sqlite）按公告型号补齐。
 
 用法：
-    python3 main.py review <车型>                       # 解析 downloads/<车型>/*.pdf
-    python3 main.py review downloads/<车型>/xx.pdf -o output/评审.xlsx
+    python3 main.py review <车型>                       # 解析 downloads/announcement_site/<品牌>/<车型>/ 下的 PDF
+    python3 main.py review downloads/announcement_site/<品牌>/<车型>/某配置.pdf -o output/评审.xlsx
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from miit_gonggao.core import save_workbook_atomic
+from miit_gonggao.core import DEFAULT_ANNOUNCEMENT_DIR, save_workbook_atomic
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
+DEFAULT_DOWNLOAD_DIR = DEFAULT_ANNOUNCEMENT_DIR
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "jianmian_catalog.sqlite"
 
@@ -471,7 +471,7 @@ def _collect_pdfs(inputs: list[str], download_dir: Path) -> tuple[list[Path], st
         if path.is_file() and path.suffix.lower() == ".pdf":
             pdfs.append(path)
         elif path.is_dir():
-            pdfs.extend(sorted(path.glob("*.pdf")))
+            pdfs.extend(sorted(path.rglob("*.pdf")))
             label = label or path.name
         elif (download_dir / item).is_dir():
             candidate = (download_dir / item).resolve()
@@ -480,10 +480,17 @@ def _collect_pdfs(inputs: list[str], download_dir: Path) -> tuple[list[Path], st
                 candidate.relative_to(root)
             except ValueError as exc:
                 raise SystemExit(f"拒绝读取下载目录之外的路径: {item}") from exc
-            pdfs.extend(sorted(candidate.glob("*.pdf")))
+            pdfs.extend(sorted(candidate.rglob("*.pdf")))
             label = label or item
         else:
-            raise SystemExit(f"找不到 PDF 或目录: {item}（也不在 {download_dir} 下）")
+            matches = sorted(path for path in download_dir.glob(f"*/{item}") if path.is_dir())
+            if len(matches) == 1:
+                pdfs.extend(sorted(matches[0].rglob("*.pdf")))
+                label = label or item
+            elif len(matches) > 1:
+                raise SystemExit(f"下载目录内存在多个同名车型目录，请改用完整路径: {item}")
+            else:
+                raise SystemExit(f"找不到 PDF 或目录: {item}（也不在 {download_dir} 下）")
     unique: list[Path] = []
     for pdf in pdfs:
         if pdf not in unique:
@@ -536,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "inputs",
         nargs="+",
-        help="车型名（对应 downloads/<车型>/ 目录）、PDF 文件或目录，可多个",
+        help="车型名（对应 downloads/announcement_site/<品牌>/<车型>/ 目录）、PDF 文件或目录，可多个",
     )
     parser.add_argument("-o", "--output", help="输出 xlsx 路径，默认 output/公告参数_<车型>_<批次>.xlsx")
     parser.add_argument("--title", help="报表标题中的车型名，默认取目录通用名称")

@@ -87,6 +87,15 @@ def test_safe_part():
     assert core.safe_part("../downloads") == "downloads"
 
 
+def test_build_announcement_download_dir(tmp_path):
+    assert core.build_announcement_download_dir(
+        tmp_path,
+        trademark="示例牌",
+        vehicle_folder="示例车型 2026款",
+        batch="408",
+    ) == (tmp_path / "示例牌" / "示例车型_2026款" / "第408批")
+
+
 def test_is_pdf_bytes():
     assert core.is_pdf_bytes(b"%PDF-1.4 rest")
     assert not core.is_pdf_bytes(b"<html>application/pdf</html>")

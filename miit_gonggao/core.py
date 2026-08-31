@@ -26,6 +26,8 @@ DETAIL_URL = f"{BASE_URL}/queryCpData"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MAPPING_PATH = PROJECT_ROOT / "data" / "vehicle_profiles.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "downloads"
+DEFAULT_ANNOUNCEMENT_DIR = DEFAULT_OUTPUT_DIR / "announcement_site"
+ANNOUNCEMENT_SNAPSHOT_DIRNAME = "_snapshots"
 
 
 @dataclass
@@ -311,6 +313,22 @@ def build_download_folder_name(
     return safe_part("_".join(part for part in parts if part))
 
 
+def build_announcement_download_dir(
+    output_root: Path,
+    *,
+    trademark: str,
+    vehicle_folder: str,
+    batch: str,
+) -> Path:
+    """公告 PDF 的统一目录：品牌 / 车型（查询名）/ 批次。"""
+    return (
+        output_root
+        / safe_part(trademark or "未标注商标")
+        / safe_part(vehicle_folder or "未标注车型")
+        / f"第{safe_part(batch or '未标注')}批"
+    )
+
+
 def model_matches_prefixes(
     model_code: str,
     *,
@@ -555,7 +573,8 @@ def command_query(args: argparse.Namespace) -> int:
         rows = filter_latest_batch(rows)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
-    snapshot = write_query_snapshot(rows, output_dir=output_dir, query=query, mapping=mapping)
+    snapshot_dir = output_dir / ANNOUNCEMENT_SNAPSHOT_DIRNAME
+    snapshot = write_query_snapshot(rows, output_dir=snapshot_dir, query=query, mapping=mapping)
 
     print(f"产品商标: {trademark}")
     if mapping:
@@ -573,21 +592,25 @@ def command_query(args: argparse.Namespace) -> int:
             print("查询结果为空，没有可下载的公告。", file=sys.stderr)
             return 1
         manifest_entries: list[dict[str, Any]] = []
-        download_dir = output_dir
-        if not args.flat_output:
-            download_dir = output_dir / build_download_folder_name(
-                args=args,
-                mapping=mapping,
-                trademark=trademark,
-                company=company,
-                model_code=model_code,
-                vehicle_name=vehicle_name,
-            )
-        print(f"下载目录: {download_dir}")
+        vehicle_folder = build_download_folder_name(
+            args=args,
+            mapping=mapping,
+            trademark=trademark,
+            company=company,
+            model_code=model_code,
+            vehicle_name=vehicle_name,
+        )
+        print(f"下载根目录: {output_dir}")
         errors: list[str] = []
         non_pdf: list[str] = []
         for row in selected:
             label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
+            download_dir = output_dir if args.flat_output else build_announcement_download_dir(
+                output_dir,
+                trademark=str(row.get("cpsb") or trademark),
+                vehicle_folder=vehicle_folder,
+                batch=str(row.get("gppc") or row.get("pc") or ""),
+            )
             try:
                 path, is_pdf, byte_count = download_param_page(row, download_dir)
             except Exception as exc:  # 单条下载失败不中断整批
@@ -619,7 +642,7 @@ def command_query(args: argparse.Namespace) -> int:
                     print(f"已保存详情: {detail_path}")
                 except Exception as exc:  # 详情失败不影响已下载的参数页
                     print(f"详情页保存失败，跳过: {label} ({exc})", file=sys.stderr)
-        manifest_path = write_download_manifest(manifest_entries, output_dir)
+        manifest_path = write_download_manifest(manifest_entries, snapshot_dir)
         print(f"下载索引: {manifest_path}")
         if errors:
             print(f"以下 {len(errors)} 条下载失败: {'; '.join(errors)}", file=sys.stderr)
@@ -684,7 +707,11 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--vehicle-folder", help="下载时使用的车型目录名；默认按查询配置或查询条件自动生成")
     query_parser.add_argument("--flat-output", action="store_true", help="下载文件直接保存到输出目录根目录，兼容旧版平铺结构")
     query_parser.add_argument("--limit", type=positive_int, help="限制展示或下载条数")
-    query_parser.add_argument("--output-dir", default=os.fspath(DEFAULT_OUTPUT_DIR), help="输出目录")
+    query_parser.add_argument(
+        "--output-dir",
+        default=os.fspath(DEFAULT_ANNOUNCEMENT_DIR),
+        help=f"公告下载根目录，默认 {DEFAULT_ANNOUNCEMENT_DIR}",
+    )
     query_parser.set_defaults(func=command_query)
 
     profiles_parser = subparsers.add_parser("profiles", help="列出本地查询配置")
@@ -694,6 +721,10 @@ def build_parser() -> argparse.ArgumentParser:
     trademarks_parser = subparsers.add_parser("trademarks", help="兼容旧命令：列出本地查询配置")
     trademarks_parser.add_argument("--mapping-file", default=os.fspath(DEFAULT_MAPPING_PATH), help="本地查询配置 JSON 文件")
     trademarks_parser.set_defaults(func=command_profiles)
+
+    from miit_gonggao import change_notice
+
+    change_notice.register_subcommands(subparsers)
 
     from miit_gonggao import jianmian
 

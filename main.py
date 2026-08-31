@@ -7,6 +7,7 @@
     python3 main.py fetch <车型> --source autohome   # 只抓汽车之家配置 Excel
     python3 main.py autohome --models "<车型>"       # 汽车之家配置抓取完整 CLI
     python3 main.py gonggao query <车型> --download  # 工信部公告查询完整 CLI
+    python3 main.py gonggao changes --model-code <型号> --download  # 变更扩展公示 -> 最新有效 PDF
     python3 main.py review <车型>                    # 公告 PDF -> 公告参数评审 Excel
     python3 main.py report <本品> --vs <竞品>      # 口碑/销量竞品对标 HTML 报告
     python3 main.py profiles                         # 列出统一车型档案
@@ -67,7 +68,7 @@ def build_fetch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-profile-dir", help="浏览器登录态目录，默认 .browser/autohome")
     parser.add_argument("--browser-channel", help="Playwright channel，例如 chrome 或 msedge")
     parser.add_argument("--autohome-output-dir", help="汽车之家 Excel 输出目录，默认 output/")
-    parser.add_argument("--gonggao-output-dir", help="工信部公告下载根目录，默认 downloads/")
+    parser.add_argument("--gonggao-output-dir", help="工信部公告下载根目录，默认 downloads/announcement_site/")
     return parser
 
 

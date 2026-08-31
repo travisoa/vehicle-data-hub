@@ -8,7 +8,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from miit_gonggao.review_export import _batch_filename_part, export_review_excel, lookup_catalog, parse_words
+from miit_gonggao.review_export import _batch_filename_part, _collect_pdfs, export_review_excel, lookup_catalog, parse_words
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gonggao_pdf_words.json"
 
@@ -87,6 +87,17 @@ def test_batch_filename_part():
     # 多批次取最小-最大区间，且与 PDF 出现顺序无关
     assert _batch_filename_part([{"batch": "406"}, {"batch": "394"}, {"batch": "405"}]) == "第394-406批"
     assert _batch_filename_part([{}]) == "未知批次"
+
+
+def test_collect_pdfs_finds_vehicle_under_brand_and_batch(tmp_path):
+    pdf = tmp_path / "示例牌" / "示例车型" / "第408批" / "demo.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4 test")
+
+    pdfs, label = _collect_pdfs(["示例车型"], tmp_path)
+
+    assert pdfs == [pdf]
+    assert label == "示例车型"
 
 
 def test_lookup_catalog(tmp_path):
