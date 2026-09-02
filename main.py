@@ -11,6 +11,7 @@
     python3 main.py review <车型>                    # 公告 PDF -> 公告参数评审 Excel
     python3 main.py report <本品> --vs <竞品>      # 口碑/销量竞品对标 HTML 报告
     python3 main.py profiles                         # 列出统一车型档案
+    python3 main.py profiles add <市场名>            # 反查公告条件并写入档案（-f 名单文件可批量）
 
     # 减免购置税/车船税目录（市场名 -> 公告型号反查，目录数据入库可检索）
     python3 main.py gonggao jianmian sync            # 抓取目录附件解析入 SQLite
@@ -21,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -118,10 +120,7 @@ def run_jianmian_fallback(vehicle: str, args: argparse.Namespace) -> int:
         print(f"[工信部公告] {vehicle} 反查失败: {exc}", file=sys.stderr)
         return gonggao_core.EXIT_DOWNLOAD_FAILED
     if code in (gonggao_core.EXIT_OK, gonggao_core.EXIT_DOWNLOAD_PARTIAL):
-        print(
-            f"[提示] {vehicle} 不在车型档案中；可按上方“建议 model_prefixes”"
-            "把公告条件沉淀进 data/vehicle_profiles.json"
-        )
+        print(f"[提示] {vehicle} 不在车型档案中；沉淀条件直接跑：main.py profiles add {vehicle}")
     return code
 
 
@@ -217,7 +216,141 @@ def command_fetch(argv: list[str]) -> int:
     return 0
 
 
+def _warn(message: str) -> None:
+    """输出到 stderr 前先冲掉 stdout：管道场景下 stdout 是块缓冲、stderr 无缓冲，
+    不冲的话报错行会跑到对应的「=== 车型 ===」标题前面，看不出是哪个车型失败的。"""
+    sys.stdout.flush()
+    print(message, file=sys.stderr, flush=True)
+
+
+def _collect_profile_names(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[str]:
+    names = split_vehicle_args(args.names)
+    if args.from_file:
+        text = Path(args.from_file).expanduser().read_text(encoding="utf-8")
+        names.extend(
+            line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+        )
+    if not names:
+        parser.error("需要至少一个车型名，或用 -f 指定名单文件")
+    if args.alias and len(names) > 1:
+        parser.error("--alias 只能在单个车型名时使用")
+    return names
+
+
+def command_profiles_add(argv: list[str]) -> int:
+    """按市场名从减免税目录反查公告条件，直接写入统一车型档案。
+
+    此前 jianmian search 已经算出「建议 model_prefixes」和公告商标，但只打印到终端，
+    需要人再手抄进 data/vehicle_profiles.json；这条命令把该 handoff 补上。
+    """
+    parser = argparse.ArgumentParser(
+        prog="main.py profiles add",
+        description="按市场名反查公告条件并写入统一车型档案",
+    )
+    parser.add_argument("names", nargs="*", help="车型市场名，可传多个（也支持逗号分隔）")
+    parser.add_argument("-f", "--from-file", help="从文件按行读取车型名，# 开头的行视为注释")
+    parser.add_argument("--alias", action="append", default=[], help="附加别名，仅单车型时可用，可重复")
+    parser.add_argument("--mapping-file", help="统一车型档案 JSON，默认 data/vehicle_profiles.json")
+    parser.add_argument("--db", help="减免税目录库路径，默认 data/jianmian_catalog.sqlite")
+    parser.add_argument("--limit", type=int, default=200, help="目录检索返回条数上限，默认 200")
+    parser.add_argument("--overwrite", action="store_true", help="已存在同名或同别名档案时覆盖")
+    parser.add_argument("--dry-run", action="store_true", help="只打印将写入的条目，不落盘")
+    args = parser.parse_args(argv)
+
+    names = _collect_profile_names(args, parser)
+
+    from miit_gonggao import jianmian
+
+    mapping_path = (
+        Path(args.mapping_file).expanduser().resolve()
+        if args.mapping_file
+        else gonggao_core.DEFAULT_MAPPING_PATH
+    )
+    db_path = Path(args.db).expanduser().resolve() if args.db else jianmian.DB_PATH
+    if not db_path.exists():
+        _warn(f"目录库不存在: {db_path}")
+        _warn("先运行: main.py gonggao jianmian sync")
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
+
+    entries = gonggao_core.load_raw_mappings(mapping_path)
+    conn = jianmian.open_db(db_path)
+    staged: list[dict[str, object]] = []
+    counters = {"added": 0, "updated": 0, "skipped": 0}
+    failed: list[str] = []
+
+    for name in names:
+        print(f"\n=== {name} ===")
+        if not args.overwrite and gonggao_core.mapping_exists(entries, name, args.alias):
+            counters["skipped"] += 1
+            print("档案中已有同名或同别名条目，跳过（要覆盖加 --overwrite）")
+            continue
+        rows = jianmian.query_rows(conn, name, limit=args.limit)
+        if not rows:
+            _warn(f"目录库中未找到「{name}」，跳过；可先 jianmian sync，或换用目录里的通用名称")
+            failed.append(name)
+            continue
+        model_codes = sorted({row["model_code"] for row in rows if row["model_code"]})
+        prefixes = jianmian.suggest_prefixes(model_codes)
+        print(f"目录命中 {len(rows)} 条 / 车辆型号 {len(model_codes)} 个")
+        if args.limit and len(rows) == args.limit:
+            _warn(f"命中条数已达上限 {args.limit}，model_prefixes 可能不全；"
+                  f"用 --limit 调大后重跑（--overwrite 覆盖）")
+        print(f"建议 model_prefixes: {', '.join(prefixes) or '(无)'}")
+
+        # 反查要为每个车辆型号打一次公告接口，网络异常只跳过当前车型：
+        # 与 fetch 一致，不能让一次失败作废整批已经查好的结果
+        try:
+            resolved = jianmian.resolve_models(model_codes)
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"「{name}」公告反查失败，跳过: {type(exc).__name__}: {exc}")
+            failed.append(name)
+            continue
+        if not resolved:
+            _warn("公告接口未返回匹配产品，商标与车辆名称无法确定")
+
+        entry, notes = gonggao_core.build_profile_entry(
+            name,
+            aliases=args.alias,
+            model_prefixes=prefixes,
+            resolved_rows=resolved,
+        )
+        entries, action = gonggao_core.upsert_mapping(entries, entry, overwrite=args.overwrite)
+        if action == "skipped":
+            counters["skipped"] += 1
+            print("档案中已有同名或同别名条目，跳过（要覆盖加 --overwrite）")
+            continue
+        counters[action] += 1
+        staged.append(entry)
+        print(f"{'覆盖' if action == 'updated' else '新增'}档案条目: {entry['gonggao']['trademark'] or '(商标待补)'}")
+        for note in notes:
+            print(f"  [待确认] {note}")
+
+    if not staged:
+        print("\n没有条目需要写入。")
+    elif args.dry_run:
+        print("\n--dry-run，未写盘。将写入的条目：")
+        print(json.dumps(staged, ensure_ascii=False, indent=2))
+    else:
+        gonggao_core.save_mappings(mapping_path, entries)
+        print(f"\n已写入 {mapping_path}")
+
+    print(
+        f"新增 {counters['added']} / 覆盖 {counters['updated']} / "
+        f"跳过 {counters['skipped']} / 失败 {len(failed)}"
+    )
+    if failed:
+        _warn(f"失败车型: {', '.join(failed)}")
+    if not failed:
+        return gonggao_core.EXIT_OK
+    # 与 fetch 一致：全失败为 1，部分成功为 2，便于脚本区分「名单全错」和「个别没查到」
+    if not staged and counters["skipped"] == 0:
+        return gonggao_core.EXIT_DOWNLOAD_FAILED
+    return gonggao_core.EXIT_DOWNLOAD_PARTIAL
+
+
 def command_profiles(argv: list[str]) -> int:
+    if argv and argv[0] == "add":
+        return command_profiles_add(argv[1:])
     parser = argparse.ArgumentParser(prog="main.py profiles", description="列出统一车型档案")
     parser.add_argument("--mapping-file", help="统一车型档案 JSON，默认 data/vehicle_profiles.json")
     args = parser.parse_args(argv)

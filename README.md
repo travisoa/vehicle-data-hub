@@ -64,8 +64,8 @@
 output/汽车之家_&lt;车型A&gt;等2个车型配置表_20260823.xlsx
 
 === [工信部公告] &lt;车型A&gt; ===
-downloads/&lt;车型A&gt;/406_&lt;车辆型号&gt;_*.pdf
-downloads/manifest_20260823_*.json
+downloads/announcement_site/&lt;品牌&gt;/&lt;车型A&gt;/第406批/&lt;品牌&gt;_&lt;车辆型号&gt;_406_*.pdf
+downloads/announcement_site/_snapshots/manifest_20260823_*.json
 
 全部任务完成。</code></pre>
 
@@ -74,7 +74,7 @@ downloads/manifest_20260823_*.json
 
 <pre><code>$ main.py review &lt;车型&gt;
 
-解析 downloads/&lt;车型&gt;/*.pdf … 12 份
+解析 downloads/announcement_site/&lt;品牌&gt;/&lt;车型&gt;/**/*.pdf … 12 份
 目录补参数（购置税目录优先）… 命中 12
 output/公告参数_&lt;车型&gt;_第394-406批.xlsx
   ├─ 关键参数（行=参数项，列=各配置）
@@ -146,7 +146,8 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 
 ### 工信部公告与减免税目录
 
-对应命令：`main.py gonggao query ...`、`main.py gonggao jianmian ...` 与 `main.py fetch --source gonggao`
+对应命令：`main.py gonggao query ...`、`main.py gonggao changes ...`、
+`main.py gonggao jianmian ...` 与 `main.py fetch --source gonggao`
 
 <table>
 <colgroup><col width="1%"><col></colgroup>
@@ -155,7 +156,9 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 </thead>
 <tbody>
 <tr><td nowrap width="1%"><strong>公告查询</strong></td><td>按商标、企业、车辆型号、名称与批次组合筛选；支持型号前缀的<strong>包含与排除</strong>（<code>--model-prefix</code> / <code>--exclude-model-prefix</code>）及任意字段后置筛选（<code>--row-filter</code>）</td></tr>
-<tr><td nowrap width="1%"><strong>参数页下载</strong></td><td><code>--download</code> 下载参数页 PDF 至 <code>downloads/&lt;车型&gt;/</code>；按 <code>%PDF</code> 头校验，非 PDF 时保留 <code>.html</code> 供人工核查；单条失败仅跳过并在结尾汇总，<strong>不中断整批</strong></td></tr>
+<tr><td nowrap width="1%"><strong>变更扩展公示</strong></td><td><code>gonggao changes</code> 按公示企业、商标、产品名称或产品型号查询工信部变更扩展清单；加 <code>--download</code> 后，以公示中的精确产品型号查询当前有效公告，下载其中最高批次的参数页 PDF。查询快照同时保留公示批次与实际 PDF 批次，二者不强制相同。</td></tr>
+<tr><td nowrap width="1%"><strong>参数页下载</strong></td><td><code>--download</code> 下载参数页 PDF 至 <code>downloads/announcement_site/&lt;品牌&gt;/&lt;车型&gt;/第&lt;批次&gt;批/</code>；查询快照与下载索引存入 <code>_snapshots/</code>；按 <code>%PDF</code> 头校验，非 PDF 时保留 <code>.html</code> 供人工核查；单条失败仅跳过并在结尾汇总，<strong>不中断整批</strong></td></tr>
+<tr><td nowrap width="1%"><strong>动态修订归档</strong></td><td>公告网站的参数页 PDF 由查询接口动态生成。同一产品 ID 后续返回的字段或批次发生变化时，当前版本留在主目录，旧快照归入 <code>downloads/announcement_site/_revisions/</code> 并在 <code>manifest.json</code> 记录哈希、PDF 生成时间、身份字段及差异；历史快照不参与普通车型查询和分类索引。</td></tr>
 <tr><td nowrap width="1%"><strong>目录反查</strong></td><td><code>jianmian search &lt;市场名&gt;</code> 以通用名称反查公告型号与商标；<code>--resolve</code> 经公告接口确认，<code>--download</code> 直接下载参数页</td></tr>
 <tr><td nowrap width="1%"><strong>目录入库</strong></td><td><code>jianmian sync</code> 增量抓取全部批次附件并解析入 SQLite（覆盖乘用车、客车、货车、专用车全类别）；<code>articles</code> 表记录 <code>status/error/row_count</code>，<code>zero_rows</code> 与 <code>error</code> 状态下次自动重试</td></tr>
 <tr><td nowrap width="1%"><strong>.doc 精确解析</strong></td><td>老式二进制 .doc 先转 .docx，按<strong>真实表格结构</strong>解析（含纵向合并），避免转换工具压平表格导致单元格边界丢失；按 LibreOffice headless、Microsoft Word AppleScript、启发式重建三级降级，各级结果均有缓存</td></tr>
@@ -209,7 +212,7 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 | 配置对比表 / 参数 Excel | **汽车之家** | `fetch <车型A> --source autohome` |
 | 公告页 / 准入参数 PDF | **工信部公告** | `fetch <车型A> --source gonggao` |
 | 两者均需，或来源未定 | **两个来源** | `fetch <车型A> <车型B>` |
-| 公告参数评审表 | **review** | `review <车型>`（需 `downloads/<车型>/` 已有 PDF） |
+| 公告参数评审表 | **review** | `review <车型>`（需 `downloads/announcement_site/<品牌>/<车型>/` 已有 PDF） |
 | 竞品对标 / 口碑 / 销量 | **report** | `report <本品> --vs <竞品1> <竞品2>` |
 | 仅知市场名，无法检索公告 | **jianmian** | `gonggao jianmian search <市场名> --download` |
 | 已知商标或型号，临时查询 | **gonggao query** | `gonggao query --trademark "<商标>" --model-prefix <型号前缀> --latest-batch` |
@@ -280,7 +283,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 ### 典型用法
 
 ```bash
-# 1. 两个来源同时抓取：配置 Excel 输出至 output/，公告 PDF 输出至 downloads/<车型>/
+# 1. 两个来源同时抓取：配置 Excel 输出至 output/，公告 PDF 输出至 downloads/announcement_site/<品牌>/<车型>/<批次>/
 .venv/bin/python main.py fetch <车型A> <车型B>
 
 # 2. 公告 PDF 转公告参数 Excel（自动补充减免税目录参数）
@@ -294,7 +297,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 未命中档案的减免目录反查同样带 `--latest-batch`），
 使用 `--all-batches` 保留全部批次。未命中档案的车型，工信部侧自动转为按市场名走减免税目录反查，
 成功后提示将建议的 `model_prefixes` 沉淀至档案。输出目录可按来源分别指定：
-`--autohome-output-dir`（Excel，默认 `output/`）与 `--gonggao-output-dir`（PDF，默认 `downloads/`）。
+`--autohome-output-dir`（Excel，默认 `output/`）与 `--gonggao-output-dir`（PDF，默认 `downloads/announcement_site/`）。
 
 `--download` 的退出码分三档，便于脚本区分「白跑一趟」和「拿到了但需人工检查」：
 
@@ -317,15 +320,17 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 | --- | --- |
 | `fetch <车型>...` | 按统一车型档案同时抓取两个来源 |
 | `autohome ...` | 汽车之家配置抓取完整 CLI（`--models`、`--capture-file`、`--cookies`、`--browser-login` 等） |
-| `gonggao ...` | 工信部公告查询完整 CLI（含 `query`、`profiles`、`jianmian` 子命令） |
+| `gonggao ...` | 工信部公告查询完整 CLI（含 `query`、`changes`、`profiles`、`jianmian` 子命令） |
 | `review <车型/PDF>...` | 公告参数页 PDF 转公告参数 Excel（[详解](#公告参数表review)） |
 | `report <车型> --vs ...` | 口碑与销量竞品对标 HTML 报告（[详解](#竞品对标报告report)） |
 | `profiles` | 列出统一车型档案 |
+| `profiles add <市场名>...` | 按市场名反查公告条件并写入档案（`-f` 名单文件可批量，`--dry-run` 预览） |
 
 两个来源的全部参数均在各自子命令下可用：
 
 ```bash
 .venv/bin/python main.py gonggao query --trademark "<商标>" --model-prefix <型号前缀> --latest-batch --download
+.venv/bin/python main.py gonggao changes --model-code <完整公告型号> --download
 .venv/bin/python main.py autohome --models "<车型名>" --browser-login --browser-fallback
 .venv/bin/python main.py autohome --capture-file /path/to/autohome_config.html
 ```
@@ -338,6 +343,12 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 `--exclude-model-prefix` 排除前缀（可重复）/ `--row-filter FIELD=VALUE` 任意字段后置筛选（可重复）/
 `--latest-batch` 仅保留最高批次 / `--all-pages` 拉取全部分页 / `--download` 下载 PDF /
 `--detail-html` 同时保存技术参数 HTML / `--vehicle-folder` 指定下载目录名 / `--limit` 条数限制
+
+**`gonggao changes`**：`--company` 公示企业 / `--trademark` 公示商标 /
+`--product-name` 公示产品名称 / `--model-code` 公示产品型号 / `--download` 按命中型号下载当前最高有效批次 PDF /
+`--limit` 限制返回及下载数量 / `--all` 显式允许无条件遍历整批 /
+`--notice-url` 指定新的工信部变更扩展公示文章。默认使用项目已验证的官方公示入口；
+工信部发布新批次且文章随机 URL 变化时，应把该批次文章 URL 通过 `--notice-url` 传入。
 
 **`gonggao jianmian`**：`sync`（`--max-pages` / `--max-articles` / `--force` 重新下载并作废转换缓存）、
 `search <关键词>`（`--resolve` 经公告接口反查 / `--download` 反查后下载，隐含 `--resolve` / `--latest-batch` 只下最高批次）、
@@ -372,7 +383,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 .venv/bin/python main.py gonggao jianmian search <市场名> --resolve  # 经公告接口反查商标与批次
 .venv/bin/python main.py gonggao jianmian search <市场名> --download # 反查后直接下载公告参数页 PDF
 .venv/bin/python main.py gonggao jianmian export --keyword <关键词>      # 导出 Excel 至 output/jianmian_catalog.xlsx
-.venv/bin/python main.py gonggao jianmian export --by-category      # 按车辆类别分 6 个文件导出至 output/jianmian_by_category/
+.venv/bin/python main.py gonggao jianmian export --by-category      # 全量.xlsx + 6 个分类文件导出至 output/jianmian_by_category/
 ```
 
 **关于 .doc 转 .docx**：目录附件为老式二进制 .doc，`textutil` 会将表格压平并丢失单元格边界，
@@ -408,8 +419,8 @@ LibreOffice 转换失败或超时（默认 300s，数十 MB 的多目录合刊�
 行结构对齐《公告参数评审模板》（行为参数项、列为各配置型号，附「备注」列标注真实来源）：
 
 ```bash
-.venv/bin/python main.py review <车型>                          # 解析 downloads/<车型>/*.pdf
-.venv/bin/python main.py review downloads/<车型>/某配置.pdf -o output/评审.xlsx
+.venv/bin/python main.py review <车型>                          # 解析 downloads/announcement_site/<品牌>/<车型>/**/*.pdf
+.venv/bin/python main.py review downloads/announcement_site/<品牌>/<车型>/某配置.pdf -o output/评审.xlsx
 .venv/bin/python main.py review <车型> --no-catalog             # 不从减免税目录补充参数
 ```
 
@@ -483,6 +494,20 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 
 - `autohome.models`：汽车之家搜索使用的车系或车型名。车系名导出全部在售配置，带年款的具体版本名仅匹配最相关的一个
 - `gonggao.*`：工信部公告查询条件（商标、筛选项、型号前缀）
+
+新增条目不必手写。`profiles add` 会按市场名走减免税目录反查，把公告商标、`clmc`、`model_prefixes` 直接写入档案：
+
+```bash
+.venv/bin/python main.py profiles add <市场名> --dry-run   # 先预览将写入的条目
+.venv/bin/python main.py profiles add <市场名A> <市场名B>   # 确认后落盘
+.venv/bin/python main.py profiles add -f names.txt         # 批量，按行读取，# 开头为注释
+```
+
+写入遵循「拿不准就留空」：公告返回多个商标、或各条记录 `clmc` 不一致时该字段留空并在终端点名；
+`exclude_model_prefixes` 需要人判断哪些前缀属于同名异车，一律不猜。`autohome.models` 暂用市场名兜底，
+汽车之家站内名称不同的车型需人工改写。已存在同名或同别名档案时跳过（`--overwrite` 覆盖），
+且跳过前不会发起任何目录检索与公告请求。
+
 - `fetch` 时未命中档案的车型：汽车之家按输入名直接搜索；工信部公告自动转为减免税目录反查并下载（目录库为空时提示先执行 `jianmian sync`）
 - 旧版平铺格式（`trademark` 位于顶层、无 `gonggao` 子对象）保持兼容
 - 一次性筛选优先使用 CLI 参数（`--model-prefix`、`--row-filter`、`--latest-batch`），不建议为临时需求修改档案
@@ -498,11 +523,13 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 | `output/汽车之家_<车型>配置表_<日期>.xlsx` | 汽车之家配置对比表，工作表结构见下 |
 | `output/公告参数_<车型>_<批次>.xlsx` | 公告参数表（关键参数 / 数据来源） |
 | `output/对标报告_*.html` | 竞品对标分析报告（自包含） |
-| `output/jianmian_catalog.xlsx` | 减免税目录单文件导出 |
-| `output/jianmian_by_category/` | 减免税目录分类导出（6 个固定 xlsx） |
-| `downloads/<车型>/*.pdf` | 工信部公告参数页 PDF；接口未返回 PDF 时保留同名 `.html` 供人工核查 |
+| `output/jianmian_catalog.xlsx` | 减免税目录单文件导出（不带 `--by-category` 时的输出；配 `--keyword` 会整体换成匹配子集） |
+| `output/jianmian_by_category/全量.xlsx` | 减免税目录全量表（列结构与分类文件相同） |
+| `output/jianmian_by_category/<类别>.xlsx` | 减免税目录分类导出（6 个固定 xlsx） |
+| `downloads/announcement_site/<品牌>/<车型>/第<批次>批/*.pdf` | 工信部公告参数页 PDF；接口未返回 PDF 时保留同名 `.html` 供人工核查 |
 | `downloads/benchmark/<车型>.json` | 口碑与销量原始数据缓存（`report --offline` 复用） |
-| `downloads/query_*.json` / `manifest_*.json` | 公告查询快照与下载索引 |
+| `downloads/announcement_site/_snapshots/query_*.json` / `manifest_*.json` | `gonggao query --download` 的查询快照与下载索引；索引含成功与失败两类条目（`status` 为 `ok`/`not_pdf`/`download_failed`）。网站侧的批量采集走 Website 的 seed 脚本，记录进它的业务库，不产出这两个文件 |
+| `downloads/announcement_site/_revisions/` | 公告网站动态页面变更前的 PDF 快照；`manifest.json` 记录原始哈希、当前哈希、PDF 生成时间与字段差异，不参与主库分类或普通查询 |
 | `downloads/jianmian/<文章ID>_公告第N批/` | 减免税目录附件及派生缓存 |
 | `data/jianmian_catalog.sqlite` | 减免税目录车型库（本地数据，不纳入版本管理） |
 | `logs/` | 汽车之家抓取运行日志 |

@@ -7,7 +7,22 @@
 统一的车型数据下载与对标分析工具：
 
 - **汽车之家**（`autohome_cc/`）：按车型名抓配置，导出 Excel 对比表到 `output/`（含「配置分析」差异透视 sheet）
-- **工信部公告**（`miit_gonggao/`）：按商标/型号前缀查公告，下载参数页 PDF 到 `downloads/<车型>/`；`review_export.py` 可把参数页 PDF 转成公告参数 Excel
+- **工信部公告**（`miit_gonggao/`）：按商标/型号前缀查公告，下载参数页 PDF 到 `downloads/announcement_site/<品牌>/<车型>/<批次>/`；`review_export.py` 可把参数页 PDF 转成公告参数 Excel
+
+## 与 Website 项目的边界
+
+数据流单向：本项目 → Website，不存在反向依赖。判断一处改动是否越界，只问一句：**它读写的资产，唯一写入方是谁？**
+
+本项目独占写入：`data/jianmian_catalog.sqlite`、`data/vehicle_profiles.json`、
+`downloads/announcement_site/**/*.pdf`（PDF 本体）、`downloads/announcement_site/_snapshots/`、`output/`。
+
+Website 独占写入（其中后两项物理位置在本项目目录下，所有权仍归 Website）：
+`Website/data/announcement_site.sqlite`（采集业务库）、`Website/dist/site-*.sqlite`（站点只读库）、
+`downloads/announcement_site/分类公告/`、`downloads/announcement_site/_revisions/`。
+
+因此本项目不得读取或推断公告业务库的位置，也不得统计 PDF 的采集覆盖率——那是 Website 的职责。
+`core.build_announcement_download_dir` 是两个项目共用的目录结构契约，Website 直接调用它；
+改动该函数等同于改文件契约，须同步确认 Website 侧。
 - **竞品对标**（`benchmark/`）：抓汽车之家口碑 + 懂车帝销量榜，生成对标分析 HTML 报告到 `output/`
 
 这是通用工具，不要把它当成只服务少数硬编码车型的脚本；车型相关条件一律走 `data/vehicle_profiles.json` 档案或 CLI 参数。
@@ -20,7 +35,7 @@
    - 要配置对比 / 参数表 / Excel → 汽车之家：`--source autohome`
    - 要公告页 / 公告参数 PDF / 工信部数据 → 工信部：`--source gonggao`
    - 都要或未说明 → `fetch <车型>` 默认两个来源都抓
-   - 要公告参数表 / 公告参数 Excel → 先确认 `downloads/<车型>/` 有 PDF（没有先 fetch），再 `main.py review <车型>`
+   - 要公告参数表 / 公告参数 Excel → 先确认 `downloads/announcement_site/<品牌>/<车型>/` 有 PDF（没有先 fetch），再 `main.py review <车型>`
    - 要竞品对标 / 口碑分析 / 槽点亮点 / 销量对比 → `main.py report <本品> --vs <竞品...>`（断网或复现用 `--offline`，需要 `downloads/benchmark/` 已有缓存）。按需聚焦板块：`--focus all`（默认综合，顶部含「综合研判」结论层）/ `sales`（仅销量对标）/ `koubei`（仅口碑对标）；不带 `--vs` 生成单车画像。销量为懂车帝全榜+汽车之家级别榜双源、各含最新月/近半年/近12个月三维度并标注月份范围；懂车帝对英文命名品牌（中文名↔英文名）按型号标识跨语言匹配，汽车之家级别榜未进 Top20 时按口碑品牌 ID 品牌检索兜底
 2. **先查档案**：`main.py profiles` 看车型是否已有统一档案（含别名匹配）。
 3. **命中档案** → 直接 `main.py fetch <车型名>`。
@@ -31,7 +46,12 @@
     - 已知商标或型号时用透传 CLI 一次性查询：
      `main.py gonggao query --trademark "某某牌" --model-prefix XXX --latest-batch --download --vehicle-folder <车型>`
      （`--model-code`/`--company`/`--model-prefix` 之一存在时可不带 `--trademark`）
-   - 如果这个车型以后还会查，把条件沉淀进 `data/vehicle_profiles.json`（见下文格式）
+    - 要查变更扩展公示时用
+      `main.py gonggao changes --model-code <完整公告型号> [--download]`；`--download` 必须先保留公示命中证据，
+      再以精确型号查询有效公告中的最高批次 PDF，分别记录公示批次与 PDF 批次，不能假定二者相同
+   - 如果这个车型以后还会查，用 `main.py profiles add <市场名>` 把条件写进 `data/vehicle_profiles.json`，
+     不要手抄终端里的「建议 model_prefixes」。先 `--dry-run` 预览；命令只写机器能确定的字段，
+     商标不唯一、`clmc` 不一致、`exclude_model_prefixes` 一律留空并在终端点名，这些需要人工补
 5. **汇报结果**：列出生成的 Excel 路径、PDF 目录、批次号，以及失败/跳过项。
 
 常用命令：
@@ -42,9 +62,12 @@
 .venv/bin/python main.py fetch <车型> --all-batches --source gonggao  # 全部批次
 .venv/bin/python main.py autohome --models "..." [--browser-login --browser-fallback]
 .venv/bin/python main.py gonggao query ... --download   # 公告查询 CLI 全参数可用
+.venv/bin/python main.py gonggao changes --model-code <完整公告型号> [--download]  # 变更扩展公示 -> 最新有效 PDF
 .venv/bin/python main.py gonggao jianmian sync          # 减免税目录抓取入库（增量，--force 重下并作废转换缓存）
 .venv/bin/python main.py gonggao jianmian search <市场名> --resolve [--download] [--latest-batch]
 .venv/bin/python main.py gonggao jianmian export [--keyword <关键词>] [--xlsx 路径]
+.venv/bin/python main.py profiles                       # 列出统一车型档案
+.venv/bin/python main.py profiles add <市场名> [--dry-run] [--overwrite] [-f 名单.txt]  # 反查并写入档案
 .venv/bin/python main.py review <车型> [-o 输出.xlsx] [--no-catalog]   # 公告 PDF -> 公告参数 Excel
 .venv/bin/python main.py report <本品> --vs <竞品1> <竞品2> [--focus all|sales|koubei] [--offline] [--pages N]
 ```
@@ -117,7 +140,7 @@
 
 - 两个来源都保持低频、串行、温和，不加激进并发
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
-- `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
+- `query --download` 与 `changes --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
 - 工信部 PDF 接口的 `NECaptchaValidate` 沿用现有随机 token 方式，不要改动
 - 缺失字段不要抛异常中断，记录日志后继续
@@ -126,9 +149,14 @@
 
 - 汽车之家 Excel → `output/汽车之家_<车型>配置表_<YYYYMMDD>.xlsx`（多车型取首车+总数：`汽车之家_<车型>等3个车型配置表_20260728.xlsx`；同名自动追加 `_2` 序号；命名逻辑在 `autohome_cc/utils/cleaners.py` 的 `build_export_filename`）（sheet：说明/车型信息/配置分析/详细配置表/颜色明细；配置分析按动力总成分组（能源×驱动×电池电量×座位数）每组一列，保留整合后的全量参数，组内多值合并总结，差异单元格高亮）
 - 公告参数表 → `output/公告参数_<车型>_<批次>.xlsx`（多批次取区间如 `第394-406批`；关键参数 sheet 无「是否已评审」列，备注列写真实来源：公告参数页/减免车辆购置税目录/未显示未解析）；对标报告 → `output/对标报告_*.html`（销量标注懂车帝榜单具体月份，如「2026年05月销量」）
-- 减免税目录导出 → `output/jianmian_catalog.xlsx`（单文件增量覆盖）；`output/jianmian_by_category/`（6 个固定分类 xlsx 覆盖更新）
+- 减免税目录导出 → `jianmian export --by-category` 产出 `output/jianmian_by_category/`：
+  `全量.xlsx`（全部行）+ 6 个分类 xlsx，两者列结构相同。不带 `--by-category` 时只写单文件
+  `output/jianmian_catalog.xlsx`，两条路互斥。导出只反映目录库自身，不含公告 PDF 的采集状态——
+  采集覆盖率属于 Website 项目的站点库职责，本项目不反向读取它
+- 导出一律整表重写覆盖，没有增量合并；`--keyword` 会把输出文件整体换成匹配子集，别拿带 keyword 的产物当全量表
 - 口碑/销量原始数据缓存 → `downloads/benchmark/<车型>.json`（`report --offline` 依赖它；sales 字段为 `{dongchedi/autohome: {latest/half_year/year: {count,rank,label,scope}}}` 双源三维度结构；汽车之家 `scope=brand` 表示品牌检索兜底命中）
-- 工信部 PDF → `downloads/<车型>/`；查询快照 `downloads/query_*.json`，下载索引 `downloads/manifest_*.json`
+- 工信部 PDF → `downloads/announcement_site/<品牌>/<车型>/第<批次>批/`。查询快照与下载索引 → `downloads/announcement_site/_snapshots/`，**仅** `gonggao query --download` 与 `changes --download` 产出；下载索引对每条都记 `status`（`ok`/`not_pdf`/`download_failed`）与 `error`，失败项不会只留在终端。网站侧的批量采集由 Website 的 `seed_announcement_site.py` 发起，逐条状态记在它的业务库（`run_models` / `documents`），不写这里。公告网站 PDF 属动态生成内容，同一产品 ID 后续可能返回不同内容。历史快照的识别与归档（`_revisions/`）、以及 `分类公告/` 硬链接索引，都由 Website 项目的脚本负责，本项目不参与——它们依赖公告业务库，而那个库归 Website 所有。本项目只保证：主目录下每个 `<品牌>/<车型>/第<批次>批/` 里放的是当次下载的 PDF，目录名一律由 `core.build_announcement_download_dir` 生成。
+- 变更扩展公示查询快照 → `downloads/announcement_site/_snapshots/change_notice_*.json`，其中同时保存公示文章、发布日期、公示批次、命中型号和详情链接；`changes --download` 的下载索引还要记录最终命中的有效公告批次
 - PDF 只认 `%PDF` 魔数；不是 PDF 时保留 `.html` 供人工检查。非 PDF 属预期情形，只有**全部**条目都没拿到 PDF 才算失败（退出码 1），部分非 PDF 退出码为 2
 - 不要删除既有 `output/`、`downloads/` 内容，除非用户明确要求
 

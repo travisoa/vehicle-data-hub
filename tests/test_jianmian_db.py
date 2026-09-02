@@ -118,8 +118,53 @@ def test_command_export_by_category_uses_fixed_directory(tmp_path, monkeypatch):
     assert rc == 0
     assert (fixed_dir / "乘用车.xlsx").exists()
     assert (fixed_dir / "客车.xlsx").exists()
+    assert (fixed_dir / "全量.xlsx").exists()
     assert not (fixed_dir / "jianmian_by_category_legacy.xlsx").exists()
     assert not any(path.is_file() and path.name.startswith("jianmian_by_category_") for path in out_dir.iterdir())
+
+
+def _export_two_categories(tmp_path):
+    db_path = tmp_path / "db.sqlite"
+    conn = jianmian.open_db(db_path)
+    rows = [
+        {"seq": "1", "catalog": "减免车辆购置税的新能源汽车车型目录", "batch": "28", "part": "1", "energy_type": "纯电动", "category": "乘用车", "model_code": "DOC7000BEV01", "company": "测试公司"},
+        {"seq": "2", "catalog": "减免车辆购置税的新能源汽车车型目录", "batch": "28", "part": "1", "energy_type": "纯电动", "category": "客车", "model_code": "DOC7000BEV02", "company": "测试公司"},
+    ]
+    jianmian.store_article(conn, _article(), [("a.doc", rows)])
+    conn.close()
+    out_dir = tmp_path / "by_category"
+    rc = jianmian.command_export(
+        SimpleNamespace(keyword=None, by_category=True, xlsx=str(out_dir), db=str(db_path))
+    )
+    assert rc == 0
+    return out_dir
+
+
+def _sheet_rows(path):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True)
+    rows = list(workbook.active.iter_rows(values_only=True))
+    workbook.close()
+    return rows
+
+
+def test_full_export_shares_column_layout_with_categories(tmp_path):
+    """全量表与分类表列结构一致：导出只反映目录库，不掺入采集侧状态。
+
+    公告 PDF 的下载状态归 Website 项目的站点库所有，本项目不再反向读取它。
+    """
+    out_dir = _export_two_categories(tmp_path)
+
+    expected = [label for _, label in jianmian.EXPORT_HEADERS]
+    full_header, *full_rows = _sheet_rows(out_dir / f"{jianmian.EXPORT_FULL_NAME}.xlsx")
+    assert list(full_header) == expected
+    assert list(_sheet_rows(out_dir / "乘用车.xlsx")[0]) == expected
+    # 全量表覆盖全部分类的行，分类表是它的子集
+    assert {row[full_header.index("车辆型号")] for row in full_rows} == {
+        "DOC7000BEV01",
+        "DOC7000BEV02",
+    }
 
 
 def test_command_export_by_category_keeps_unrelated_xlsx(tmp_path):

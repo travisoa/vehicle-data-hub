@@ -15,7 +15,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib import error, parse, request
 
 
@@ -91,6 +91,142 @@ def find_mapping(vehicle: str | None, mappings: list[QueryProfile]) -> QueryProf
         return None
     fuzzy.sort(key=lambda item: -item[0])
     return fuzzy[0][1]
+
+
+def load_raw_mappings(path: Path = DEFAULT_MAPPING_PATH) -> list[dict[str, Any]]:
+    """读原始档案 JSON。写回时用这份而非 load_mappings，避免丢掉未建模的字段。"""
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _dedupe(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def build_profile_entry(
+    name: str,
+    *,
+    aliases: Iterable[str] = (),
+    model_prefixes: Iterable[str] = (),
+    resolved_rows: Iterable[dict[str, Any]] = (),
+    autohome_models: Iterable[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """把目录反查结果组装成统一车型档案条目，返回 (条目, 待人工确认事项)。
+
+    只写机器能确定的字段，拿不准的一律留空并在 notes 里点名，避免把猜测写进档案：
+    - trademark：公告返回多个商标时留空（同名车型可能由不同主体登记，例如代工方持有商标）
+    - filters.clmc：各条公告的车辆名称不一致时留空
+    - exclude_model_prefixes：要人判断哪些前缀是同名异车，一律不猜，故不写入该键
+    """
+    notes: list[str] = []
+    prefixes = _dedupe(model_prefixes)
+    rows = list(resolved_rows)
+
+    trademarks = _dedupe(str(row.get("cpsb") or "") for row in rows)
+    if len(trademarks) == 1:
+        trademark = trademarks[0]
+    else:
+        trademark = ""
+        detail = "、".join(trademarks) if trademarks else "无"
+        notes.append(f"公告商标未写入（反查到 {len(trademarks)} 个：{detail}），需人工确认后补 gonggao.trademark")
+
+    clmc_values = _dedupe(str(row.get("clmc") or "") for row in rows)
+    filters = {"clmc": clmc_values[0]} if len(clmc_values) == 1 else {}
+    if len(clmc_values) > 1:
+        notes.append(f"车辆名称不唯一（{'、'.join(clmc_values)}），未写入 gonggao.filters.clmc")
+
+    if not prefixes:
+        notes.append("未得到 model_prefixes，该档案对公告侧不生效")
+
+    gonggao: dict[str, Any] = {"trademark": trademark}
+    if filters:
+        gonggao["filters"] = filters
+    gonggao["model_prefixes"] = prefixes
+
+    if autohome_models is None:
+        models = [name]
+        notes.append("autohome.models 暂用市场名兜底；若汽车之家站内名称不同需人工改写")
+    else:
+        models = _dedupe(autohome_models)
+
+    entry = {
+        "name": name,
+        "aliases": _dedupe([name, *aliases]),
+        "autohome": {"models": models},
+        "gonggao": gonggao,
+    }
+    return entry, notes
+
+
+def _profile_keys(name: str, aliases: Iterable[str] = ()) -> set[str]:
+    return {normalize_key(key) for key in [name, *aliases] if key}
+
+
+def mapping_exists(entries: list[dict[str, Any]], name: str, aliases: Iterable[str] = ()) -> bool:
+    """档案里是否已有同名或同别名条目；语义与 upsert_mapping 一致（精确匹配）。
+
+    供调用方在做目录检索和公告反查之前先短路，避免为一条注定跳过的车型白跑一次网络请求。
+    """
+    keys = _profile_keys(name, aliases)
+    return any(
+        keys & _profile_keys(existing.get("name", ""), existing.get("aliases", []))
+        for existing in entries
+    )
+
+
+def upsert_mapping(
+    entries: list[dict[str, Any]],
+    entry: dict[str, Any],
+    *,
+    overwrite: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """按档案名/别名精确匹配写入，返回 (新列表, 动作)；动作为 added / updated / skipped。
+
+    这里只做精确匹配：find_mapping 的子串模糊匹配是查询侧的容错，
+    用它判断「档案是否已存在」会把「豹5」和「豹5智驾版」误判成同一条。
+    """
+    keys = _profile_keys(entry.get("name", ""), entry.get("aliases", []))
+    result = list(entries)
+    for index, existing in enumerate(result):
+        if keys & _profile_keys(existing.get("name", ""), existing.get("aliases", [])):
+            if not overwrite:
+                return result, "skipped"
+            result[index] = entry
+            return result, "updated"
+    result.append(entry)
+    return result, "added"
+
+
+def save_mappings(path: Path, entries: list[dict[str, Any]]) -> None:
+    """原子写回统一车型档案，沿用既有 JSON 风格（2 空格缩进、非 ASCII 原样、无末尾换行）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(entries, ensure_ascii=False, indent=2)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.stem}.",
+        suffix=path.suffix,
+        delete=False,
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        tmp_file.write(payload)
+    # NamedTemporaryFile 建的是 0600，直接 replace 会把档案权限一起收紧
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    os.chmod(tmp_path, mode)
+    try:
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def parse_key_value_pairs(values: list[str] | None, option_name: str) -> dict[str, str]:
@@ -611,25 +747,35 @@ def command_query(args: argparse.Namespace) -> int:
                 vehicle_folder=vehicle_folder,
                 batch=str(row.get("gppc") or row.get("pc") or ""),
             )
+            identity = {
+                "qymc": row.get("qymc", ""),
+                "cpsb": row.get("cpsb", ""),
+                "clxh": row.get("clxh", ""),
+                "clmc": row.get("clmc", ""),
+                "gppc": row.get("gppc") or row.get("pc") or "",
+                "cpid": row.get("cpid") or row.get("gid") or "",
+                "dataTag": row.get("dataTag", ""),
+                "folder": os.fspath(download_dir),
+            }
             try:
                 path, is_pdf, byte_count = download_param_page(row, download_dir)
             except Exception as exc:  # 单条下载失败不中断整批
                 errors.append(label)
+                # 失败项同样进索引：过去只记成功项，失败清单只到 stderr，命令一结束就没了
+                manifest_entries.append(
+                    {**identity, "file": "", "bytes": 0, "ok_pdf": False,
+                     "status": "download_failed", "error": f"{type(exc).__name__}: {exc}"}
+                )
                 print(f"下载失败，跳过: {label} ({exc})", file=sys.stderr)
                 continue
             manifest_entries.append(
                 {
-                    "qymc": row.get("qymc", ""),
-                    "cpsb": row.get("cpsb", ""),
-                    "clxh": row.get("clxh", ""),
-                    "clmc": row.get("clmc", ""),
-                    "gppc": row.get("gppc") or row.get("pc") or "",
-                    "cpid": row.get("cpid") or row.get("gid") or "",
-                    "dataTag": row.get("dataTag", ""),
-                    "folder": os.fspath(download_dir),
+                    **identity,
                     "file": os.fspath(path),
                     "bytes": byte_count,
                     "ok_pdf": is_pdf,
+                    "status": "ok" if is_pdf else "not_pdf",
+                    "error": "" if is_pdf else "接口返回的不是 PDF，已存为 HTML",
                 }
             )
             print(f"已下载: {path}")

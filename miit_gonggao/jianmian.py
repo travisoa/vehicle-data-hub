@@ -1259,14 +1259,19 @@ def command_search(args: argparse.Namespace) -> int:
         print(f"最新批次: {resolved[0].get('gppc') or resolved[0].get('pc')}")
 
     if args.download:
-        base_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else core.DEFAULT_OUTPUT_DIR
-        folder = base_dir / core.safe_part(args.keyword)
-        print(f"下载目录: {folder}")
+        base_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else core.DEFAULT_ANNOUNCEMENT_DIR
+        print(f"下载根目录: {base_dir}")
         errors: list[str] = []
         non_pdf: list[str] = []
         ok_pdf_count = 0
         for row in resolved:
             label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
+            folder = core.build_announcement_download_dir(
+                base_dir,
+                trademark=str(row.get("cpsb") or ""),
+                vehicle_folder=args.keyword,
+                batch=str(row.get("gppc") or row.get("pc") or ""),
+            )
             try:
                 path, is_pdf, _ = core.download_param_page(row, folder)
             except Exception as exc:  # noqa: BLE001
@@ -1374,7 +1379,10 @@ CATEGORY_GROUP_NAMES = (
     "插混及燃料电池商用车",
     "其他",
 )
-EXPORT_BY_CATEGORY_FILENAMES = frozenset(f"{name}.xlsx" for name in CATEGORY_GROUP_NAMES)
+EXPORT_FULL_NAME = "全量"
+EXPORT_BY_CATEGORY_FILENAMES = frozenset(
+    f"{name}.xlsx" for name in (*CATEGORY_GROUP_NAMES, EXPORT_FULL_NAME)
+)
 LEGACY_BY_CATEGORY_PREFIX = "jianmian_by_category_"
 
 
@@ -1433,7 +1441,7 @@ def command_export(args: argparse.Namespace) -> int:
             groups.setdefault(category_group(row["category"]), []).append(row)
         out_dir = Path(args.xlsx).expanduser().resolve() if args.xlsx else EXPORT_BY_CATEGORY_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
-        keep_names = {f"{name}.xlsx" for name in groups}
+        keep_names = {f"{name}.xlsx" for name in groups} | {f"{EXPORT_FULL_NAME}.xlsx"}
         # 只清理本工具自己会产出的文件名（当前分类名 + 旧版 jianmian_by_category_ 前缀），
         # --xlsx 可指向任意目录，目录里的其他 Excel 一律不碰
         for stale_path in out_dir.glob("*.xlsx"):
@@ -1443,6 +1451,9 @@ def command_export(args: argparse.Namespace) -> int:
                 LEGACY_BY_CATEGORY_PREFIX
             ):
                 stale_path.unlink()
+        full_path = out_dir / f"{EXPORT_FULL_NAME}.xlsx"
+        write_xlsx(rows, full_path, EXPORT_FULL_NAME)
+        print(f"已导出 {len(rows)} 行: {full_path}")
         for name, group_rows in sorted(groups.items(), key=lambda item: -len(item[1])):
             out_path = out_dir / f"{name}.xlsx"
             write_xlsx(group_rows, out_path, name)
@@ -1474,7 +1485,7 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     search_parser.add_argument("--latest-batch", action="store_true", help="--resolve/--download 时只保留最高公告批次")
     search_parser.add_argument("--all-batches", action="store_true", help="下载全部历史批次（覆盖 --latest-batch）")
     search_parser.add_argument("--limit", type=core.positive_int, help="限制展示条数")
-    search_parser.add_argument("--output-dir", help=f"--download 时的下载根目录，默认 {core.DEFAULT_OUTPUT_DIR}")
+    search_parser.add_argument("--output-dir", help=f"--download 时的下载根目录，默认 {core.DEFAULT_ANNOUNCEMENT_DIR}")
     search_parser.add_argument("--db", help=f"SQLite 路径，默认 {DB_PATH}")
     search_parser.set_defaults(func=command_search)
 
@@ -1488,7 +1499,8 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     export_parser.add_argument(
         "--by-category",
         action="store_true",
-        help="按车辆类别(6组)分文件导出；输出目录中同名的旧分类文件会被覆盖或清理，其他文件不受影响",
+        help="按车辆类别(6组)分文件导出，并同时产出一份 全量.xlsx；"
+             "输出目录中同名的旧文件会被覆盖或清理，其他文件不受影响",
     )
     export_parser.add_argument("--xlsx", help="输出文件/目录路径，默认固定到 output/jianmian_catalog.xlsx 或 output/jianmian_by_category/")
     export_parser.add_argument("--db", help=f"SQLite 路径，默认 {DB_PATH}")

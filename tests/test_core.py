@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
@@ -319,3 +320,51 @@ def test_command_query_download_all_pdf_returns_zero(tmp_path, monkeypatch):
         lambda row, folder: (folder / f"{row['clxh']}.pdf", True, 2048),
     )
     assert core.command_query(_query_args(tmp_path)) == core.EXIT_OK
+
+
+def test_download_manifest_records_failures_and_non_pdf(tmp_path, monkeypatch):
+    """下载索引必须同时记成功、非 PDF 和失败三类。
+
+    过去 manifest 只 append 成功项，失败的只打到 stderr——命令一结束失败清单就没了，
+    无法回答「这批里哪几条没拿到」。
+    """
+    rows = [
+        {"cpsb": "甲牌", "clxh": "OK1", "gppc": "408", "cpid": "1", "dataTag": "t"},
+        {"cpsb": "乙牌", "clxh": "HTML1", "gppc": "408", "cpid": "2", "dataTag": "t"},
+        {"cpsb": "丙牌", "clxh": "BOOM1", "gppc": "408", "cpid": "3", "dataTag": "t"},
+    ]
+
+    def fake_post_form(url, payload, **kwargs):
+        if payload["gid"] == "3":
+            raise RuntimeError("连接被重置")
+        body = b"%PDF-1.4 ok" if payload["gid"] == "1" else "<html>没有找到参数页</html>".encode()
+        return body, {}
+
+    monkeypatch.setattr(core, "post_form", fake_post_form)
+    monkeypatch.setattr(core, "query_all_pages", lambda **kwargs: rows)
+
+    args = argparse.Namespace(
+        vehicle=None, vehicle_name="", mapping_file=str(tmp_path / "absent.json"),
+        trademark="甲牌", company="", model_code="", model_prefix=[], exclude_model_prefix=[],
+        row_filter=[], pc="", page_size=50, all_pages=False, latest_batch=False,
+        limit=None, download=True, detail_html=False, output_dir=str(tmp_path),
+        flat_output=False, vehicle_folder="测试车",
+    )
+    code = core.command_query(args)
+
+    manifests = sorted((tmp_path / core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("manifest_*.json"))
+    assert len(manifests) == 1
+    entries = json.loads(manifests[0].read_text(encoding="utf-8"))
+    by_model = {entry["clxh"]: entry for entry in entries}
+
+    # 三条全部入索引，而不是只有成功的那条
+    assert set(by_model) == {"OK1", "HTML1", "BOOM1"}
+    assert by_model["OK1"]["status"] == "ok"
+    assert by_model["OK1"]["ok_pdf"] is True
+    assert by_model["HTML1"]["status"] == "not_pdf"
+    assert by_model["HTML1"]["ok_pdf"] is False
+    assert by_model["BOOM1"]["status"] == "download_failed"
+    assert by_model["BOOM1"]["file"] == ""
+    assert "连接被重置" in by_model["BOOM1"]["error"]
+    # 拿到 1 份 PDF + 2 条需人工检查 -> 部分成功
+    assert code == core.EXIT_DOWNLOAD_PARTIAL
