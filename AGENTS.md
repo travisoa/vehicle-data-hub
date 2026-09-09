@@ -14,7 +14,8 @@
 数据流单向：本项目 → Website，不存在反向依赖。判断一处改动是否越界，只问一句：**它读写的资产，唯一写入方是谁？**
 
 本项目独占写入：`data/jianmian_catalog.sqlite`、`data/vehicle_profiles.json`、
-`downloads/announcement_site/**/*.pdf`（PDF 本体）、`downloads/announcement_site/_snapshots/`、`output/`。
+`downloads/announcement_site/**/*.pdf`（PDF 本体）、`downloads/announcement_site/_snapshots/`、
+`downloads/announcement_batches/`（公告批次枚举缓存，见下）、`output/`。
 
 Website 独占写入（其中后两项物理位置在本项目目录下，所有权仍归 Website）：
 `Website/data/announcement_site.sqlite`（采集业务库）、`Website/dist/site-*.sqlite`（站点只读库）、
@@ -83,6 +84,31 @@ Website 独占写入（其中后两项物理位置在本项目目录下，所有
 - 2020~2022 年的《新能源汽车推广应用推荐车型目录》表头无"通用名称"列，不入库（警告跳过属预期）
 - 典型用途：新车只知道市场名时 `jianmian search <市场名> --resolve` 反查公告型号与商标，再沉淀进车型档案
 
+### 目录未覆盖车型（`scripts/announcement_catalog_gap.py`）
+
+反过来问「公告发布了、但没进新能源目录的车型有哪些」，输出格式与
+`jianmian export --by-category` 前 19 列完全对齐，可直接与目录表拼接：
+
+```bash
+.venv/bin/python scripts/announcement_catalog_gap.py --batch 409         # 单批
+.venv/bin/python scripts/announcement_catalog_gap.py --batch 173-409     # 全部可查批次
+```
+
+- 公告参数查询接口**拒绝只带 `pc` 的空条件查询**（`respCode=500`「请输入查询条件」），
+  因此按企业名称关键词并集枚举整批，再用型号两字母前缀反查交叉校验完备性；
+  接口同样**不支持第 173 批以下**（`不支持对小于173批以下的数据查询.`），脚本自动跳过
+- 每批枚举结果缓存到 `downloads/announcement_batches/batch<N>.json`，重复导出不再打接口；
+  单批失败不中断其余批次，`--refresh` 强制重抓
+- 类别按 `Website/docs/architecture.md` §2.4 的型号类别码推导，并补齐该文档标注「扩全量时需补」
+  的三类：码 8=摩托车、码 9=挂车、数字开头型号=三轮汽车
+- 公告接口只返回 11 个键，续驶里程/油耗/排量/整备质量/电池等目录字段在参数页 PDF 里，
+  导出时**留空而不是编造**
+- Excel 按车辆型号去重（跨批次同型号取最新批次，另记出现批次数与最早批次），
+  逐产品 ID 明细另出 CSV——全量批次的产品记录数会超过 Excel 单表 104 万行上限
+- 缓存 v4 只复用「完整 + 通过所需交叉校验 + 7 天内」的结果；部分失败另存 `.partial.json`
+  并向调用方返回失败，批次在上游没有数据表则另存 `.absent.json` 待下次重新探测。
+  这两类文件都是证据，不得当作成功全集参与导出
+
 ### 跨平台运行（macOS / Windows / Linux）
 
 三平台均可运行，全部功能无平台专有依赖。`jianmian sync` / `rename` 需要 LibreOffice 把目录附件
@@ -139,6 +165,7 @@ Website 独占写入（其中后两项物理位置在本项目目录下，所有
 ## 抓取与网络规则
 
 - 两个来源都保持低频、串行、温和，不加激进并发
+- 例外：`scripts/announcement_catalog_gap.py` 的全量批次枚举是一次性只读大作业（约 2.9 万次请求），经项目所有者授权可用 `--fast`（0.2~0.4 秒）或 `--min-interval/--max-interval` 提速。它只覆盖该进程内的 `core.REQUEST_MIN_INTERVAL`，不改 `core.py` 默认值，PDF 下载等其他功能不受影响；仍然串行（同等平均 QPS 下比并发对服务端更平滑），且连续 3 次请求异常会自动降回保守节流。默认不提速，必须显式传参
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
 - `query --download` 与 `changes --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
@@ -157,6 +184,9 @@ Website 独占写入（其中后两项物理位置在本项目目录下，所有
 - 口碑/销量原始数据缓存 → `downloads/benchmark/<车型>.json`（`report --offline` 依赖它；sales 字段为 `{dongchedi/autohome: {latest/half_year/year: {count,rank,label,scope}}}` 双源三维度结构；汽车之家 `scope=brand` 表示品牌检索兜底命中）
 - 工信部 PDF → `downloads/announcement_site/<品牌>/<车型>/第<批次>批/`。查询快照与下载索引 → `downloads/announcement_site/_snapshots/`，**仅** `gonggao query --download` 与 `changes --download` 产出；下载索引对每条都记 `status`（`ok`/`not_pdf`/`download_failed`）与 `error`，失败项不会只留在终端。网站侧的批量采集由 Website 的 `seed_announcement_site.py` 发起，逐条状态记在它的业务库（`run_models` / `documents`），不写这里。公告网站 PDF 属动态生成内容，同一产品 ID 后续可能返回不同内容。历史快照的识别与归档（`_revisions/`）、以及 `分类公告/` 硬链接索引，都由 Website 项目的脚本负责，本项目不参与——它们依赖公告业务库，而那个库归 Website 所有。本项目只保证：主目录下每个 `<品牌>/<车型>/第<批次>批/` 里放的是当次下载的 PDF，目录名一律由 `core.build_announcement_download_dir` 生成。
 - 变更扩展公示查询快照 → `downloads/announcement_site/_snapshots/change_notice_*.json`，其中同时保存公示文章、发布日期、公示批次、命中型号和详情链接；`changes --download` 的下载索引还要记录最终命中的有效公告批次
+- 公示 `notice_batch` 以文章标题为准；表格原始批次保留在 `raw_notice_batch`，混合列保留在
+  `batch_or_chassis_id`，不得把底盘 ID 当作公告批次。解析仅跳过明确整行合计，缺列、未知合并行
+  和缺型号均报告表格行号并停止登记，不静默丢弃产品行。
 - PDF 只认 `%PDF` 魔数；不是 PDF 时保留 `.html` 供人工检查。非 PDF 属预期情形，只有**全部**条目都没拿到 PDF 才算失败（退出码 1），部分非 PDF 退出码为 2
 - 不要删除既有 `output/`、`downloads/` 内容，除非用户明确要求
 

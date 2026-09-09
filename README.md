@@ -642,3 +642,14 @@ Autohome 返回权限或验证页时，有三种处理方式：
 MIT License © [travisoa](https://github.com/travisoa/)
 
 </div>
+
+### 公告批次枚举缓存
+
+`python scripts/announcement_catalog_gap.py --batch <批次> --fetch-only` 用于完整枚举。
+缓存 v4 仅复用 7 天内的完整结果；关键词或校验失败保存 `.partial.json` 并以失败结束，
+缺失批次保存 `.absent.json` 并在下一次重新探测，均不覆盖已有成功缓存。
+Website 的近期公告/公示跟踪及数据库写入由 Website 项目负责。
+公示表格按实际表头定位企业、产品名称、型号，兼容新产品及变更扩展列顺序；
+无法识别时停止，不把错位或不完整结果当作有效清单，行错误指出表格行号。
+明确的整行合计可跳过，未知合并行仍阻断登记。`notice_batch` 取文章批次，
+原始表格批次/混合列分别保留为 `raw_notice_batch` / `batch_or_chassis_id`，不把底盘 ID 当批次。

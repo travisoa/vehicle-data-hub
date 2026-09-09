@@ -125,6 +125,8 @@ def load_change_notice_source(notice_url: str = DEFAULT_CHANGE_NOTICE_URL) -> Ch
 NOTICE_COLUMNS = (
     "notice_title",
     "notice_batch",
+    "raw_notice_batch",
+    "batch_or_chassis_id",
     "company",
     "trademark",
     "product_name",
@@ -138,24 +140,52 @@ def parse_change_notice_rows(html: str, base_url: str) -> tuple[list[dict[str, s
     if table is None:
         raise RuntimeError("公示查询响应缺少结果表格")
 
+    # 新产品公示和变更扩展公示的列数/顺序可能不同，按表头定位，拒绝错位入库。
+    aliases = {
+        "标题": "notice_title", "批次": "raw_notice_batch", "批次或底盘ID": "batch_or_chassis_id",
+        "企业名称": "company", "生产企业": "company", "产品商标": "trademark",
+        "商标": "trademark", "产品名称": "product_name", "车辆名称": "product_name",
+        "产品型号": "model_code", "车辆型号": "model_code",
+    }
+    trs = table.find_all("tr")
+    if not trs:
+        raise RuntimeError("公示清单没有表头")
+    headings = [re.sub(r"\s+", "", cell.get_text())
+                for cell in trs[0].find_all(["td", "th"], recursive=False)]
+    mapping = {index: aliases[name] for index, name in enumerate(headings) if name in aliases}
+    if not {"company", "product_name", "model_code"}.issubset(mapping.values()):
+        raise RuntimeError("公示表头第1行无法识别企业、产品名称和型号，停止登记")
+    if len(set(mapping.values())) != len(mapping):
+        raise RuntimeError("公示表头第1行存在重复字段，无法确定列对应关系")
     rows: list[dict[str, str]] = []
-    for tr in table.find_all("tr")[1:]:
+    for row_number, tr in enumerate(trs[1:], 2):
         cells = tr.find_all("td", recursive=False)
-        if len(cells) < len(NOTICE_COLUMNS):
+        if not cells:
             continue
-        values: list[str] = []
+        # 只跳过明确的整行合计，不把任意缺列/合并产品行当作页脚吞掉。
+        text = tr.get_text(" ", strip=True)
+        if (len(cells) == 1 and str(cells[0].get("colspan", "1")).isdigit()
+                and int(cells[0].get("colspan", "1")) >= len(headings)
+                and re.fullmatch(r"(?:合计|总计|共计)\s*[:：]?\s*(?:\d+\s*(?:条|项|个)?)?", text)):
+            continue
+        if any(str(cell.get(attr, "1")) != "1" for cell in cells for attr in ("colspan", "rowspan")):
+            raise RuntimeError(f"公示产品行第{row_number}行存在无法识别的合并单元格")
+        if len(cells) <= max(mapping):
+            raise RuntimeError(f"公示产品行第{row_number}行缺列，不能作为完整清单")
+        row = dict.fromkeys(NOTICE_COLUMNS, "")
         detail_url = ""
-        for cell in cells[: len(NOTICE_COLUMNS)]:
+        for index, field in mapping.items():
+            cell = cells[index]
             div = cell.find("div")
             value = str(div.get("title") or "").strip() if div else ""
-            if not value:
-                value = cell.get_text(" ", strip=True)
-            values.append(value)
-            if not detail_url:
-                link = cell.find("a", href=True)
-                if link:
-                    detail_url = parse.urljoin(base_url, str(link["href"]))
-        row = dict(zip(NOTICE_COLUMNS, values, strict=True))
+            row[field] = value or cell.get_text(" ", strip=True)
+        for cell in cells:
+            link = cell.find("a", href=True)
+            if link:
+                detail_url = parse.urljoin(base_url, str(link["href"]))
+                break
+        if not row["model_code"]:
+            raise RuntimeError(f"公示产品行第{row_number}行缺少精确型号")
         row["detail_url"] = detail_url
         rows.append(row)
 
@@ -219,6 +249,9 @@ def query_change_notice(
         source, search=search, page_num=1, page_size=page_size
     )
     rows, total, actual_page_size = parse_change_notice_rows(first_html, source.iframe_url)
+    # 目标公告批次取文章标题；原始表格批次/底盘 ID 分字段保留，禁止混用。
+    for row in rows:
+        row["notice_batch"] = source.batch
     if limit is not None and len(rows) >= limit:
         return rows[:limit], total
 
@@ -230,6 +263,8 @@ def query_change_notice(
         page_rows, _page_total, _page_size = parse_change_notice_rows(
             page_html, source.iframe_url
         )
+        for row in page_rows:
+            row["notice_batch"] = source.batch
         rows.extend(page_rows)
         if limit is not None and len(rows) >= limit:
             return rows[:limit], total

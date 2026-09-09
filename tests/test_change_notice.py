@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from miit_gonggao import change_notice
 
@@ -83,7 +84,9 @@ def test_parse_change_notice_rows():
     assert rows == [
         {
             "notice_title": "多用途乘用车",
-            "notice_batch": "404",
+            "notice_batch": "",
+            "raw_notice_batch": "",
+            "batch_or_chassis_id": "404",
             "company": "示例汽车有限公司",
             "trademark": "示例牌",
             "product_name": "多用途乘用车",
@@ -123,3 +126,52 @@ def test_latest_effective_rows_requires_exact_model_and_highest_batch(monkeypatc
     )
     rows = change_notice.latest_effective_rows("abc6500ev")
     assert rows == [{"clxh": "ABC6500EV", "gppc": "409"}]
+
+
+def test_new_product_notice_uses_headers_not_fixed_column_positions():
+    html = '''<div class="page-content"><table>
+      <tr><th>序号</th><th>企业名称</th><th>产品型号</th><th>产品名称</th><th>商标</th></tr>
+      <tr><td>1</td><td>测试公司</td><td>ZZ7000BEV</td><td>纯电动轿车</td><td>测试牌</td></tr>
+    </table></div>'''
+    rows, total, _ = change_notice.parse_change_notice_rows(html, IFRAME_URL)
+    assert total == 1
+    assert rows[0]['model_code'] == 'ZZ7000BEV'
+    assert rows[0]['product_name'] == '纯电动轿车'
+    assert rows[0]['notice_batch'] == ''
+
+
+def test_summary_row_does_not_discard_products():
+    html = _result_html(model_code='ABC7000').replace(
+        '</table>', '<tr><td colspan="6">合计：1 条</td></tr></table>')
+    rows, total, _ = change_notice.parse_change_notice_rows(html, IFRAME_URL)
+    assert total == len(rows) == 1
+    assert rows[0]['model_code'] == 'ABC7000'
+
+
+@pytest.mark.parametrize('html,message', [
+    ('<div/>', '缺少结果表格'),
+    ('<div class="page-content"><table></table></div>', '没有表头'),
+    ('<div class="page-content"><table><tr><th>未知列</th></tr></table></div>', '表头第1行'),
+    (_result_html(model_code='ABC7000').replace('<th>产品商标</th>', '<th>企业名称</th>'), '重复字段'),
+    (_result_html(model_code=''), '第2行缺少精确型号'),
+    (_result_html(model_code='ABC7000').replace('<td><div title="ABC7000">ABC7000</div></td>', ''),
+     '第2行缺列'),
+    (_result_html(model_code='ABC7000').replace('</table>',
+     '<tr><td colspan="6">未知产品数据</td></tr></table>'), '第3行存在无法识别'),
+])
+def test_malformed_notice_fails_with_context(html, message):
+    with pytest.raises(RuntimeError, match=message):
+        change_notice.parse_change_notice_rows(html, IFRAME_URL)
+
+
+def test_article_batch_preserves_raw_batch_and_chassis_column(monkeypatch):
+    def fake_fetch(source, **kwargs):
+        html = _result_html(model_code='ABC7000')
+        html = html.replace('<div title="404">404</div>', '<div title="DP123">DP123</div>')
+        return html.replace('<th>标题</th>', '<th>批次</th>').replace(
+            '<div title="多用途乘用车"><a', '<div title="403"><a')
+    monkeypatch.setattr(change_notice, '_fetch_unit_html', fake_fetch)
+    rows, _ = change_notice.query_change_notice(_source())
+    assert rows[0]['notice_batch'] == '404'
+    assert rows[0]['raw_notice_batch'] == '403'
+    assert rows[0]['batch_or_chassis_id'] == 'DP123'
