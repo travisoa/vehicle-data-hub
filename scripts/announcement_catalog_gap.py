@@ -85,6 +85,12 @@ MIN_QUERYABLE_BATCH = 173
 XLSX_MAX_ROWS = 1_000_000
 
 
+# 摩托车、挂车、三轮汽车、低速汽车是独立产品序列，型号不按 GB 9417 编制，
+# 但形如 AMT1200DZK-35 同样能匹配「字母+类别码」，只看类别码会把电动正三轮摩托车
+# 判成货车。必须先按产品名称把它们摘出去。见 Website/docs/architecture.md §2.4。
+NON_AUTOMOTIVE = re.compile(r"摩托车|挂车|三轮汽车|低速汽车|低速货车")
+
+
 def derive_category(model_code: str, product_name: str) -> str:
     """GB 9417 型号类别码 + 产品名称，见 Website/docs/architecture.md §2.4。
 
@@ -93,6 +99,9 @@ def derive_category(model_code: str, product_name: str) -> str:
     是独立产品序列，单独成组，不塞进「其他」。
     """
     name = product_name or ""
+    if NON_AUTOMOTIVE.search(name):
+        return "挂车" if "挂车" in name else "三轮汽车" if "三轮汽车" in name else (
+            "低速汽车" if "低速" in name else "摩托车")
     match = re.match(r"^[A-Za-z]+(\d)", model_code or "")
     if not match:
         return "三轮汽车" if "三轮汽车" in name else "未分类"
