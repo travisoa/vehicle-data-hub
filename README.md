@@ -320,11 +320,16 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 | --- | --- |
 | `fetch <车型>...` | 按统一车型档案同时抓取两个来源 |
 | `autohome ...` | 汽车之家配置抓取完整 CLI（`--models`、`--capture-file`、`--cookies`、`--browser-login` 等） |
-| `gonggao ...` | 工信部公告查询完整 CLI（含 `query`、`changes`、`profiles`、`jianmian` 子命令） |
+| `gonggao ...` | 工信部公告查询完整 CLI（含 `collect`、`query`、`changes`、`profiles`、`jianmian` 子命令） |
 | `review <车型/PDF>...` | 公告参数页 PDF 转公告参数 Excel（[详解](#公告参数表review)） |
 | `report <车型> --vs ...` | 口碑与销量竞品对标 HTML 报告（[详解](#竞品对标报告report)） |
 | `profiles` | 列出统一车型档案 |
 | `profiles add <市场名>...` | 按市场名反查公告条件并写入档案（`-f` 名单文件可批量，`--dry-run` 预览） |
+
+网站批量收录、补采及重试先使用 `main.py gonggao collect`，
+按 [公告采集契约](docs/announcement-collection.md) 选择模式；不要为新批次或提速另建下载脚本。
+能力不足时扩展原入口的参数或内部策略。下面的 `query/changes --download` 用于独立查询下载，
+不能代替网站采集库登记。
 
 两个来源的全部参数均在各自子命令下可用：
 
@@ -529,9 +534,11 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 | `output/jianmian_by_category/<类别>.xlsx` | 减免税目录分类导出（6 个固定 xlsx） |
 | `downloads/announcement_site/<品牌>/<车型>/第<批次>批/*.pdf` | 工信部公告参数页 PDF；接口未返回 PDF 时保留同名 `.html` 供人工核查 |
 | `downloads/benchmark/<车型>.json` | 口碑与销量原始数据缓存（`report --offline` 复用） |
-| `downloads/announcement_site/_snapshots/query_*.json` / `manifest_*.json` | `gonggao query --download` 的查询快照与下载索引；索引含成功与失败两类条目（`status` 为 `ok`/`not_pdf`/`download_failed`）。网站侧的批量采集走 Website 的 seed 脚本，记录进它的业务库，不产出这两个文件 |
+| `downloads/announcement_site/_snapshots/query_*.json` / `manifest_*.json` | `gonggao query --download` 的查询快照与下载索引；索引含成功与失败两类条目（`status` 为 `ok`/`not_pdf`/`download_failed`）。网站批量采集用本项目 `gonggao collect`，统一登记 `data/announcement_site.sqlite`，保留独立的来源证据 |
 | `downloads/announcement_site/_revisions/` | 公告网站动态页面变更前的 PDF 快照；`manifest.json` 记录原始哈希、当前哈希、PDF 生成时间与字段差异，不参与主库分类或普通查询 |
 | `downloads/jianmian/<文章ID>_公告第N批/` | 减免税目录附件及派生缓存 |
+| `data/announcement_site.sqlite` | 公告采集、文档、解析参数与公示跟踪的权威业务库 |
+| `var/runs/` / `var/reports/` | 上游采集清单、进度、逐产品日志和报告 |
 | `data/jianmian_catalog.sqlite` | 减免税目录车型库（本地数据，不纳入版本管理） |
 | `logs/` | 汽车之家抓取运行日志 |
 
@@ -649,7 +656,7 @@ MIT License © [travisoa](https://github.com/travisoa/)
 `python scripts/announcement_catalog_gap.py --batch <批次> --fetch-only` 用于完整枚举。
 缓存 v4 仅复用 7 天内的完整结果；关键词或校验失败保存 `.partial.json` 并以失败结束，
 缺失批次保存 `.absent.json` 并在下一次重新探测，均不覆盖已有成功缓存。
-Website 的近期公告/公示跟踪及数据库写入由 Website 项目负责。
+近期公告/公示跟踪由本项目 `miit_gonggao.collection_tracking` 写入上游权威业务库；Website 只读构建派生库。
 公示表格按实际表头定位企业、产品名称、型号，兼容新产品及变更扩展列顺序；
 无法识别时停止，不把错位或不完整结果当作有效清单，行错误指出表格行号。
 明确的整行合计可跳过，未知合并行仍阻断登记。`notice_batch` 取文章批次，

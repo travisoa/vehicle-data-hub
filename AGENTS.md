@@ -33,6 +33,9 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 
 统一用项目虚拟环境运行：`.venv/bin/python main.py ...`（首次先 `./scripts/bootstrap.sh`）。
 
+**若任务是网站批量收录、历史补采、重试或提速，先按下面的「批量采集复用约束」执行；**
+下列 `fetch/query --download` 流程用于车型查询和独立文件交付，不替代网站业务库登记。
+
 1. **判断用户要哪类内容**：
    - 要配置对比 / 参数表 / Excel → 汽车之家：`--source autohome`
    - 要公告页 / 公告参数 PDF / 工信部数据 → 工信部：`--source gonggao`
@@ -73,6 +76,26 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 .venv/bin/python main.py review <车型> [-o 输出.xlsx] [--no-catalog]   # 公告 PDF -> 公告参数 Excel
 .venv/bin/python main.py report <本品> --vs <竞品1> <竞品2> [--focus all|sales|koubei] [--offline] [--pages N]
 ```
+
+## 批量采集复用约束
+
+- 开始网站采集任务前，先读 `docs/announcement-collection.md`，检查
+  `main.py gonggao collect --help`、所选模式及既有轮次/清单；不得未查入口就编写下载脚本。
+- 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
+  `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
+  新建独立批量下载入口，也不得复制已有下载循环。
+- 能力不足时，先定位缺少的参数、候选选择或恢复能力，在既有 `collection*.py` 中扩展。
+  可按职责拆分内部策略模块，但必须接入原入口，复用 `store_announcement`、锁、解析、
+  状态收尾和权威业务库；内部拆分不构成新增一套采集器的理由。
+- 禁止用临时 Python、Shell、Notebook、后台进程或另一个库绕开上述约束。
+  一次性辅助代码可只读统计、估算、生成名单或核验结果，不能发起 PDF 下载或另写采集状态。
+- 每轮变化放入上游 `var/runs/<本轮>/` 的清单、参数和日志；通用代码不带任务日期/批次硬编码。
+  恢复固定清单使用原清单/哈希及 `--resume-run`，提速使用现有模式支持的节流参数。
+  不得删改清单校验、并发锁或失败保护来完成运行；跨轮按最好结局避免重复下载。
+- Website 兼容脚本仅转发，不增加业务逻辑；业务库、PDF、下载日志保持上游唯一活动资产。
+  发布数据只读消费；本轮是否下载及收录范围仍以用户命令为准。
+- 修改采集能力时，交付说明应列出复用入口、实际能力缺口、修改模块、数据落点及验证结果。
+  旧架构设想、历史报告和记忆不能作为新增独立下载入口的依据；当前规则见本节和采集文档。
 
 ## 减免购置税目录（jianmian）
 
