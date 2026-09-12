@@ -19,7 +19,7 @@
 `downloads/announcement_batches/`、`var/runs/`、采集报告及 `output/`。
 Website 独占写入其派生站点库、前后端、站点构建/部署产物；只读消费上游业务库和 PDF。
 2026-09-12 已把 Website 的采集实现与完整业务库统一迁入本项目；Website 旧脚本为兼容转发，
-旧数据库/运行目录为符号链接，不能再建立独立副本。详见 `docs/announcement-collection.md`。
+旧数据库/运行目录为符号链接，不能再建立独立副本。详见 `README.md` 的“公告批量采集”章节。
 `main.py gonggao collect` 是批量入口：目录/型号名单与固定产品清单共享下载、解析、入库和状态收尾；
 `collection_tracking` 管理近期事件，`collection_report` 生成采集报告。
 历史 CLI 查询的 `manifest_*.json` 保持原始证据，不改写成网站采集轮次。
@@ -79,7 +79,7 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 
 ## 批量采集复用约束
 
-- 开始网站采集任务前，先读 `docs/announcement-collection.md`，检查
+- 开始网站采集任务前，先读 `README.md` 的“公告批量采集”章节，检查
   `main.py gonggao collect --help`、所选模式及既有轮次/清单；不得未查入口就编写下载脚本。
 - 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
   `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
@@ -123,8 +123,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   接口同样**不支持第 173 批以下**（`不支持对小于173批以下的数据查询.`），脚本自动跳过
 - 每批枚举结果缓存到 `downloads/announcement_batches/batch<N>.json`，重复导出不再打接口；
   单批失败不中断其余批次，`--refresh` 强制重抓
-- 类别按 `Website/docs/architecture.md` §2.4 的型号类别码推导，并补齐该文档标注「扩全量时需补」
-  的三类：码 8=摩托车、码 9=挂车、数字开头型号=三轮汽车
+- 类别按 本项目 `scripts/announcement_catalog_gap.py:derive_category` 生成导出分组。
+  该分组不代替汽车整车收录判断；网站范围统一由 `miit_gonggao.vehicle_classification` 判断
 - 公告接口只返回 11 个键，续驶里程/油耗/排量/整备质量/电池等目录字段在参数页 PDF 里，
   导出时**留空而不是编造**
 - Excel 按车辆型号去重（跨批次同型号取最新批次，另记出现批次数与最早批次），
@@ -219,6 +219,10 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 不要删除既有 `output/`、`downloads/` 内容，除非用户明确要求
 
 ## 开发规则
+
+- README 集中维护现行结构、命令与数据契约；完成的审查、迁移和设计记录由 Git 追溯，
+  一次性产物留在 `var/reports/`。新增能力更新原章节，不另写重复方案或长期历史审查页。
+  合并/清理文档时保留有效约束与恢复信息，并修复本项目和 Website 的所有引用。
 
 - `autohome_cc/`、`miit_gonggao/` 包内导入统一用 `autohome_cc.xxx` / `miit_gonggao.xxx` 前缀，不要写成顶层导入
 - 解析逻辑与抓取逻辑保持分离，方便扩字段

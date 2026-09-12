@@ -20,7 +20,7 @@ DAYS = 60
 BATCHES = 2
 KINDS = {'formal', 'new_notice', 'change_notice'}
 # 工信部公告里汽车、摩托车、挂车、三轮汽车、低速汽车是彼此独立的产品序列，各有各的
-# 型号编制规则。本站只做汽车四频道（见 docs/architecture.md §2.4、§14.2），其余序列
+# 型号编制规则。本站只做汽车四频道（范围见 Website/docs/collection-boundary.md），其余序列
 # 不登记、不采集、不入库。判定必须看产品名称：摩托车型号同样是「字母+数字」结构，
 # 首位数字也落在 1-7，单靠 GB 9417 类别码会把「电动正三轮摩托车 AMT1200DZK-35」判成货车。
 SCHEMA = """
