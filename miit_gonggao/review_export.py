@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sqlite3
 import sys
@@ -118,10 +119,40 @@ def _line_text(line: list[dict[str, Any]]) -> str:
     return " ".join(str(w["text"]) for w in line)
 
 
-def parse_words(words: list[dict[str, Any]]) -> dict[str, str]:
+def _converted_headers(lines: list[list[dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """定位同一行中相邻的表头词，兼容「底盘」+「ID」等拆词结果。"""
+    labels = ('底盘ID', '底盘型号', '底盘类别', '底盘名称')
+    headers: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        for index, first in enumerate(line):
+            for label in labels:
+                text = ''
+                previous = None
+                for position in range(index, len(line)):
+                    word = line[position]
+                    if previous and float(word['x0']) - float(previous['x1']) > 6:
+                        break
+                    text += re.sub(r'\s+', '', str(word['text']))
+                    if not label.startswith(text):
+                        break
+                    if text == label:
+                        headers.setdefault(label, dict(first, text=label, x1=word['x1']))
+                        break
+                    previous = word
+    return headers
+
+
+def parse_words(
+    words: list[dict[str, Any]], *, detect_converted_layout: bool = True,
+) -> dict[str, str]:
     """从词坐标列表解析公告参数页字段。"""
-    fields: dict[str, str] = {}
+    # 改装车版式是横向底盘表 + 全宽其他说明，不能套用整车的底部三栏坐标。
     lines = _group_lines(words)
+    if detect_converted_layout:
+        headers = _converted_headers(lines)
+        if '底盘ID' in headers:
+            return _parse_converted_words(words, headers)
+    fields: dict[str, str] = {}
 
     def find_word(prefix: str) -> dict[str, Any] | None:
         for word in words:
@@ -163,7 +194,7 @@ def parse_words(words: list[dict[str, Any]]) -> dict[str, str]:
 
     # 3) 产品型号名称 -> 型号 + 产品名称
     model_full = fields.get("model_full", "")
-    split = re.match(r"^([A-Za-z0-9\-]+)\s*型(.+)$", model_full)
+    split = re.match(r"^([A-Za-z0-9/\-]+)\s*型(.+)$", model_full)
     fields["model_code"] = split.group(1) if split else model_full
     fields["product_name"] = split.group(2).strip() if split else ""
 
@@ -245,6 +276,65 @@ def parse_words(words: list[dict[str, Any]]) -> dict[str, str]:
     # 5) 货厢栏板合并
     cargo = [fields.get(f"cargo_{name}", "") for name in ("length", "width", "height")]
     fields["cargo_dims"] = "×".join(cargo) if any(cargo) else ""
+    return fields
+
+
+def _parse_converted_words(
+    words: list[dict[str, Any]], headers: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """改装车参数页：按实际表头定位底盘引用，保留全宽用途说明。
+
+    该版式没有燃料种类字段，不能从油耗、运输介质或型号尾缀补造能源。
+    """
+    if not all(label in headers for label in ('底盘ID', '底盘型号', '底盘类别', '底盘名称')):
+        raise ValueError('改装车底盘表缺少必要表头')
+    top = min(float(w['top']) for w in headers.values())
+    vin = next((w for w in words if str(w['text']).startswith('车辆识别代号')), None)
+    cutoff = min(top, float(vin['top'])) if vin else top
+    fields = parse_words(
+        [w for w in words if float(w['top']) < cutoff - 2],
+        detect_converted_layout=False,
+    )
+    labels = {label: next((w for w in words if str(w['text']).startswith(label + ':')
+                          or str(w['text']).startswith(label + '：')), None)
+              for label in ('油耗', '车身反光标识说明', '其他')}
+    bottom = min((float(w['top']) for w in labels.values() if w), default=float('inf'))
+    columns = [(float(headers[label]['x0']), key) for label, key in
+               [('底盘ID', 'product_id'), ('底盘型号', 'model_code'),
+                ('底盘类别', 'category'), ('底盘名称', 'product_name')]]
+    right = float(vin['x0']) - 5 if vin else float('inf')
+    refs = []
+    for line in _group_lines([w for w in words if top + 3 < float(w['top']) < bottom - 2]):
+        cells = {key: [] for _, key in columns}
+        for w in line:
+            x = float(w['x0'])
+            if x < columns[0][0] - 2 or x >= right:
+                continue
+            key = next((key for left, key in reversed(columns) if x >= left - 2), None)
+            if key:
+                cells[key].append(str(w['text']))
+        ref = {key: ''.join(parts) for key, parts in cells.items()}
+        if ref['product_id'] or ref['model_code']:
+            refs.append(ref)
+    fields['chassis'] = ';'.join(r['model_code'] for r in refs)
+    fields['chassis_references'] = json.dumps(refs, ensure_ascii=False)
+    fields['pdf_layout'] = 'converted_vehicle'
+    if vin:
+        # VIN 仅从它自己的右栏取得；不把底盘 ID、行号和底盘型号拼成 VIN。
+        fields['vin'] = ''.join(str(w['text']) for line in _group_lines(words) for w in line
+                               if float(w['x0']) >= right
+                               and float(vin['top']) + 3 < float(w['top']) < bottom - 2)
+    for label, key in [('油耗', 'fuel_consumption_page'),
+                       ('车身反光标识说明', 'reflective_marking'), ('其他', 'other')]:
+        start = labels[label]
+        if not start:
+            continue
+        y = float(start['top'])
+        end = min((float(w['top']) for w in labels.values() if w and float(w['top']) > y + 3),
+                  default=float('inf'))
+        section = [w for w in words if y - 2 <= float(w['top']) < end - 2]
+        text = ''.join(str(w['text']) for line in _group_lines(section) for w in line)
+        fields[key] = re.sub('^' + re.escape(label) + r'[:：]', '', text).strip()
     return fields
 
 

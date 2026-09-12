@@ -6,6 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
 from openpyxl import load_workbook
 
 from miit_gonggao.review_export import _batch_filename_part, _collect_pdfs, export_review_excel, lookup_catalog, parse_words
@@ -53,6 +54,76 @@ def test_parse_words_core_fields():
     assert fields["engine_power"] == "152"
     assert fields["other"].startswith("该产品为新能源车辆")
     assert "峰值功率" in fields["other"]
+
+
+@pytest.mark.parametrize('id_parts', [
+    [('底盘ID', 54, 85, 0)],
+    [('底盘', 54, 74, 0), ('ID', 76, 87, 1)],
+    [('底', 54, 64, 0), ('盘', 65, 75, 0), ('I', 76, 79, 1), ('D', 80, 86, 1)],
+    [('底盘 ID', 54, 87, 0)],
+])
+def test_converted_layout_keeps_chassis_separate_from_vin_and_full_width_other(id_parts):
+    def word(text, x, y):
+        return {'text': text, 'x0': x, 'x1': x + 40, 'top': y}
+
+    words = [word('改装车产品技术参数', 180, 20),
+             word('产品型号名称:TEST5381/C6型泡沫消防车', 35, 100),
+             word('总质量(kg):', 36, 300), word('37675', 117, 300),
+             word('车辆识别代号:', 419, 519),
+             *[dict(word(text, x0, 527 + offset), x1=x1) for text, x0, x1, offset in id_parts],
+             word('底盘型号', 112, 527),
+             word('底盘类别', 231, 527), word('底盘名称', 294, 527),
+             word('1、', 35, 547), word('1234567', 54, 547),
+             word('TEST1380', 112, 547), word('二类', 231, 547),
+             word('载货汽车底盘', 295, 547), word('LTEST123×××××××××', 419, 547),
+             word('2、', 35, 567), word('7654321', 54, 567),
+             word('TEST1381', 112, 567), word('二类', 231, 567),
+             word('载货汽车底盘', 295, 567),
+             word('油耗:22.8', 36, 627),
+             word('车身反光标识说明:', 36, 649), word('企业:示例企业;', 135, 649),
+             word('其他:', 38, 669), word('该车用于消防作业;', 53, 689),
+             word('运输介质:汽油,不能作为燃料依据。', 53, 701)]
+    fields = parse_words(words)
+    assert fields['model_code'] == 'TEST5381/C6'
+    assert fields['product_name'] == '泡沫消防车'
+    assert fields['chassis'] == 'TEST1380;TEST1381'
+    assert fields['vin'] == 'LTEST123×××××××××'
+    assert [r['product_id'] for r in json.loads(fields['chassis_references'])] == ['1234567', '7654321']
+    assert fields['other'] == '该车用于消防作业;运输介质:汽油,不能作为燃料依据。'
+    assert fields['fuel_consumption_page'] == '22.8'
+    assert fields['reflective_marking'] == '企业:示例企业;'
+    assert 'fuel_type' not in fields
+
+    # VIN 原文为空时，底盘 ID 和型号绝不能成为虚假的 VIN。
+    fields = parse_words([w for w in words if w['text'] != 'LTEST123×××××××××'])
+    assert fields['vin'] == ''
+
+
+@pytest.mark.parametrize('id_words', [
+    [{'text': '底盘ID', 'x0': 54, 'x1': 85, 'top': 527}],
+    [{'text': '底盘', 'x0': 54, 'x1': 74, 'top': 527},
+     {'text': 'ID', 'x0': 76, 'x1': 87, 'top': 528}],
+])
+def test_converted_layout_rejects_incomplete_chassis_header(id_words):
+    with pytest.raises(ValueError, match='缺少必要表头'):
+        parse_words(id_words)
+
+
+@pytest.mark.parametrize(('id_x', 'id_y'), [(160, 527), (76, 540)])
+def test_converted_layout_does_not_join_distant_words(id_x, id_y):
+    fields = parse_words([
+        {'text': '底盘', 'x0': 54, 'x1': 74, 'top': 527},
+        {'text': 'ID', 'x0': id_x, 'x1': id_x + 11, 'top': id_y},
+    ])
+    assert 'pdf_layout' not in fields
+
+
+def test_base_layout_parse_can_explicitly_disable_converted_dispatch():
+    fields = parse_words(
+        [{'text': '底盘ID', 'x0': 54, 'x1': 85, 'top': 527}],
+        detect_converted_layout=False,
+    )
+    assert 'pdf_layout' not in fields
 
 
 def test_export_review_excel(tmp_path):

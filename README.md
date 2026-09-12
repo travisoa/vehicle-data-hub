@@ -177,7 +177,7 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 </thead>
 <tbody>
 <tr><td nowrap width="1%"><strong>模板对齐</strong></td><td>PDF 转 Excel，行结构对齐《公告参数评审模板》：<strong>行为参数项、列为各配置型号</strong>，附「备注」列标注真实来源</td></tr>
-<tr><td nowrap width="1%"><strong>坐标级解析</strong></td><td>公告参数页为单页固定版式，按<strong>词坐标</strong>精确解析，覆盖底部「发动机 / 其他 / 轴荷 / VIN / 底盘」多栏交错区</td></tr>
+<tr><td nowrap width="1%"><strong>坐标级解析</strong></td><td>按<strong>词坐标</strong>解析整车参数页的底部多栏交错区，以及改装车参数页的横向底盘表和全宽说明</td></tr>
 <tr><td nowrap width="1%"><strong>目录补参数</strong></td><td>公告页未显示的字段（通用名称、续驶里程、燃料消耗量、电池质量、储电量）按公告型号自动从目录库补齐（购置税目录优先），并以<strong>浅黄底色</strong>标注</td></tr>
 <tr><td nowrap width="1%"><strong>批次命名</strong></td><td>默认输出 <code>公告参数_&lt;车型&gt;_&lt;批次&gt;.xlsx</code>；跨批次时取区间（与 PDF 顺序无关）如 <code>第394-406批</code>；同名自动追加序号</td></tr>
 <tr><td nowrap width="1%"><strong>来源可追溯</strong></td><td>「备注」列填写「公告参数页」「减免车辆购置税目录」等实际出处；未显示或未命中的字段明确标注为未解析或未命中，避免空值歧义</td></tr>
@@ -424,7 +424,8 @@ LibreOffice 转换失败或超时（默认 300s，数十 MB 的多目录合刊�
 .venv/bin/python main.py review <车型> --no-catalog             # 不从减免税目录补充参数
 ```
 
-- 公告参数页为单页固定版式，按词坐标精确解析，覆盖底部「发动机 / 其他 / 轴荷 / VIN / 底盘」多栏交错区
+- 整车参数页按词坐标解析，覆盖底部「发动机 / 其他 / 轴荷 / VIN / 底盘」多栏交错区
+- 改装车参数页独立解析横向底盘引用表、VIN 和全宽「其他」说明，兼容「底盘 ID」表头被拆成多个词；缺少必要表头时报告解析错误。公告页未显示燃料种类时保留缺失，不从油耗或运输介质推断能源
 - 公告页未显示的目录参数（通用名称、续驶里程、燃料消耗量、电池质量、储电量）按公告型号自动从
   `data/jianmian_catalog.sqlite` 补齐（购置税目录优先），并以浅黄底色标注
 - 默认输出命名为 `output/公告参数_<车型>_<批次>.xlsx`，如 `公告参数_<车型>_第406批.xlsx`；
