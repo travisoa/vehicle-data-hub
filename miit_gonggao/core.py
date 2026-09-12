@@ -834,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="查询并下载工信部装备工业发展中心公告参数页")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    subparsers.add_parser("collect", help="批量采集公告：目录、型号名单或固定产品清单")
     query_parser = subparsers.add_parser("query", help="按本地配置或公告字段查询产品")
     query_parser.add_argument("vehicle", nargs="?", help="本地查询配置名，可为销售车型、项目代号或内部简称")
     query_parser.add_argument("--mapping-file", default=os.fspath(DEFAULT_MAPPING_PATH), help="本地查询配置 JSON 文件")
@@ -880,6 +881,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "collect":
+        from .collection import main as collect_main
+        return collect_main(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

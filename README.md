@@ -654,3 +654,10 @@ Website 的近期公告/公示跟踪及数据库写入由 Website 项目负责�
 无法识别时停止，不把错位或不完整结果当作有效清单，行错误指出表格行号。
 明确的整行合计可跳过，未知合并行仍阻断登记。`notice_batch` 取文章批次，
 原始表格批次/混合列分别保留为 `raw_notice_batch` / `batch_or_chassis_id`，不把底盘 ID 当批次。
+
+## 公告批量采集与下载记录
+
+批量下载统一用 `main.py gonggao collect`；目录/型号名单及固定产品 ID 清单共用
+下载、解析、数据库和轮次状态。完整采集库在 `data/announcement_site.sqlite`，
+PDF 在 `downloads/announcement_site/`，运行日志在 `var/runs/`；Website 只读构建派生库。
+详细用法与兼容迁移见 [公告采集](docs/announcement-collection.md)。

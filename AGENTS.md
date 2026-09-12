@@ -14,16 +14,17 @@
 数据流单向：本项目 → Website，不存在反向依赖。判断一处改动是否越界，只问一句：**它读写的资产，唯一写入方是谁？**
 
 本项目独占写入：`data/jianmian_catalog.sqlite`、`data/vehicle_profiles.json`、
-`downloads/announcement_site/**/*.pdf`（PDF 本体）、`downloads/announcement_site/_snapshots/`、
-`downloads/announcement_batches/`（公告批次枚举缓存，见下）、`output/`。
-
-Website 独占写入（其中后两项物理位置在本项目目录下，所有权仍归 Website）：
-`Website/data/announcement_site.sqlite`（采集业务库）、`Website/dist/site-*.sqlite`（站点只读库）、
-`downloads/announcement_site/分类公告/`、`downloads/announcement_site/_revisions/`。
-
-因此本项目不得读取或推断公告业务库的位置，也不得统计 PDF 的采集覆盖率——那是 Website 的职责。
-`core.build_announcement_download_dir` 是两个项目共用的目录结构契约，Website 直接调用它；
-改动该函数等同于改文件契约，须同步确认 Website 侧。
+`data/announcement_site.sqlite`（公告、PDF 路径/哈希/解析字段、采集轮次及逐型号状态、公示跟踪）、
+`downloads/announcement_site/`（含 `_snapshots/`、`分类公告/`、`_revisions/`）、
+`downloads/announcement_batches/`、`var/runs/`、采集报告及 `output/`。
+Website 独占写入其派生站点库、前后端、站点构建/部署产物；只读消费上游业务库和 PDF。
+2026-09-12 已把 Website 的采集实现与完整业务库统一迁入本项目；Website 旧脚本为兼容转发，
+旧数据库/运行目录为符号链接，不能再建立独立副本。详见 `docs/announcement-collection.md`。
+`main.py gonggao collect` 是批量入口：目录/型号名单与固定产品清单共享下载、解析、入库和状态收尾；
+`collection_tracking` 管理近期事件，`collection_report` 生成采集报告。
+历史 CLI 查询的 `manifest_*.json` 保持原始证据，不改写成网站采集轮次。
+覆盖率统计和修订归档现在可读取本项目权威业务库；归档仍默认预览，`--apply` 须用户确认。
+`core.build_announcement_download_dir` 是所有下载入口共用的目录结构契约。
 - **竞品对标**（`benchmark/`）：抓汽车之家口碑 + 懂车帝销量榜，生成对标分析 HTML 报告到 `output/`
 
 这是通用工具，不要把它当成只服务少数硬编码车型的脚本；车型相关条件一律走 `data/vehicle_profiles.json` 档案或 CLI 参数。
@@ -179,10 +180,14 @@ Website 独占写入（其中后两项物理位置在本项目目录下，所有
 - 减免税目录导出 → `jianmian export --by-category` 产出 `output/jianmian_by_category/`：
   `全量.xlsx`（全部行）+ 6 个分类 xlsx，两者列结构相同。不带 `--by-category` 时只写单文件
   `output/jianmian_catalog.xlsx`，两条路互斥。导出只反映目录库自身，不含公告 PDF 的采集状态——
-  采集覆盖率属于 Website 项目的站点库职责，本项目不反向读取它
+  采集覆盖率由本项目 `collection_coverage` 单独统计，不混入目录原始导出
 - 导出一律整表重写覆盖，没有增量合并；`--keyword` 会把输出文件整体换成匹配子集，别拿带 keyword 的产物当全量表
 - 口碑/销量原始数据缓存 → `downloads/benchmark/<车型>.json`（`report --offline` 依赖它；sales 字段为 `{dongchedi/autohome: {latest/half_year/year: {count,rank,label,scope}}}` 双源三维度结构；汽车之家 `scope=brand` 表示品牌检索兜底命中）
-- 工信部 PDF → `downloads/announcement_site/<品牌>/<车型>/第<批次>批/`。查询快照与下载索引 → `downloads/announcement_site/_snapshots/`，**仅** `gonggao query --download` 与 `changes --download` 产出；下载索引对每条都记 `status`（`ok`/`not_pdf`/`download_failed`）与 `error`，失败项不会只留在终端。网站侧的批量采集由 Website 的 `seed_announcement_site.py` 发起，逐条状态记在它的业务库（`run_models` / `documents`），不写这里。公告网站 PDF 属动态生成内容，同一产品 ID 后续可能返回不同内容。历史快照的识别与归档（`_revisions/`）、以及 `分类公告/` 硬链接索引，都由 Website 项目的脚本负责，本项目不参与——它们依赖公告业务库，而那个库归 Website 所有。本项目只保证：主目录下每个 `<品牌>/<车型>/第<批次>批/` 里放的是当次下载的 PDF，目录名一律由 `core.build_announcement_download_dir` 生成。
+- 工信部 PDF → `downloads/announcement_site/<品牌>/<车型>/第<批次>批/`，目录统一由
+  `core.build_announcement_download_dir` 生成。CLI 查询快照/下载索引仍在 `_snapshots/`，
+  每条保留 `status/error`。批量下载结果统一写 `data/announcement_site.sqlite`，
+  固定产品清单的逐产品日志另存 `var/runs/<本轮>/results.jsonl`；两类历史来源均保留，不互相覆盖。
+  PDF 分类及历史修订分别由 `collection_classify`、`collection_revisions` 读取同一业务库处理。
 - 变更扩展公示查询快照 → `downloads/announcement_site/_snapshots/change_notice_*.json`，其中同时保存公示文章、发布日期、公示批次、命中型号和详情链接；`changes --download` 的下载索引还要记录最终命中的有效公告批次
 - 公示 `notice_batch` 以文章标题为准；表格原始批次保留在 `raw_notice_batch`，混合列保留在
   `batch_or_chassis_id`，不得把底盘 ID 当作公告批次。解析仅跳过明确整行合计，缺列、未知合并行

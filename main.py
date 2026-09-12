@@ -6,6 +6,8 @@
     python3 main.py fetch <车型> --source gonggao    # 只下载工信部公告 PDF
     python3 main.py fetch <车型> --source autohome   # 只抓汽车之家配置 Excel
     python3 main.py autohome --models "<车型>"       # 汽车之家配置抓取完整 CLI
+    python3 main.py gonggao collect -f <型号名单>    # 批量下载并登记统一业务库
+    python3 main.py gonggao collect --manifest <清单> --help  # 固定产品清单模式
     python3 main.py gonggao query <车型> --download  # 工信部公告查询完整 CLI
     python3 main.py gonggao changes --model-code <型号> --download  # 变更扩展公示 -> 最新有效 PDF
     python3 main.py review <车型>                    # 公告 PDF -> 公告参数评审 Excel
