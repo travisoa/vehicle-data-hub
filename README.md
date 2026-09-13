@@ -384,11 +384,12 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 任务 | 复用方式 | 边界 |
 | --- | --- | --- |
 | 目录或型号名单采集 | `gonggao collect` 的目录参数或 `-f` | 会查询同型号所有正式批次；不是固定批次下载 |
-| 已核验新能源整车产品 ID | `gonggao collect --manifest ...` | 只处理清单产品；当前不接受普通燃油/混动产品 |
+| 已核验汽车整车产品 ID | `gonggao collect --manifest ...` | 只处理冻结清单；新能源 scope 仅收新能源，通用 scope 的非新能源/未知仅 408/409 批 |
 | 近期公告/公示 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
 | 提速 | 固定清单已有 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
-| 估算、筛选与核验 | 只读业务库、已有缓存，生成本轮清单/报告 | 辅助代码不下载 PDF、不写新的采集状态 |
+| 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
+| 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
 
 Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整车可收录历史正式公告，
@@ -417,6 +418,12 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 .venv/bin/python main.py gonggao collect \
   --manifest var/runs/<本轮>/manifest.json \
   --manifest-sha256 <已核验SHA256> --run-dir var/runs/<本轮>
+# 读取最新收录统计，不重新统计或下载
+.venv/bin/python main.py gonggao status
+.venv/bin/python main.py gonggao status --json
+# 读取最近十次统计变化；重新计算使用单独的 --refresh
+.venv/bin/python main.py gonggao status --history
+.venv/bin/python main.py gonggao status --refresh
 # 最近一轮或指定轮次报告
 .venv/bin/python -m miit_gonggao.collection_report --run 24
 # 近期公示/公告跟踪，只读生成计划
@@ -427,6 +434,13 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 保持清单原文、SHA256 和运行目录一致。有效 PDF 校验路径、魔数、字节数、哈希后跳过，
 解析问题保留记录。经用户明确要求可传 `--min-interval/--max-interval`，仅改变本轮节流；
 下载异常恢复默认间隔，连续三次下载失败停止。该模式不会重新按型号搜索或增加其他批次。
+固定清单使用 schema_version=1。`nev_complete_manifest_v1`（及兼容旧 scope）仅接受新能源；
+`automotive_complete_manifest_v1` 在第 408、409 批接受燃油、普通混动与动力未知整车，其他批次仍须新能源。
+各 scope 均执行整车判定，不依赖清单自报能源；恢复时 scope 与清单哈希必须一致。
+需要核验新能源范围时优先按官方产品名判断；产品名只写混合动力等无法确认类型时，只读查询
+`--catalog-db`（默认 `data/jianmian_catalog.sqlite`）中精确同型号的具体能源证据。
+通用“新能源/新能源汽车”标签不单独证明类型；具体能源冲突、普通混动或无证据均拒绝。
+不采用清单自报的 `catalog_energy`，不改写官方产品名；整车范围、清单哈希和数量校验仍须通过。
 
 目录模式、固定清单模式与近期事件模式保留各自的候选选择逻辑，统一复用
 `collection.store_announcement` 的下载、参数解析和发布事务，以及数据库锁和逐型号状态收尾。
@@ -446,6 +460,51 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 | CLI 查询/下载索引与源快照 | `downloads/announcement_site/_snapshots/` |
 | 固定清单、断点、逐产品结果 | `var/runs/<本轮>/` |
 | 采集报告 | `var/reports/` |
+| 持久收录统计与候选清单 | `var/reports/collection-status/` |
+
+日常查询“已收录多少、还缺多少”先执行 `main.py gonggao status`，或读取
+`var/reports/collection-status/latest.json`。默认只读最新汇总，并比较业务库、目录库
+（含 WAL/journal）、批次缓存文件元数据及统计规则代码哈希；不扫描业务表、解析批次缓存或
+遍历 PDF。输入变化显示 `stale`，没有快照显示 `missing`，均不会自行重算。
+`--json` 输出状态及汇总，`--history` 只读最近十代变化；明确需要更新时使用 `--refresh`。
+
+每代记录位于 `snapshots/<generation>/`，包含 `summary.json`、`candidates.json`、
+`report.md`。文件全部生成后才原子更新 `latest.json`；刷新失败保留旧最新记录，并写
+`last-error.json`，不能把旧汇总当成已更新。候选按产品 ID 保留，去重型号数另列；
+统计范围为汽车整车的新能源历史记录，以及第 408、409 批非新能源和动力未知候选。
+动力未知独立列示，不计入已确认能源类别；候选不扩大本轮下载授权。
+目录型号六桶、事件状态及 Website 公开库占位各有口径，不能与产品缺口相加或互相替代。
+
+目录/型号名单、固定产品清单、近期事件采集在正常或中断收尾提交后更新一次统计。
+近期事件登记及仅更新已解决事件的操作、`main.py gonggao jianmian sync` 的目录库变更、
+批次枚举命令的缓存写入，也在本次操作收尾统一更新；输入未变化时复用已有快照。
+不在每条 PDF 下载后重扫全库。独立 `review_export`/`main.py review` 仅导出文件，
+不回写业务库，不改变收录状态。
+
+过期的完整批次缓存保留为历史基线，并显示来源有效期；它不证明官方当前全集，
+部分/缺失缓存也不等于零缺口。事件窗口以汇总 `as_of_date` 为准，日期变化单独提示，
+不触发日常查询重算。查看统计不检查 PDF 文件变化；手动修改 PDF 而未改变库或缓存后，
+应显式 `--refresh` 重新核验路径、大小和文件头，不能将默认查看视为逐文件 SHA-256 校验。
+
+完整批次减少时，自动刷新和普通 `--refresh` 保留上一基线，并指出减少的批次。
+先恢复该批合格缓存；枚举跳过交叉验证造成的降级，可用默认 `--verify-every 1` 重建相应批次。
+确需调整统计来源基线时，使用专门入口，不删除 `latest.json`：
+
+```bash
+.venv/bin/python main.py gonggao status --refresh --rebase-cache \
+  --expect-generation <当前generation> --removed-batches <减少的批次，逗号分隔> \
+  --rebase-reason '说明调整来源范围的原因'
+```
+
+旧代标识、减少批次和原因必须一致；空全集、进行中的采集及计算期间输入变化仍会阻断。
+新快照保留历史链，并在 `cache_rebase`、报告和 `--history` 中记录基线变化，不能将该差额当作下载量。
+自动采集不使用此选项；正常收尾仍按原规则更新。
+
+缓存诊断按批次保存于 `summary.inputs.batch_caches.cache_diagnostics`。
+已验证的上游接口缺表作为 `notices` 中的来源限制，保留日期和依据，不算成功的空批次；
+部分枚举失败、缓存校验失败和没有来源证据的缓存缺失分别告警，列出批次与原因。
+较旧且已被成功缓存替代的失败证据只保留审计记录；较新失败仍提示当前使用旧完整缓存。
+旧版未分类记录保守提示，显式刷新后采用新分类；默认查看仍只读取已保存的诊断。
 
 业务库保留 `ingestion_runs`、`run_models`、`documents`、`announcement_fields`，以及
 公告、车型、商标、批次和公示跟踪表。判断历史下载结果须跨轮取最好结局；

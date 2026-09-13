@@ -8,6 +8,7 @@
     python3 main.py autohome --models "<车型>"       # 汽车之家配置抓取完整 CLI
     python3 main.py gonggao collect -f <型号名单>    # 批量下载并登记统一业务库
     python3 main.py gonggao collect --manifest <清单> --help  # 固定产品清单模式
+    python3 main.py gonggao status                  # 读取持久收录统计；--refresh 显式更新
     python3 main.py gonggao query <车型> --download  # 工信部公告查询完整 CLI
     python3 main.py gonggao changes --model-code <型号> --download  # 变更扩展公示 -> 最新有效 PDF
     python3 main.py review <车型>                    # 公告 PDF -> 公告参数评审 Excel
@@ -377,6 +378,37 @@ def command_profiles(argv: list[str]) -> int:
     return 0
 
 
+def _sqlite_revision(path: Path) -> tuple:
+    """只探测主文件/WAL 的变化，不读取或重算目录内容。"""
+    parts = []
+    for candidate in (path, Path(str(path) + "-wal")):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            parts.append(None)
+        else:
+            parts.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+    return tuple(parts)
+
+
+def _sync_catalog(argv: list[str]) -> int:
+    from miit_gonggao import collection, jianmian
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--db", type=Path, default=jianmian.DB_PATH)
+    args, _ = parser.parse_known_args(argv[2:])
+    catalog_db = args.db.expanduser().resolve()
+    before = _sqlite_revision(catalog_db)
+    try:
+        return gonggao_core.main(argv)
+    finally:
+        if _sqlite_revision(catalog_db) != before:
+            # 自定义目录库的统计跟随该库，不读取或写入默认活动库。
+            site_db = catalog_db.parent / "announcement_site.sqlite"
+            collection.refresh_collection_status(site_db, catalog_db=catalog_db,
+                                                 pdf_root=site_db.parent.parent, reason="catalog_sync")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in {"-h", "--help"}:
@@ -386,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
     if command == "fetch":
         return command_fetch(rest)
     if command == "gonggao":
+        if rest and rest[0] == "status":
+            from miit_gonggao import collection_status
+
+            return collection_status.main(rest[1:])
+        if rest[:2] == ["jianmian", "sync"]:
+            return _sync_catalog(rest)
         return gonggao_core.main(rest)
     if command == "review":
         from miit_gonggao import review_export

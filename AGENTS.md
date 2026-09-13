@@ -21,7 +21,7 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 2026-09-12 已把 Website 的采集实现与完整业务库统一迁入本项目；Website 旧脚本为兼容转发，
 旧数据库/运行目录为符号链接，不能再建立独立副本。详见 `README.md` 的“公告批量采集”章节。
 `main.py gonggao collect` 是批量入口：目录/型号名单与固定产品清单共享下载、解析、入库和状态收尾；
-`collection_tracking` 管理近期事件，`collection_report` 生成采集报告。
+`collection_tracking` 管理近期事件，`collection_report` 生成采集报告，`collection_status` 管理持久收录统计。
 历史 CLI 查询的 `manifest_*.json` 保持原始证据，不改写成网站采集轮次。
 覆盖率统计和修订归档现在可读取本项目权威业务库；归档仍默认预览，`--apply` 须用户确认。
 `core.build_announcement_download_dir` 是所有下载入口共用的目录结构契约。
@@ -81,6 +81,17 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 
 - 开始网站采集任务前，先读 `README.md` 的“公告批量采集”章节，检查
   `main.py gonggao collect --help`、所选模式及既有轮次/清单；不得未查入口就编写下载脚本。
+- 查询收录量、缺口或历史变化，先用 `main.py gonggao status`（可加 `--json`/`--history`）
+  或读 `var/reports/collection-status/latest.json`，再判断是否需要显式 `--refresh`。
+  默认查看仅比较输入元数据和规则哈希，显示 `stale` 不自行重算；不要直接临时重扫或另建统计台账。
+  历代 `snapshots/<generation>/{summary.json,candidates.json,report.md}` 保留；刷新失败读
+  `last-error.json`，旧 latest 不能当作本次结果。批次收尾统一更新，不在每条 PDF 后全量计算。
+  产品候选、目录型号六桶、事件和公开库占位分开使用；过期完整缓存只作历史基线，窗口日期及
+  PDF 文件校验边界见 README。独立文件导出不回写业务库，不改变收录状态。
+- 完整批次减少先恢复合格缓存；确需调整来源基线使用 `status --refresh --rebase-cache`，
+  同时给出当前 `--expect-generation`、精确 `--removed-batches` 和 `--rebase-reason`。
+  保留历史与范围变化证据，不删除 latest 或让普通刷新绕过保护；自动收尾不使用基线调整选项。
+  已知接口缺表作为带日期的来源说明，真正枚举/校验/无证据缺失单独告警，不按批次号硬编码豁免。
 - 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
   `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
   新建独立批量下载入口，也不得复制已有下载循环。
@@ -92,6 +103,11 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 每轮变化放入上游 `var/runs/<本轮>/` 的清单、参数和日志；通用代码不带任务日期/批次硬编码。
   恢复固定清单使用原清单/哈希及 `--resume-run`，提速使用现有模式支持的节流参数。
   不得删改清单校验、并发锁或失败保护来完成运行；跨轮按最好结局避免重复下载。
+- 固定清单 `nev_complete_manifest_v1` 及旧 scope 均仅接受新能源；
+  `automotive_complete_manifest_v1` 仅在第 408、409 批允许非新能源/未知整车，其他批次仍须新能源。
+  需要新能源证据但产品名未明确时，仅允许通过 `--catalog-db` 的精确同型号具体能源补证。
+  通用新能源标签不能单独放行；忽略其后，具体能源须唯一且属于新能源，并与产品名相容。
+  缺失、普通混动或冲突证据均拒绝；不信任清单自报能源，不改写官方产品名或放宽整车判定。
 - Website 兼容脚本仅转发，不增加业务逻辑；业务库、PDF、下载日志保持上游唯一活动资产。
   发布数据只读消费；本轮是否下载及收录范围仍以用户命令为准。
 - 修改采集能力时，交付说明应列出复用入口、实际能力缺口、修改模块、数据落点及验证结果。

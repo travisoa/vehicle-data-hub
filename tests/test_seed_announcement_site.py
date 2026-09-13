@@ -13,6 +13,11 @@ import pytest
 from miit_gonggao import collection as seed
 
 
+@pytest.fixture(autouse=True)
+def isolate_persistent_status(monkeypatch):
+    monkeypatch.setattr(seed, "refresh_collection_status", lambda *_args, **_kwargs: None)
+
+
 def test_database_lock_resolves_legacy_symlink(tmp_path):
     target = tmp_path / "upstream.sqlite"
     target.touch()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""按 SHA256 冻结的新能源整车产品 ID 清单补采，默认只校验、预览。
+"""按 SHA256 冻结的汽车整车产品 ID 清单补采，默认只校验、预览。
 
 复用 seed 的下载、解析、规范目录和逐份发布逻辑；不查询其他型号或公告批次。
+新能源 scope 保持历史整车范围；通用 scope 另允许第 408、409 批的非新能源或能源待确认整车。
 每份提交后记录 results.jsonl 和原子 progress.json；可用原清单恢复同一 run。
 """
 from __future__ import annotations
@@ -34,6 +35,8 @@ else:
 
 SCOPE = "nev_complete_manifest_v1"
 LEGACY_SCOPE = "uncollected_nev_complete_20260912"
+AUTOMOTIVE_SCOPE = "automotive_complete_manifest_v1"
+NON_NEV_BATCHES = frozenset({408, 409})
 NEV_TYPES = {"纯电动", "插电式混合动力", "增程式", "燃料电池"}
 SUCCESS = {"downloaded", "skipped_existing"}
 
@@ -72,18 +75,45 @@ def request_pace(args: argparse.Namespace):
         seed.core.REQUEST_MIN_INTERVAL = original
 
 
-def load_manifest(path: Path, expected_hash: str) -> dict[str, Any]:
+def validate_catalog_energy(rows: list[tuple[str, str, str]], catalog_db: Path | None) -> None:
+    """仅以同型号权威目录的具体能源补证；不采用清单自报的能源或泛新能源标签。"""
+    if not rows:
+        return
+    if catalog_db is None:
+        raise ValueError(f"清单含产品名未明确新能源的产品，且未提供目录核验：{rows[0][0]}")
+    with closing(sqlite3.connect(catalog_db.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        catalog_by_model: dict[str, set[str]] = {}
+        for product_id, model, name in rows:
+            if model not in catalog_by_model:
+                catalog_by_model[model] = {
+                    str(row[0] or "").strip() for row in conn.execute(
+                        "SELECT energy_type FROM catalog_rows WHERE model_code=? COLLATE BINARY", (model,))
+                } - {"", "新能源", "新能源汽车"}
+            labels = catalog_by_model[model]
+            energies = {normalize_energy("", "", "", label)[0] for label in labels}
+            if len(energies) != 1 or not energies <= NEV_TYPES:
+                raise ValueError(f"目录缺少唯一明确新能源证据或存在能源冲突：{product_id} ({model})")
+            # 目录也不能把明确的普通混动产品名直接覆盖成纯电动等不相容能源。
+            if any(normalize_energy("", name, "", label)[0] not in energies for label in labels):
+                raise ValueError(f"公告产品名与目录能源不相容：{product_id} ({model})")
+
+
+def load_manifest(path: Path, expected_hash: str, catalog_db: Path | None = None) -> dict[str, Any]:
     content = path.read_bytes()
     if hashlib.sha256(content).hexdigest() != expected_hash.lower():
         raise ValueError("manifest SHA256 不符，拒绝下载")
     manifest = json.loads(content)
-    if manifest.get("schema_version") != 1 or manifest.get("scope") not in {SCOPE, LEGACY_SCOPE}:
+    scope = manifest.get("scope")
+    if manifest.get("schema_version") != 1 or scope not in {SCOPE, LEGACY_SCOPE, AUTOMOTIVE_SCOPE}:
         raise ValueError("manifest schema_version 或 scope 不符")
     products = manifest.get("products")
     if not isinstance(products, list) or not products:
         raise ValueError("manifest products 必须为非空列表")
     ids: set[str] = set()
     models: set[str] = set()
+    needs_catalog: list[tuple[str, str, str]] = []
     for row in products:
         if not isinstance(row, dict):
             raise ValueError("manifest 产品行必须是对象")
@@ -97,12 +127,14 @@ def load_manifest(path: Path, expected_hash: str) -> dict[str, Any]:
             raise ValueError(f"产品 ID 和型号必须为无首尾空白的字符串：{product_id!r}")
         if classify_vehicle(model, name, row)["inclusion_gate"] != "accepted":
             raise ValueError(f"清单含非汽车整车或范围待确认产品：{product_id}")
-        if normalize_energy("", name, "", "")[0] not in NEV_TYPES:
-            raise ValueError(f"清单含产品名未明确新能源的产品：{product_id}")
+        needs_nev = scope != AUTOMOTIVE_SCOPE or int(batch) not in NON_NEV_BATCHES
+        if needs_nev and normalize_energy("", name, "", "")[0] not in NEV_TYPES:
+            needs_catalog.append((product_id, model, name))
         ids.add(product_id)
         models.add(model)
     if manifest.get("expected_products") != len(ids) or manifest.get("expected_models") != len(models):
         raise ValueError("manifest expected_products/expected_models 与实际去重数量不符")
+    validate_catalog_energy(needs_catalog, catalog_db)
     return manifest
 
 
@@ -364,13 +396,18 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 stop.reason = f"运行中断：{type(exc).__name__}: {exc}"
                 print(stop.reason, file=sys.stderr, flush=True)
             finally:
-                seed.finish_run(conn, run_id, {
-                    "download_failures": counters["download_failed"], "non_pdf_documents": counters["non_pdf"],
-                    "parse_failures": counters["parse_failed"], "publish_failures": counters["publish_failed"],
-                }, stop.reason)
-                all_successful = sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
-                state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
-                atomic_json(progress_path, progress(state))
+                try:
+                    seed.finish_run(conn, run_id, {
+                        "download_failures": counters["download_failed"], "non_pdf_documents": counters["non_pdf"],
+                        "parse_failures": counters["parse_failed"], "publish_failures": counters["publish_failed"],
+                    }, stop.reason)
+                    all_successful = sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
+                    state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
+                    atomic_json(progress_path, progress(state))
+                finally:
+                    seed.refresh_collection_status(args.site_db, catalog_db=args.catalog_db,
+                                                   pdf_root=args.pdf_root, run_id=run_id,
+                                                   reason="manifest_collection")
             try:
                 write_report(args.site_db, run_id, args.run_dir, args.catalog_db)
             except Exception as exc:
@@ -395,10 +432,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-interval", type=float, help="本进程请求最大间隔（秒），遇下载失败/非 PDF 恢复默认")
     args = parser.parse_args(argv)
     try:
-        manifest = load_manifest(args.manifest, args.manifest_sha256)
+        manifest = load_manifest(args.manifest, args.manifest_sha256, catalog_db=args.catalog_db)
         interval = requested_interval(args)
         if not args.apply:
-            print(json.dumps({"status": "dry_run", "scope": SCOPE, "products": manifest["expected_products"],
+            print(json.dumps({"status": "dry_run", "scope": manifest["scope"], "products": manifest["expected_products"],
                               "models": manifest["expected_models"], "manifest_sha256": args.manifest_sha256.lower(),
                               "site_db": str(args.site_db), "pdf_root": str(args.pdf_root),
                               "request_interval": list(interval or seed.core.REQUEST_MIN_INTERVAL),

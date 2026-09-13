@@ -346,6 +346,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
     except ImportError:
         from miit_gonggao import collection as seed
     seed.ensure_schema(conn)
+    db_path = next((Path(row[2]) for row in conn.execute('pragma database_list')
+                    if row[1] == 'main' and row[2]), None)
     if conn.execute('select 1 from ingestion_runs where completed_at is null').fetchone():
         raise RuntimeError('存在未完成采集，不能另起一轮')
     for event_id in plan['resolved']:
@@ -355,6 +357,9 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         grouped.setdefault((event['model_code'], event['batch']), []).append(event)
     if not grouped:
         conn.commit()
+        if plan['resolved']:
+            seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
+                                           reason="tracking_resolved")
         return {'queries': 0, 'errors': 0}
     run_id = conn.execute(
         'insert into ingestion_runs(started_at,selector_json,selected_models,parse_failures,publish_failures) '
@@ -457,7 +462,11 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             seed.finish_model(conn, run_id, vehicle_id, model_status, model_error)
             checked += 1
     finally:
-        seed.finish_run(conn, run_id, counts)
+        try:
+            seed.finish_run(conn, run_id, counts)
+        finally:
+            seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
+                                           run_id=run_id, reason="tracking_collection")
     errors = (sum(counts[k] for k in ('query_failures', 'download_failures', 'publish_failures'))
               + sum(scope_counts.values()))
     return {'run_id': run_id, 'queries': checked, 'errors': errors, **counts, **scope_counts}
@@ -541,6 +550,9 @@ def main() -> int:
                     result['report_error'] = str(exc)
             print(json.dumps(result, ensure_ascii=False))
             return 2 if result['errors'] else 0
+        if args.command.startswith('register-'):
+            seed.refresh_collection_status(args.site_db, catalog_db=args.catalog_db,
+                                           pdf_root=args.pdf_root, reason=args.command)
     return 0
 
 

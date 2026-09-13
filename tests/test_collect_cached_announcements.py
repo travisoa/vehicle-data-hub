@@ -20,9 +20,9 @@ def product(pid: str = "p1", model: str = "ABC6500EV", **overrides) -> dict:
             "dataTag": "Z", "gppc": "409", "pc": "409", **overrides}
 
 
-def setup(tmp_path: Path, rows: list[dict] | None = None) -> tuple[argparse.Namespace, dict]:
+def setup(tmp_path: Path, rows: list[dict] | None = None, *, scope=cached.SCOPE) -> tuple[argparse.Namespace, dict]:
     rows = rows or [product()]
-    manifest = {"schema_version": 1, "scope": cached.SCOPE, "expected_products": len(rows),
+    manifest = {"schema_version": 1, "scope": scope, "expected_products": len(rows),
                 "expected_models": len({row["clxh"] for row in rows}), "source_boundary": "test", "products": rows}
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -55,6 +55,7 @@ def forbid_network(monkeypatch):
     monkeypatch.setattr(seed.core, "post_form", fail)
     monkeypatch.setattr(seed.core, "query_all_pages", fail)
     monkeypatch.setattr(seed, "parse_pdf", lambda _path, _db: ({"model_code": "ABC6500EV"}, ""))
+    monkeypatch.setattr(seed, "refresh_collection_status", lambda *_args, **_kwargs: None)
 
 
 def fake_download(monkeypatch, calls: list[str], behavior=None):
@@ -124,6 +125,168 @@ def test_manifest_rejects_out_of_scope_or_invalid_rows(tmp_path, bad):
     with pytest.raises(ValueError):
         cached.load_manifest(args.manifest, args.manifest_sha256)
     assert not args.site_db.exists()
+
+
+@pytest.mark.parametrize("scope", [cached.SCOPE, cached.LEGACY_SCOPE])
+@pytest.mark.parametrize("name,batch", [("客车", 408), ("混合动力客车", 409)])
+def test_existing_nev_scopes_do_not_inherit_general_batch_allowance(tmp_path, scope, name, batch):
+    args, _ = setup(tmp_path, [product(clmc=name, gppc=str(batch), pc=str(batch))], scope=scope)
+    with pytest.raises(ValueError, match="未提供目录核验"):
+        cached.load_manifest(args.manifest, args.manifest_sha256)
+    assert not args.site_db.exists()
+
+
+@pytest.mark.parametrize("batch", [408, 409])
+@pytest.mark.parametrize("name", ["客车", "混合动力客车", "柴油客车"])
+def test_automotive_scope_accepts_recent_unknown_hybrid_and_fuel_without_catalog(tmp_path, batch, name):
+    args, manifest = setup(tmp_path, [product(clmc=name, gppc=str(batch), pc=str(batch))],
+                           scope=cached.AUTOMOTIVE_SCOPE)
+    # No catalogue is necessary to authorize those two complete-vehicle batches.
+    assert cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db) == manifest
+    assert not args.catalog_db.exists() and not args.site_db.exists()
+
+
+@pytest.mark.parametrize("batch", [407, 410])
+@pytest.mark.parametrize("name", ["客车", "混合动力客车", "柴油客车"])
+def test_automotive_scope_does_not_trust_claimed_energy_outside_recent_batches(tmp_path, batch, name):
+    row = product(clmc=name, gppc=str(batch), pc=str(batch), group="nev", energy_type="纯电动",
+                  catalog_energy="纯电动汽车")
+    args, _ = setup(tmp_path, [row], scope=cached.AUTOMOTIVE_SCOPE)
+    with pytest.raises(ValueError, match="未提供目录核验"):
+        cached.load_manifest(args.manifest, args.manifest_sha256)
+
+
+@pytest.mark.parametrize("batch", [284, 407, 410])
+def test_automotive_scope_keeps_explicit_nev_historical_collection(tmp_path, batch):
+    args, manifest = setup(tmp_path, [product(gppc=str(batch), pc=str(batch))], scope=cached.AUTOMOTIVE_SCOPE)
+    assert cached.load_manifest(args.manifest, args.manifest_sha256) == manifest
+
+
+@pytest.mark.parametrize("bad", [
+    {"clmc": "载货汽车底盘"}, {"clmc": "电动正三轮摩托车"},
+    {"clmc": "待确认产品"}, {"dataTag": "D"},
+])
+def test_automotive_scope_rejects_non_complete_vehicles_before_apply(tmp_path, monkeypatch, bad):
+    args, _ = setup(tmp_path, [product(**bad)], scope=cached.AUTOMOTIVE_SCOPE)
+    monkeypatch.setattr(cached, "collect", lambda *_a, **_k: pytest.fail("范围核验失败不得进入采集"))
+    assert cached.main(["--manifest", str(args.manifest), "--manifest-sha256", args.manifest_sha256,
+                        "--run-dir", str(args.run_dir), "--site-db", str(args.site_db), "--apply"]) == 1
+    assert not args.run_dir.exists() and not args.site_db.exists()
+
+
+@pytest.mark.parametrize("scope", [cached.SCOPE, cached.LEGACY_SCOPE, cached.AUTOMOTIVE_SCOPE])
+def test_dry_run_reports_the_validated_manifest_scope(tmp_path, capsys, scope):
+    args, _ = setup(tmp_path, scope=scope)
+    assert cached.main(["--manifest", str(args.manifest), "--manifest-sha256", args.manifest_sha256,
+                        "--run-dir", str(args.run_dir), "--site-db", str(args.site_db)]) == 0
+    assert json.loads(capsys.readouterr().out)["scope"] == scope
+    assert not args.run_dir.exists() and not args.site_db.exists()
+
+
+def test_automotive_scope_reuses_exact_id_collection_and_same_scope_resume(tmp_path, monkeypatch):
+    rows = [product("fuel", "ABC6500F", clmc="混合动力客车", gppc="408", pc="408"),
+            product("unknown", "DEF6500U", clmc="客车")]
+    args, _ = setup(tmp_path, rows, scope=cached.AUTOMOTIVE_SCOPE)
+    loaded = cached.load_manifest(args.manifest, args.manifest_sha256)
+    calls = []
+    fake_download(monkeypatch, calls)
+    assert cached.collect(args, loaded) == 0
+    assert calls == ["fuel", "unknown"]
+    args.resume_run = progress(args)["run_id"]
+    assert cached.collect(args, loaded) == 0
+    assert calls == ["fuel", "unknown"]  # Registered valid PDFs are not downloaded twice.
+    assert progress(args)["results"] == {"skipped_existing": 2}
+    with closing(sqlite3.connect(args.site_db)) as conn:
+        selector = json.loads(conn.execute("SELECT selector_json FROM ingestion_runs").fetchone()[0])
+        assert selector["scope"] == cached.AUTOMOTIVE_SCOPE
+        assert conn.execute("SELECT a.source_product_id,b.batch FROM announcements a "
+                            "JOIN batches b ON b.id=a.batch_id ORDER BY a.source_product_id").fetchall() == [
+            ("fuel", "408"), ("unknown", "409")]
+        # Scope is checked independently of the manifest hash when claiming a resume.
+        with pytest.raises(RuntimeError, match="SHA256/scope 不匹配"):
+            cached.claim_run(conn, args, {**loaded, "scope": cached.SCOPE})
+
+
+def make_energy_catalog(path: Path, rows: list[tuple[str, str]]) -> None:
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE catalog_rows (model_code TEXT, energy_type TEXT)")
+        conn.executemany("INSERT INTO catalog_rows VALUES (?, ?)", rows)
+        conn.commit()
+
+
+@pytest.mark.parametrize("model,name,labels", [
+    ("CA5046XLCP40K51L2E6PHEVA84", "混合动力冷藏车", ["插电式混合动力汽车"] * 2),
+    ("CA5046XXYP40K51L2E6PHEVA84", "混合动力厢式运输车",
+     ["新能源汽车", "插电式混合动力汽车", "新能源汽车", "插电式混合动力汽车"]),
+])
+def test_manifest_catalog_confirms_hybrid_without_changing_official_name(tmp_path, model, name, labels):
+    # 两种实目录证据形态：重复具体能源，以及通用标签与具体插混标签共存。
+    args, manifest = setup(tmp_path, [product(model=model, clmc=name)])
+    make_energy_catalog(args.catalog_db, [(model, label) for label in labels])
+    before = args.catalog_db.read_bytes()
+    loaded = cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db)
+    assert loaded == manifest and loaded["products"][0]["clmc"] == name
+    assert args.catalog_db.read_bytes() == before
+    assert not args.site_db.exists() and not args.run_dir.exists()
+
+
+def test_automotive_scope_uses_authoritative_catalog_for_historical_hybrid(tmp_path):
+    row = product(clmc="混合动力客车", gppc="352", pc="352")
+    args, manifest = setup(tmp_path, [row], scope=cached.AUTOMOTIVE_SCOPE)
+    make_energy_catalog(args.catalog_db, [(row["clxh"], "插电式混合动力汽车")])
+    assert cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db) == manifest
+
+
+@pytest.mark.parametrize("labels", [
+    [], [""], ["新能源汽车"], ["新能源"], ["混合动力汽车"], ["柴油汽车"],
+    ["插电式混合动力汽车", "混合动力汽车"],
+    ["插电式混合动力汽车", "纯电动汽车"],
+    ["插电式混合动力汽车", "柴油汽车"],
+    ["插电式混合动力汽车", "未知"],
+])
+def test_manifest_rejects_missing_generic_non_nev_or_conflicting_catalog_evidence(tmp_path, labels):
+    row = product(clmc="混合动力客车", catalog_energy="插电式混合动力汽车")
+    args, _ = setup(tmp_path, [row])
+    make_energy_catalog(args.catalog_db, [(row["clxh"], label) for label in labels])
+    with pytest.raises(ValueError, match="目录缺少唯一明确新能源证据或存在能源冲突"):
+        cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db)
+
+
+def test_manifest_does_not_trust_claimed_energy_or_create_missing_catalog(tmp_path):
+    args, _ = setup(tmp_path, [product(clmc="混合动力客车", catalog_energy="插电式混合动力汽车")])
+    with pytest.raises(ValueError, match="未提供目录核验"):
+        cached.load_manifest(args.manifest, args.manifest_sha256)
+    with pytest.raises(sqlite3.OperationalError):
+        cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db)
+    assert not args.catalog_db.exists()
+
+
+@pytest.mark.parametrize("catalog_model", ["ABC6500EV2", "ABC6500", "abc6500ev", " ABC6500EV"])
+def test_manifest_catalog_requires_exact_model_match(tmp_path, catalog_model):
+    args, _ = setup(tmp_path, [product(clmc="混合动力客车")])
+    make_energy_catalog(args.catalog_db, [(catalog_model, "插电式混合动力汽车")])
+    with pytest.raises(ValueError, match="目录缺少唯一明确新能源证据"):
+        cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db)
+
+
+def test_manifest_rejects_hybrid_name_with_incompatible_electric_catalog(tmp_path):
+    args, _ = setup(tmp_path, [product(clmc="混合动力客车")])
+    make_energy_catalog(args.catalog_db, [("ABC6500EV", "纯电动汽车")])
+    with pytest.raises(ValueError, match="公告产品名与目录能源不相容"):
+        cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db)
+
+
+def test_collect_cli_passes_custom_catalog_to_manifest_validation(tmp_path, monkeypatch, capsys):
+    import main
+
+    args, _ = setup(tmp_path, [product(clmc="混合动力客车")])
+    make_energy_catalog(args.catalog_db, [("ABC6500EV", "插电式混合动力汽车")])
+    monkeypatch.setattr(seed, "DEFAULT_CATALOG_DB", tmp_path / "absent-default.sqlite")
+    assert main.main(["gonggao", "collect", "--manifest", str(args.manifest),
+                      "--manifest-sha256", args.manifest_sha256, "--run-dir", str(args.run_dir),
+                      "--site-db", str(args.site_db), "--catalog-db", str(args.catalog_db)]) == 0
+    assert json.loads(capsys.readouterr().out)["products"] == 1
+    assert not args.site_db.exists() and not args.run_dir.exists()
 
 
 @pytest.mark.parametrize("change", ["hash", "scope", "products", "models", "duplicate"])

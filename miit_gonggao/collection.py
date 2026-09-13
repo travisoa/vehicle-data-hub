@@ -106,6 +106,24 @@ def finish_run(conn: sqlite3.Connection, run_id: int, counts: dict, reason: str 
     return interrupted
 
 
+def refresh_collection_status(db_path: Path | None, *, catalog_db: Path, pdf_root: Path,
+                              run_id: int | None = None, reason: str = "collection") -> None:
+    """已提交批次的统计收尾；失败不得掩盖采集结果或原始中断异常。
+
+    只在批次收尾调用，不放入逐产品下载事务。无文件的内存库没有持久快照。
+    """
+    if db_path is None:
+        return
+    try:
+        from miit_gonggao.collection_status import refresh_after_collection
+
+        refresh_after_collection(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
+                                 run_id=run_id, reason=reason)
+    except Exception as exc:
+        print(f"收录统计更新失败（采集记录已保留，旧统计可能过期）：{type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS ingestion_runs (
@@ -955,12 +973,16 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 flush=True,
             )
     finally:
-        interrupted = finish_run(conn, run_id, {
-            "query_failures": query_failures, "download_failures": download_failures,
-            "non_pdf_documents": non_pdf, "awaiting_effective": awaiting_effective,
-            "parse_failures": parse_failures, "publish_failures": publish_failures,
-        })
-        conn.close()
+        try:
+            interrupted = finish_run(conn, run_id, {
+                "query_failures": query_failures, "download_failures": download_failures,
+                "non_pdf_documents": non_pdf, "awaiting_effective": awaiting_effective,
+                "parse_failures": parse_failures, "publish_failures": publish_failures,
+            })
+        finally:
+            conn.close()
+            refresh_collection_status(args.site_db, catalog_db=args.catalog_db,
+                                      pdf_root=UPSTREAM_ROOT, run_id=run_id, reason="catalog_collection")
         if interrupted:
             print(f"本轮有 {interrupted} 个型号因中断未完成，已标记 interrupted。", file=sys.stderr, flush=True)
 

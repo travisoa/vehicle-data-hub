@@ -32,6 +32,7 @@ CATALOG_NAMES = (
 )
 CACHE_DIR = PROJECT_ROOT / "downloads" / "announcement_batches"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "output" / "gonggao_gap_by_category"
+_CACHE_WRITES = 0
 
 # 企业名称至少两个字才被接口接受（单字返回「请输入查询条件(至少有一项不少于两个字)」）。
 # 依据实测的 3,138 家公告企业：绝大多数名字含「公司」，其余是「…厂」「…研究所」，
@@ -275,9 +276,11 @@ def cache_is_complete(payload: dict, *, verify: bool = True) -> bool:
 
 
 def write_cache(path: Path, payload: dict) -> None:
+    global _CACHE_WRITES
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
+    _CACHE_WRITES += 1
 
 
 def load_batch(batch: str, *, refresh: bool = False, verify: bool = True) -> dict[str, dict]:
@@ -485,15 +488,25 @@ def main(argv: list[str] | None = None) -> int:
 
     products: dict[str, dict] = {}
     failed: list[int] = []
-    for index, batch in enumerate(batches, start=1):
-        print(f"[{index}/{len(batches)}] 第{batch}批", flush=True)
-        try:
-            verify = args.verify_every <= 1 or (index - 1) % args.verify_every == 0
-            products.update(load_batch(str(batch), refresh=args.refresh, verify=verify))
-        except Exception as exc:  # 单批失败不该丢掉已抓到的其他批次
-            failed.append(batch)
-            print(f"  第{batch}批枚举失败：{type(exc).__name__}: {exc}",
-                  file=sys.stderr, flush=True)
+    cache_writes_before = _CACHE_WRITES
+    try:
+        for index, batch in enumerate(batches, start=1):
+            print(f"[{index}/{len(batches)}] 第{batch}批", flush=True)
+            try:
+                verify = args.verify_every <= 1 or (index - 1) % args.verify_every == 0
+                products.update(load_batch(str(batch), refresh=args.refresh, verify=verify))
+            except Exception as exc:  # 单批失败不该丢掉已抓到的其他批次
+                failed.append(batch)
+                print(f"  第{batch}批枚举失败：{type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+    finally:
+        if _CACHE_WRITES != cache_writes_before:
+            from miit_gonggao import collection
+
+            catalog_db = args.catalog_db.expanduser().resolve()
+            site_db = catalog_db.parent / "announcement_site.sqlite"
+            collection.refresh_collection_status(site_db, catalog_db=catalog_db,
+                                                 pdf_root=site_db.parent.parent, reason="batch_cache")
     print(f"公告产品合计：{len(products)} 条（{len(batches) - len(failed)}/{len(batches)} 个批次）",
           flush=True)
     if failed:
