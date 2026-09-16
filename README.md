@@ -390,7 +390,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 近期正式公告 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
 | 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 只刷新本地已有有效参数页且被更高正式批次重发的整车；公示不作为来源；`--dry-run` 只出清单不下载 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
-| 提速 | 固定清单已有 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
+| 提速 | `gonggao collect` 各模式与固定清单共用 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |

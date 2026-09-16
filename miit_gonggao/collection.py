@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ import sys
 import tempfile
 from collections import Counter
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -362,6 +364,41 @@ def _catalog_item(catalog_db: Path, model_code: str) -> dict[str, str] | None:
     if not row:
         return None
     return {key: str(row[key] or "") for key in row.keys()}
+
+
+def requested_interval(args: argparse.Namespace) -> tuple[float, float] | None:
+    minimum, maximum = getattr(args, "min_interval", None), getattr(args, "max_interval", None)
+    if minimum is None and maximum is None:
+        return None
+    if minimum is None or maximum is None:
+        raise ValueError("--min-interval 和 --max-interval 必须同时提供")
+    if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum <= maximum):
+        raise ValueError("请求间隔必须为有限数且满足 0 < min <= max")
+    return minimum, maximum
+
+
+@dataclass
+class RequestPace:
+    requested: tuple[float, float] | None
+    default: tuple[float, float]
+    warning: str = ""
+
+    def slow_down(self, status: str) -> None:
+        core.REQUEST_MIN_INTERVAL = self.default
+        self.warning = f"发生 {status}，本次执行后续请求恢复默认间隔 {self.default[0]}–{self.default[1]} 秒"
+
+
+@contextmanager
+def request_pace(args: argparse.Namespace):
+    """只覆盖本进程的请求间隔，退出时一律恢复；不改 core.py 默认值。"""
+    original = core.REQUEST_MIN_INTERVAL
+    pace = RequestPace(requested_interval(args), original)
+    try:
+        if pace.requested is not None:
+            core.REQUEST_MIN_INTERVAL = pace.requested
+        yield pace
+    finally:
+        core.REQUEST_MIN_INTERVAL = original
 
 
 def _existing_vehicle_item(site_db: Path, model_code: str) -> dict[str, str] | None:
@@ -735,6 +772,13 @@ def catalog_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="只生成重发清单快照并输出统计，不查询、不下载、不写业务库",
     )
+    parser.add_argument(
+        "--min-interval", type=float,
+        help="本进程请求最小间隔（秒），须与最大间隔同时给出；默认沿用 core 的 0.8–1.8",
+    )
+    parser.add_argument(
+        "--max-interval", type=float, help="本进程请求最大间隔（秒），须与最小间隔同时给出",
+    )
     parser.add_argument("--catalog-db", type=Path, default=DEFAULT_CATALOG_DB)
     parser.add_argument("--site-db", type=Path, default=DEFAULT_SITE_DB)
     parser.add_argument("--report-dir", type=Path,
@@ -744,6 +788,10 @@ def catalog_main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if (args.limit is not None and args.limit < 1) or args.offset < 0:
         parser.error("--limit 必须大于 0，--offset 不得小于 0")
+    try:
+        requested_interval(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not args.catalog_db.exists():
         parser.error(f"目录数据库不存在：{args.catalog_db}")
     args.catalog_db = args.catalog_db.expanduser().resolve()
@@ -862,6 +910,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         "category": "全部" if args.all_categories else "乘用车",
         "limit": args.limit if republish_mode else (args.limit or 100),
         "offset": args.offset,
+        "request_interval": list(requested_interval(args) or core.REQUEST_MIN_INTERVAL),
     }
     if republished_source is not None:
         selector["republished"] = {
@@ -885,114 +934,120 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
     query_failures = download_failures = non_pdf = parse_failures = publish_failures = 0
     awaiting_effective = announcement_count = pdf_count = 0
+    pace_warning = ""
     try:
-        for index, item in enumerate(selected, start=1):
-            vehicle_id = upsert_vehicle(conn, item)
-            begin_model(conn, run_id, index, vehicle_id)
-            print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
-            try:
-                rows = core.query_all_pages(model_code=item["model_code"], page_size=50)
-                rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
-            except Exception as exc:
-                query_failures += 1
-                message = f"{type(exc).__name__}: {exc}"
-                conn.execute(
-                    "UPDATE run_models SET status='query_failed', error=? WHERE run_id=? AND vehicle_id=?",
-                    (message, run_id, vehicle_id),
-                )
-                conn.commit()
-                print(f"  查询失败：{message}", file=sys.stderr, flush=True)
-                continue
-            if not rows:
+        # 提速只覆盖本进程；下载或查询失败会自动恢复默认间隔。
+        with request_pace(args) as pace:
+            for index, item in enumerate(selected, start=1):
+                vehicle_id = upsert_vehicle(conn, item)
+                begin_model(conn, run_id, index, vehicle_id)
+                print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
+                try:
+                    rows = core.query_all_pages(model_code=item["model_code"], page_size=50)
+                    rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
+                except Exception as exc:
+                    query_failures += 1
+                    pace.slow_down("query_failed")
+                    message = f"{type(exc).__name__}: {exc}"
+                    conn.execute(
+                        "UPDATE run_models SET status='query_failed', error=? WHERE run_id=? AND vehicle_id=?",
+                        (message, run_id, vehicle_id),
+                    )
+                    conn.commit()
+                    print(f"  查询失败：{message}", file=sys.stderr, flush=True)
+                    continue
+                if not rows:
+                    if republish_mode:
+                        awaiting_effective += 1
+                        message = (
+                            f"记录第{item['republished_batch']}批重新发布，正式接口现在查不到该精确型号"
+                        )
+                        conn.execute(
+                            "UPDATE run_models SET status='awaiting_effective', error=? "
+                            "WHERE run_id=? AND vehicle_id=?",
+                            (message, run_id, vehicle_id),
+                        )
+                        conn.commit()
+                        print(f"  接口与记录不一致：{message}", flush=True)
+                        continue
+                    conn.execute(
+                        "UPDATE run_models SET status='no_match', error='' WHERE run_id=? AND vehicle_id=?",
+                        (run_id, vehicle_id),
+                    )
+                    conn.commit()
+                    print("  公告接口未找到精确型号。", flush=True)
+                    continue
+
                 if republish_mode:
-                    awaiting_effective += 1
-                    message = (
-                        f"记录第{item['republished_batch']}批重新发布，正式接口现在查不到该精确型号"
-                    )
-                    conn.execute(
-                        "UPDATE run_models SET status='awaiting_effective', error=? "
-                        "WHERE run_id=? AND vehicle_id=?",
-                        (message, run_id, vehicle_id),
-                    )
-                    conn.commit()
-                    print(f"  接口与记录不一致：{message}", flush=True)
-                    continue
-                conn.execute(
-                    "UPDATE run_models SET status='no_match', error='' WHERE run_id=? AND vehicle_id=?",
-                    (run_id, vehicle_id),
-                )
-                conn.commit()
-                print("  公告接口未找到精确型号。", flush=True)
-                continue
+                    rows = core.filter_latest_batch(rows)
+                    actual_batch = str(rows[0].get("gppc") or rows[0].get("pc") or "")
+                    expected_batch = item["republished_batch"]
+                    if not batch_is_at_least(actual_batch, expected_batch):
+                        # 清单来自正式发布记录，接口批次反而更低说明记录已与源不符，
+                        # 不能拿更旧的一版覆盖本地已有参数页。
+                        awaiting_effective += 1
+                        message = (
+                            f"记录第{expected_batch}批，正式接口当前最高为第{actual_batch or '未知'}批"
+                        )
+                        conn.execute(
+                            "UPDATE run_models SET status='awaiting_effective', error=? "
+                            "WHERE run_id=? AND vehicle_id=?",
+                            (message, run_id, vehicle_id),
+                        )
+                        conn.commit()
+                        print(f"  接口与记录不一致：{message}", flush=True)
+                        continue
+                    rows = [
+                        {
+                            **row,
+                            "_republished": {
+                                "recorded_batch": expected_batch,
+                                "local_batch": item["local_batch"],
+                                "product_id": item["republished_product_id"],
+                                "company": item["republished_company"],
+                                "trademark": item["republished_trademark"],
+                                "product_name": item["republished_product_name"],
+                            },
+                        }
+                        for row in rows
+                    ]
 
-            if republish_mode:
-                rows = core.filter_latest_batch(rows)
-                actual_batch = str(rows[0].get("gppc") or rows[0].get("pc") or "")
-                expected_batch = item["republished_batch"]
-                if not batch_is_at_least(actual_batch, expected_batch):
-                    # 清单来自正式发布记录，接口批次反而更低说明记录已与源不符，
-                    # 不能拿更旧的一版覆盖本地已有参数页。
-                    awaiting_effective += 1
-                    message = (
-                        f"记录第{expected_batch}批，正式接口当前最高为第{actual_batch or '未知'}批"
+                errors: list[str] = []
+                model_pdf_count = 0
+                for row in rows:
+                    announcement_count += 1
+                    ok_pdf, message = store_announcement(
+                        conn,
+                        row=row,
+                        vehicle_id=vehicle_id,
+                        market_name=item["common_name"] or item["model_code"],
+                        download_root=args.download_root,
+                        pdf_root=UPSTREAM_ROOT,
+                        catalog_db=args.catalog_db,
                     )
-                    conn.execute(
-                        "UPDATE run_models SET status='awaiting_effective', error=? "
-                        "WHERE run_id=? AND vehicle_id=?",
-                        (message, run_id, vehicle_id),
-                    )
-                    conn.commit()
-                    print(f"  接口与记录不一致：{message}", flush=True)
-                    continue
-                rows = [
-                    {
-                        **row,
-                        "_republished": {
-                            "recorded_batch": expected_batch,
-                            "local_batch": item["local_batch"],
-                            "product_id": item["republished_product_id"],
-                            "company": item["republished_company"],
-                            "trademark": item["republished_trademark"],
-                            "product_name": item["republished_product_name"],
-                        },
-                    }
-                    for row in rows
-                ]
-
-            errors: list[str] = []
-            model_pdf_count = 0
-            for row in rows:
-                announcement_count += 1
-                ok_pdf, message = store_announcement(
-                    conn,
-                    row=row,
-                    vehicle_id=vehicle_id,
-                    market_name=item["common_name"] or item["model_code"],
-                    download_root=args.download_root,
-                    pdf_root=UPSTREAM_ROOT,
-                    catalog_db=args.catalog_db,
+                    if ok_pdf or message.startswith("解析失败"):
+                        pdf_count += 1
+                        model_pdf_count += 1
+                    if not ok_pdf:
+                        if message.startswith("下载失败"):
+                            download_failures += 1
+                            pace.slow_down("download_failed")
+                        elif message.startswith("解析失败"):
+                            parse_failures += 1
+                        elif message.startswith("发布失败"):
+                            publish_failures += 1
+                        else:
+                            non_pdf += 1
+                        errors.append(message)
+                status = "done" if not errors else "partial"
+                finish_model(conn, run_id, vehicle_id, status, "; ".join(errors))
+                print(
+                    f"  公告 {len(rows)} 条；PDF {model_pdf_count} 条；"
+                    f"异常 {len(errors)} 条",
+                    flush=True,
                 )
-                if ok_pdf or message.startswith("解析失败"):
-                    pdf_count += 1
-                    model_pdf_count += 1
-                if not ok_pdf:
-                    if message.startswith("下载失败"):
-                        download_failures += 1
-                    elif message.startswith("解析失败"):
-                        parse_failures += 1
-                    elif message.startswith("发布失败"):
-                        publish_failures += 1
-                    else:
-                        non_pdf += 1
-                    errors.append(message)
-            status = "done" if not errors else "partial"
-            finish_model(conn, run_id, vehicle_id, status, "; ".join(errors))
-            print(
-                f"  公告 {len(rows)} 条；PDF {model_pdf_count} 条；"
-                f"异常 {len(errors)} 条",
-                flush=True,
-            )
     finally:
+        pace_warning = pace.warning
         try:
             interrupted = finish_run(conn, run_id, {
                 "query_failures": query_failures, "download_failures": download_failures,
@@ -1009,8 +1064,9 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     print(
         f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
         f"接口与记录不一致 {awaiting_effective}，查询失败 {query_failures}，"
-        f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，非 PDF {non_pdf}。\n"
-        f"数据库：{args.site_db}\n目录快照：{selection_path}",
+        f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，非 PDF {non_pdf}。"
+        + (f"\n{pace_warning}" if pace_warning else "")
+        + f"\n数据库：{args.site_db}\n目录快照：{selection_path}",
         flush=True,
     )
 

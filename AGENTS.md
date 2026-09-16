@@ -219,6 +219,10 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 ## 抓取与网络规则
 
 - 两个来源都保持低频、串行、温和，不加激进并发
+- 经用户明确要求可给 `gonggao collect`（含目录、清单文件与正式发布重发各模式）传
+  `--min-interval/--max-interval`，与固定清单共用同一实现：只覆盖本进程的
+  `core.REQUEST_MIN_INTERVAL`，退出即恢复，不改 `core.py` 默认值；查询或下载失败会立即降回
+  默认间隔并在结尾说明，本轮实际节奏记入 `ingestion_runs.selector_json`。默认不提速，必须显式传参
 - 例外：`scripts/announcement_catalog_gap.py` 的全量批次枚举是一次性只读大作业（约 2.9 万次请求），经项目所有者授权可用 `--fast`（0.2~0.4 秒）或 `--min-interval/--max-interval` 提速。它只覆盖该进程内的 `core.REQUEST_MIN_INTERVAL`，不改 `core.py` 默认值，PDF 下载等其他功能不受影响；仍然串行（同等平均 QPS 下比并发对服务端更平滑），且连续 3 次请求异常会自动降回保守节流。默认不提速，必须显式传参
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
 - `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败

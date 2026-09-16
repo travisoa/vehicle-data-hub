@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import signal
 import sqlite3
@@ -41,38 +40,10 @@ NEV_TYPES = {"纯电动", "插电式混合动力", "增程式", "燃料电池"}
 SUCCESS = {"downloaded", "skipped_existing"}
 
 
-def requested_interval(args: argparse.Namespace) -> tuple[float, float] | None:
-    minimum, maximum = getattr(args, "min_interval", None), getattr(args, "max_interval", None)
-    if minimum is None and maximum is None:
-        return None
-    if minimum is None or maximum is None:
-        raise ValueError("--min-interval 和 --max-interval 必须同时提供")
-    if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum <= maximum):
-        raise ValueError("请求间隔必须为有限数且满足 0 < min <= max")
-    return minimum, maximum
-
-
-@dataclass
-class RequestPace:
-    requested: tuple[float, float] | None
-    default: tuple[float, float]
-    warning: str = ""
-
-    def slow_down(self, status: str) -> None:
-        seed.core.REQUEST_MIN_INTERVAL = self.default
-        self.warning = f"发生 {status}，本次执行后续请求恢复默认间隔 {self.default[0]}–{self.default[1]} 秒"
-
-
-@contextmanager
-def request_pace(args: argparse.Namespace):
-    original = seed.core.REQUEST_MIN_INTERVAL
-    pace = RequestPace(requested_interval(args), original)
-    try:
-        if pace.requested is not None:
-            seed.core.REQUEST_MIN_INTERVAL = pace.requested
-        yield pace
-    finally:
-        seed.core.REQUEST_MIN_INTERVAL = original
+# 请求节奏控制由 seed（collection）统一提供，两个入口共用同一实现与降速契约。
+requested_interval = seed.requested_interval
+RequestPace = seed.RequestPace
+request_pace = seed.request_pace
 
 
 def validate_catalog_energy(rows: list[tuple[str, str, str]], catalog_db: Path | None) -> None:

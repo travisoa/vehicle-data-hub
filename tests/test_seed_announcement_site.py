@@ -119,6 +119,7 @@ def run_republished_ingestion(
     recorded_batch: int = 409,
     download=None,
     parse=None,
+    extra_args: tuple[str, ...] = (),
 ) -> tuple[int, Path, Path]:
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
@@ -163,6 +164,7 @@ def run_republished_ingestion(
             str(site_db),
             "--download-root",
             str(download_root),
+            *extra_args,
         ],
     )
     return seed.main(), site_db, upstream_root
@@ -242,6 +244,52 @@ def test_republished_refresh_ingests_the_new_batch_and_records_provenance(monkey
         site_db, [409], upstream_root / "downloads" / "announcement_batches"
     )
     assert again.rows == []
+
+
+def test_request_pace_only_covers_this_run_and_is_restored_afterwards(monkeypatch, tmp_path: Path):
+    """提速是本进程的临时覆盖，采集一结束就要恢复 core 的默认间隔。"""
+    default = seed.core.REQUEST_MIN_INTERVAL
+    during: list[tuple[float, float]] = []
+
+    def fake_download(_row, folder: Path):
+        during.append(seed.core.REQUEST_MIN_INTERVAL)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "示例牌_ABC6500EV_409.pdf"
+        path.write_bytes(b"%PDF-1.4\npaced")
+        return path, True, path.stat().st_size
+
+    exit_code, *_ = run_republished_ingestion(
+        monkeypatch, tmp_path, announcement_batch="409", download=fake_download,
+        extra_args=("--min-interval", "0.2", "--max-interval", "0.4"))
+    assert exit_code == 0
+    assert during == [(0.2, 0.4)]
+    assert seed.core.REQUEST_MIN_INTERVAL == default
+
+
+def test_download_failure_drops_the_run_back_to_the_default_interval(monkeypatch, tmp_path: Path, capsys):
+    """下载失败是服务端压力信号：本轮后续请求必须退回默认节奏并说明。"""
+    default = seed.core.REQUEST_MIN_INTERVAL
+
+    def failing_download(_row, _folder: Path):
+        raise OSError("connection reset")
+
+    exit_code, *_ = run_republished_ingestion(
+        monkeypatch, tmp_path, announcement_batch="409", download=failing_download,
+        extra_args=("--min-interval", "0.2", "--max-interval", "0.4"))
+    assert exit_code == 2
+    printed = capsys.readouterr().out
+    assert "download_failed" in printed and "恢复默认间隔" in printed
+    assert seed.core.REQUEST_MIN_INTERVAL == default
+
+
+def test_partial_interval_is_rejected_before_any_collection(monkeypatch, tmp_path: Path):
+    """只给一半区间是配置错误，必须在采集开始前拒绝。"""
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口"))
+    with pytest.raises(SystemExit) as exc:
+        run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="409",
+                                  extra_args=("--min-interval", "0.2"))
+    assert exc.value.code == 2
 
 
 def test_republished_dry_run_lists_candidates_without_touching_the_network_or_db(monkeypatch, tmp_path: Path):
