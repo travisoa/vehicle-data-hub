@@ -10,7 +10,8 @@
     python3 main.py gonggao collect --manifest <清单> --help  # 固定产品清单模式
     python3 main.py gonggao status                  # 读取持久收录统计；--refresh 显式更新
     python3 main.py gonggao query <车型> --download  # 工信部公告查询完整 CLI
-    python3 main.py gonggao changes --model-code <型号> --download  # 变更扩展公示 -> 最新有效 PDF
+    python3 main.py gonggao collect --republished-from-status  # 正式发布重发 -> 刷新已有参数页
+    python3 main.py gonggao changes --model-code <型号>  # 变更扩展公示只读查询（提前了解，不下载）
     python3 main.py review <车型>                    # 公告 PDF -> 公告参数评审 Excel
     python3 main.py report <本品> --vs <竞品>      # 口碑/销量竞品对标 HTML 报告
     python3 main.py profiles                         # 列出统一车型档案

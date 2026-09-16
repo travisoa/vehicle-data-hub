@@ -146,7 +146,7 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 
 ### 工信部公告与减免税目录
 
-对应命令：`main.py gonggao query ...`、`main.py gonggao changes ...`、
+对应命令：`main.py gonggao query ...`、`main.py gonggao changes ...`（只读）、
 `main.py gonggao jianmian ...` 与 `main.py fetch --source gonggao`
 
 <table>
@@ -156,7 +156,8 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 </thead>
 <tbody>
 <tr><td nowrap width="1%"><strong>公告查询</strong></td><td>按商标、企业、车辆型号、名称与批次组合筛选；支持型号前缀的<strong>包含与排除</strong>（<code>--model-prefix</code> / <code>--exclude-model-prefix</code>）及任意字段后置筛选（<code>--row-filter</code>）</td></tr>
-<tr><td nowrap width="1%"><strong>变更扩展公示</strong></td><td><code>gonggao changes</code> 按公示企业、商标、产品名称或产品型号查询工信部变更扩展清单；加 <code>--download</code> 后，以公示中的精确产品型号查询当前有效公告，下载其中最高批次的参数页 PDF。查询快照同时保留公示批次与实际 PDF 批次，二者不强制相同。</td></tr>
+<tr><td nowrap width="1%"><strong>变更扩展公示</strong></td><td><code>gonggao changes</code> 按公示企业、商标、产品名称或产品型号<strong>只读</strong>查询工信部变更扩展清单，供提前了解尚未正式发布的变更。公示不下载、不入库、不作为任何采集入口；公示批次与正式公告批次不强制相同。</td></tr>
+<tr><td nowrap width="1%"><strong>正式发布重发刷新</strong></td><td><code>gonggao collect --republished-from-status</code>（或 <code>--republished-batch &lt;批次&gt;</code>）按<strong>正式公告</strong>的重新发布记录刷新已有参数页：同一产品 ID 在更高正式批次再次出现即为变更扩展或勘误重发。前者读已落盘的收录统计记录、不重算，只收 PDF 已解析的产品；后者按批次枚举缓存现算，只要求本地有有效 PDF，因此已下载但解析失败的重发只有后者会选中。两者都排除底盘等非整车。</td></tr>
 <tr><td nowrap width="1%"><strong>参数页下载</strong></td><td><code>--download</code> 下载参数页 PDF 至 <code>downloads/announcement_site/&lt;品牌&gt;/&lt;车型&gt;/第&lt;批次&gt;批/</code>；查询快照与下载索引存入 <code>_snapshots/</code>；按 <code>%PDF</code> 头校验，非 PDF 时保留 <code>.html</code> 供人工核查；单条失败仅跳过并在结尾汇总，<strong>不中断整批</strong></td></tr>
 <tr><td nowrap width="1%"><strong>动态修订归档</strong></td><td>公告网站的参数页 PDF 由查询接口动态生成。同一产品 ID 后续返回的字段或批次发生变化时，当前版本留在主目录，旧快照归入 <code>downloads/announcement_site/_revisions/</code> 并在 <code>manifest.json</code> 记录哈希、PDF 生成时间、身份字段及差异；历史快照不参与普通车型查询和分类索引。</td></tr>
 <tr><td nowrap width="1%"><strong>目录反查</strong></td><td><code>jianmian search &lt;市场名&gt;</code> 以通用名称反查公告型号与商标；<code>--resolve</code> 经公告接口确认，<code>--download</code> 直接下载参数页</td></tr>
@@ -328,14 +329,14 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 网站批量收录、补采及重试先使用 `main.py gonggao collect`，
 按 [公告采集契约](#公告批量采集) 选择模式；不要为新批次或提速另建下载脚本。
-能力不足时扩展原入口的参数或内部策略。下面的 `query/changes --download` 用于独立查询下载，
-不能代替网站采集库登记。
+能力不足时扩展原入口的参数或内部策略。下面的 `query --download` 用于独立查询下载，
+不能代替网站采集库登记；`changes` 只读查询公示，任何情况下都不作为采集入口。
 
 两个来源的全部参数均在各自子命令下可用：
 
 ```bash
 .venv/bin/python main.py gonggao query --trademark "<商标>" --model-prefix <型号前缀> --latest-batch --download
-.venv/bin/python main.py gonggao changes --model-code <完整公告型号> --download
+.venv/bin/python main.py gonggao changes --model-code <完整公告型号>
 .venv/bin/python main.py autohome --models "<车型名>" --browser-login --browser-fallback
 .venv/bin/python main.py autohome --capture-file /path/to/autohome_config.html
 ```
@@ -349,11 +350,12 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 `--latest-batch` 仅保留最高批次 / `--all-pages` 拉取全部分页 / `--download` 下载 PDF /
 `--detail-html` 同时保存技术参数 HTML / `--vehicle-folder` 指定下载目录名 / `--limit` 条数限制
 
-**`gonggao changes`**：`--company` 公示企业 / `--trademark` 公示商标 /
-`--product-name` 公示产品名称 / `--model-code` 公示产品型号 / `--download` 按命中型号下载当前最高有效批次 PDF /
-`--limit` 限制返回及下载数量 / `--all` 显式允许无条件遍历整批 /
+**`gonggao changes`**（只读，不下载）：`--company` 公示企业 / `--trademark` 公示商标 /
+`--product-name` 公示产品名称 / `--model-code` 公示产品型号 /
+`--limit` 限制返回数量 / `--all` 显式允许无条件遍历整批 /
 `--notice-url` 指定新的工信部变更扩展公示文章。默认使用项目已验证的官方公示入口；
 工信部发布新批次且文章随机 URL 变化时，应把该批次文章 URL 通过 `--notice-url` 传入。
+公示只用于提前了解，正式发布后的刷新一律走 `gonggao collect --republished-from-status`。
 
 **`gonggao jianmian`**：`sync`（`--max-pages` / `--max-articles` / `--force` 重新下载并作废转换缓存）、
 `search <关键词>`（`--resolve` 经公告接口反查 / `--download` 反查后下载，隐含 `--resolve` / `--latest-batch` 只下最高批次）、
@@ -385,7 +387,8 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | --- | --- | --- |
 | 目录或型号名单采集 | `gonggao collect` 的目录参数或 `-f` | 会查询同型号所有正式批次；不是固定批次下载 |
 | 已核验汽车整车产品 ID | `gonggao collect --manifest ...` | 只处理冻结清单；新能源 scope 仅收新能源，通用 scope 的非新能源/未知仅 408/409 批 |
-| 近期公告/公示 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
+| 近期正式公告 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
+| 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 只刷新本地已有有效参数页且被更高正式批次重发的整车；公示不作为来源；`--dry-run` 只出清单不下载 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
 | 提速 | 固定清单已有 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
@@ -426,7 +429,7 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 .venv/bin/python main.py gonggao status --refresh
 # 最近一轮或指定轮次报告
 .venv/bin/python -m miit_gonggao.collection_report --run 24
-# 近期公示/公告跟踪，只读生成计划
+# 近期正式公告跟踪，只读生成计划
 .venv/bin/python -m miit_gonggao.collection_tracking plan --limit 400
 ```
 
@@ -447,7 +450,7 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 
-`gonggao query/changes --download` 继续支持临时查询与文件下载，保留原 CLI 输出/退出码契约；
+`gonggao query --download` 继续支持临时查询与文件下载，保留原 CLI 输出/退出码契约；
 其 `manifest_*.json` 是原始查询下载证据。网站批量采集应使用 `gonggao collect`，
 不要用临时查询下载代替业务库登记。
 
@@ -507,7 +510,7 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 旧版未分类记录保守提示，显式刷新后采用新分类；默认查看仍只读取已保存的诊断。
 
 业务库保留 `ingestion_runs`、`run_models`、`documents`、`announcement_fields`，以及
-公告、车型、商标、批次和公示跟踪表。判断历史下载结果须跨轮取最好结局；
+公告、车型、商标、批次和正式公告跟踪表。判断历史下载结果须跨轮取最好结局；
 `completed_at` 只表示轮次结束，不能据此宣称全部成功。
 原 CLI 索引继续保留来源差异，不伪造为业务库的采集轮次。
 
@@ -524,7 +527,7 @@ Website 的旧采集脚本仅转发，旧业务库与已迁移运行目录是上
 `python scripts/announcement_catalog_gap.py --batch <批次> --fetch-only` 用于完整枚举。
 缓存 v4 仅复用 7 天内的完整结果；关键词或校验失败保存 `.partial.json` 并以失败结束，
 缺失批次保存 `.absent.json` 并在下一次重新探测，均不覆盖已有成功缓存。
-近期公告/公示跟踪由本项目 `miit_gonggao.collection_tracking` 写入上游权威业务库；Website 只读构建派生库。
+近期正式公告跟踪由本项目 `miit_gonggao.collection_tracking` 写入上游权威业务库；Website 只读构建派生库。
 公示表格按实际表头定位企业、产品名称、型号，兼容新产品及变更扩展列顺序；
 无法识别时停止，不把错位或不完整结果当作有效清单，行错误指出表格行号。
 明确的整行合计可跳过，未知合并行仍阻断登记。`notice_batch` 取文章批次，
@@ -694,7 +697,7 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 | `downloads/announcement_site/_snapshots/query_*.json` / `manifest_*.json` | `gonggao query --download` 的查询快照与下载索引；索引含成功与失败两类条目（`status` 为 `ok`/`not_pdf`/`download_failed`）。网站批量采集用本项目 `gonggao collect`，统一登记 `data/announcement_site.sqlite`，保留独立的来源证据 |
 | `downloads/announcement_site/_revisions/` | 公告网站动态页面变更前的 PDF 快照；`manifest.json` 记录原始哈希、当前哈希、PDF 生成时间与字段差异，不参与主库分类或普通查询 |
 | `downloads/jianmian/<文章ID>_公告第N批/` | 减免税目录附件及派生缓存 |
-| `data/announcement_site.sqlite` | 公告采集、文档、解析参数与公示跟踪的权威业务库 |
+| `data/announcement_site.sqlite` | 公告采集、文档、解析参数与正式公告跟踪的权威业务库 |
 | `var/runs/` / `var/reports/` | 上游采集清单、进度、逐产品日志和报告 |
 | `data/jianmian_catalog.sqlite` | 减免税目录车型库（本地数据，不纳入版本管理） |
 | `logs/` | 汽车之家抓取运行日志 |

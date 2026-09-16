@@ -14,7 +14,7 @@
 数据流单向：本项目 → Website，不存在反向依赖。判断一处改动是否越界，只问一句：**它读写的资产，唯一写入方是谁？**
 
 本项目独占写入：`data/jianmian_catalog.sqlite`、`data/vehicle_profiles.json`、
-`data/announcement_site.sqlite`（公告、PDF 路径/哈希/解析字段、采集轮次及逐型号状态、公示跟踪）、
+`data/announcement_site.sqlite`（公告、PDF 路径/哈希/解析字段、采集轮次及逐型号状态、正式公告跟踪）、
 `downloads/announcement_site/`（含 `_snapshots/`、`分类公告/`、`_revisions/`）、
 `downloads/announcement_batches/`、`var/runs/`、采集报告及 `output/`。
 Website 独占写入其派生站点库、前后端、站点构建/部署产物；只读消费上游业务库和 PDF。
@@ -51,9 +51,9 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
     - 已知商标或型号时用透传 CLI 一次性查询：
      `main.py gonggao query --trademark "某某牌" --model-prefix XXX --latest-batch --download --vehicle-folder <车型>`
      （`--model-code`/`--company`/`--model-prefix` 之一存在时可不带 `--trademark`）
-    - 要查变更扩展公示时用
-      `main.py gonggao changes --model-code <完整公告型号> [--download]`；`--download` 必须先保留公示命中证据，
-      再以精确型号查询有效公告中的最高批次 PDF，分别记录公示批次与 PDF 批次，不能假定二者相同
+    - 要查变更扩展公示时用 `main.py gonggao changes --model-code <完整公告型号>`；公示只用于提前了解，
+      不下载、不入库、不作为任何采集入口。公示批次与正式公告批次不能假定相同；
+      正式发布之后用 `main.py gonggao collect --republished-from-status` 刷新已有参数页
    - 如果这个车型以后还会查，用 `main.py profiles add <市场名>` 把条件写进 `data/vehicle_profiles.json`，
      不要手抄终端里的「建议 model_prefixes」。先 `--dry-run` 预览；命令只写机器能确定的字段，
      商标不唯一、`clmc` 不一致、`exclude_model_prefixes` 一律留空并在终端点名，这些需要人工补
@@ -67,7 +67,10 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 .venv/bin/python main.py fetch <车型> --all-batches --source gonggao  # 全部批次
 .venv/bin/python main.py autohome --models "..." [--browser-login --browser-fallback]
 .venv/bin/python main.py gonggao query ... --download   # 公告查询 CLI 全参数可用
-.venv/bin/python main.py gonggao changes --model-code <完整公告型号> [--download]  # 变更扩展公示 -> 最新有效 PDF
+.venv/bin/python main.py gonggao changes --model-code <完整公告型号>  # 变更扩展公示只读查询（不下载）
+.venv/bin/python main.py gonggao collect --republished-from-status   # 正式发布重发 -> 刷新已有参数页
+.venv/bin/python main.py gonggao collect --republished-batch 409     # 同上，按批次缓存现算
+.venv/bin/python main.py gonggao collect --republished-batch 409 --dry-run  # 只出清单快照，不查接口不下载
 .venv/bin/python main.py gonggao jianmian sync          # 减免税目录抓取入库（增量，--force 重下并作废转换缓存）
 .venv/bin/python main.py gonggao jianmian search <市场名> --resolve [--download] [--latest-batch]
 .venv/bin/python main.py gonggao jianmian export [--keyword <关键词>] [--xlsx 路径]
@@ -95,6 +98,17 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
   `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
   新建独立批量下载入口，也不得复制已有下载循环。
+- 公示（变更扩展公示、新产品公示）只用于提前了解，不作为任何采集入口：不登记事件、不下载、
+  不进业务库。已有参数页被官方变更后要刷新时，用 `collect --republished-from-status`
+  （读已落盘统计记录）或 `--republished-batch <批次>`（按批次枚举缓存现算），
+  两者的重发判据都是同一产品 ID 在更高正式批次再次出现，但本地侧门槛不同：
+  `--republished-from-status` 只收 PDF 已解析的产品，`--republished-batch` 只要求有有效 PDF，
+  所以已下载但解析失败的重发只有后者会选中，前者把它留在统计的 `pdf_unparsed` 候选里。
+  正式接口批次低于记录批次时该型号记 `awaiting_effective` 并跳过，绝不用更旧的一版覆盖本地已有参数页。
+  `--limit` 在该模式下按候选产品计数，去重后型号数可能更少；`--dry-run` 的统计与快照都按本轮清单输出。
+- 事件消费端只认 `kind='formal'`。旧库里遗留的 `new_notice`/`change_notice` 行原样保留在
+  `tracking_events`，但不进重试计划（`plan` 把它们单列为 `legacy_notice`），Website 构库也会跳过
+  并记入 `tracking_non_formal_skipped`。不得删除源库历史来"解决"这个问题。
 - 能力不足时，先定位缺少的参数、候选选择或恢复能力，在既有 `collection*.py` 中扩展。
   可按职责拆分内部策略模块，但必须接入原入口，复用 `store_announcement`、锁、解析、
   状态收尾和权威业务库；内部拆分不构成新增一套采集器的理由。
@@ -207,7 +221,7 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 两个来源都保持低频、串行、温和，不加激进并发
 - 例外：`scripts/announcement_catalog_gap.py` 的全量批次枚举是一次性只读大作业（约 2.9 万次请求），经项目所有者授权可用 `--fast`（0.2~0.4 秒）或 `--min-interval/--max-interval` 提速。它只覆盖该进程内的 `core.REQUEST_MIN_INTERVAL`，不改 `core.py` 默认值，PDF 下载等其他功能不受影响；仍然串行（同等平均 QPS 下比并发对服务端更平滑），且连续 3 次请求异常会自动降回保守节流。默认不提速，必须显式传参
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
-- `query --download` 与 `changes --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
+- `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有失败或非 PDF 条目）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
 - 工信部 PDF 接口的 `NECaptchaValidate` 沿用现有随机 token 方式，不要改动
 - 缺失字段不要抛异常中断，记录日志后继续
@@ -227,7 +241,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   每条保留 `status/error`。批量下载结果统一写 `data/announcement_site.sqlite`，
   固定产品清单的逐产品日志另存 `var/runs/<本轮>/results.jsonl`；两类历史来源均保留，不互相覆盖。
   PDF 分类及历史修订分别由 `collection_classify`、`collection_revisions` 读取同一业务库处理。
-- 变更扩展公示查询快照 → `downloads/announcement_site/_snapshots/change_notice_*.json`，其中同时保存公示文章、发布日期、公示批次、命中型号和详情链接；`changes --download` 的下载索引还要记录最终命中的有效公告批次
+- 变更扩展公示查询快照 → `downloads/announcement_site/_snapshots/change_notice_*.json`，其中同时保存公示文章、发布日期、公示批次、命中型号和详情链接；公示只读，没有下载索引
+- 正式发布重发清单快照 → `downloads/announcement_site/_snapshots/republished_seed_*.json`，保存来源（统计记录代号或批次）、过期批次标记、候选产品 ID 及其记录批次与本地批次
 - 公示 `notice_batch` 以文章标题为准；表格原始批次保留在 `raw_notice_batch`，混合列保留在
   `batch_or_chassis_id`，不得把底盘 ID 当作公告批次。解析仅跳过明确整行合计，缺列、未知合并行
   和缺型号均报告表格行号并停止登记，不静默丢弃产品行。

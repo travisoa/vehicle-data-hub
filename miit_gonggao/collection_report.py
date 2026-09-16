@@ -39,7 +39,7 @@ OUTCOME_LABEL = {
     "no_match": "公告系统查无此型号",
     "query_failed": "查询失败",
     "no_document": "尚未取得有效参数页",
-    "awaiting_effective": "待正式生效",
+    "awaiting_effective": "正式接口未返回记录批次",
 }
 MAX_DETAIL_ROWS = 50
 

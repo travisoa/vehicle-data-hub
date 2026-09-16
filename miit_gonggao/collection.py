@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from collections import Counter
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ for _path in (UPSTREAM_ROOT, Path(__file__).resolve().parent):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from miit_gonggao import change_notice, core  # noqa: E402
+from miit_gonggao import core, republished  # noqa: E402
 from miit_gonggao.review_export import lookup_catalog, parse_gonggao_pdf  # noqa: E402
 
 CATALOG_NAME = "减免车辆购置税的新能源汽车车型目录"
@@ -390,16 +391,16 @@ def _existing_vehicle_item(site_db: Path, model_code: str) -> dict[str, str] | N
     }
 
 
-def select_change_notice_models(
+def select_republished_models(
     catalog_db: Path,
     site_db: Path,
-    notice_rows: list[dict[str, str]],
+    republished_rows: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
-    """把变更扩展公示行转为采集候选；已有型号也必须保留并强制刷新。"""
+    """把正式发布的重发产品转为采集候选；已有型号必须保留并强制刷新。"""
     selected: list[dict[str, str]] = []
     seen: set[str] = set()
-    for notice in notice_rows:
-        model_code = str(notice.get("model_code") or "").strip()
+    for row in republished_rows:
+        model_code = str(row.get("model_code") or "").strip()
         model_key = model_code.upper()
         if not model_code or model_key in seen:
             continue
@@ -407,14 +408,14 @@ def select_change_notice_models(
         base = _catalog_item(catalog_db, model_code) or _existing_vehicle_item(
             site_db, model_code
         ) or {
-            "catalog": "变更扩展公示",
-            "batch": str(notice.get("notice_batch") or ""),
+            "catalog": "正式发布重发",
+            "batch": str(row.get("republished_batch") or ""),
             "category": derive_catalog_category(
-                model_code, str(notice.get("product_name") or "")
+                model_code, str(row.get("product_name") or "")
             ),
             "seq": "",
-            "company": str(notice.get("company") or ""),
-            "trademark": str(notice.get("trademark") or ""),
+            "company": str(row.get("company") or ""),
+            "trademark": str(row.get("trademark") or ""),
             "model_code": model_code,
             "common_name": model_code,
         }
@@ -422,12 +423,12 @@ def select_change_notice_models(
         item.update(
             {
                 "model_code": model_code,
-                "notice_batch": str(notice.get("notice_batch") or ""),
-                "notice_title": str(notice.get("notice_title") or ""),
-                "notice_detail_url": str(notice.get("detail_url") or ""),
-                "notice_company": str(notice.get("company") or ""),
-                "notice_trademark": str(notice.get("trademark") or ""),
-                "notice_product_name": str(notice.get("product_name") or ""),
+                "republished_batch": str(row.get("republished_batch") or ""),
+                "local_batch": str(row.get("local_batch") or ""),
+                "republished_product_id": str(row.get("product_id") or ""),
+                "republished_company": str(row.get("company") or ""),
+                "republished_trademark": str(row.get("trademark") or ""),
+                "republished_product_name": str(row.get("product_name") or ""),
             }
         )
         selected.append(item)
@@ -435,7 +436,7 @@ def select_change_notice_models(
 
 
 def batch_is_at_least(actual: str, expected: str) -> bool:
-    """判断正式公告批次是否已达到公示批次；非数字批次仅接受完全相等。"""
+    """判断正式公告接口批次是否已达到记录批次；非数字批次仅接受完全相等。"""
     actual = actual.strip()
     expected = expected.strip()
     if actual.isdigit() and expected.isdigit():
@@ -443,32 +444,29 @@ def batch_is_at_least(actual: str, expected: str) -> bool:
     return bool(actual and expected and actual == expected)
 
 
-def write_change_notice_snapshot(
-    source: change_notice.ChangeNoticeSource,
+def write_republished_snapshot(
+    source: republished.RepublishedSource,
     *,
-    total: int,
-    rows: list[dict[str, str]],
     selected: list[dict[str, str]],
     output_root: Path,
-    filters: dict[str, str],
 ) -> Path:
     snapshot_dir = output_root / core.ANNOUNCEMENT_SNAPSHOT_DIRNAME
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = snapshot_dir / f"change_notice_seed_batch{safe_part(source.batch)}_{stamp}.json"
+    path = snapshot_dir / f"republished_seed_{safe_part(source.snapshot_scope())}_{stamp}.json"
     path.write_text(
         json.dumps(
             {
                 "source": {
-                    "notice_url": source.notice_url,
-                    "title": source.title,
-                    "published_at": source.published_at,
-                    "batch": source.batch,
-                    "iframe_url": source.iframe_url,
+                    "origin": source.origin,
+                    "generation": source.generation,
+                    "batches": source.batches,
+                    "stale_batches": source.stale_batches,
+                    "notes": source.notes,
                 },
-                "filters": filters,
-                "total": total,
-                "returned": len(rows),
+                "total": len(source.rows),
+                "total_candidates": source.candidate_total,
+                "rows": source.rows,
                 "selected_models": selected,
             },
             ensure_ascii=False,
@@ -691,7 +689,8 @@ def catalog_main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--limit",
         type=int,
-        help="限制处理的公告型号数；目录模式默认 100，变更扩展公示模式默认不限制",
+        help="限制本轮处理量；目录模式按型号计、默认 100，"
+             "正式发布重发模式按候选产品计、默认不限制（去重后型号数可能更少）",
     )
     parser.add_argument(
         "--catalog-batch",
@@ -715,21 +714,26 @@ def catalog_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--all-categories", action="store_true", help="覆盖乘用车、专用车、客车和货车")
     parser.add_argument(
-        "--change-notice-url",
-        help="改用工信部变更扩展公示作为强制刷新清单；正式公告未达到公示批次时保持待生效",
-    )
-    parser.add_argument("--company", help="变更扩展公示企业名称筛选")
-    parser.add_argument("--trademark", help="变更扩展公示产品商标筛选")
-    parser.add_argument("--product-name", help="变更扩展公示产品名称筛选")
-    parser.add_argument("--model-code", help="变更扩展公示产品型号筛选")
-    parser.add_argument(
-        "--all",
-        dest="change_all",
+        "--republished-from-status",
         action="store_true",
-        help="允许遍历整批变更扩展公示；无筛选条件时必须显式指定",
+        help="按正式发布重发清单强制刷新：取自已落盘的收录统计记录，不重算；记录过期时拒绝",
     )
     parser.add_argument(
-        "--notice-page-size", type=int, default=100, help="变更扩展公示查询每页条数，默认 100"
+        "--republished-batch",
+        action="append",
+        default=[],
+        metavar="批次",
+        help="按正式公告批次现算重发清单，支持 409、405-409、405,407；可重复",
+    )
+    parser.add_argument(
+        "--allow-stale-status",
+        action="store_true",
+        help="允许在统计记录过期时按历史记录执行重发刷新，结果可能漏项",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只生成重发清单快照并输出统计，不查询、不下载、不写业务库",
     )
     parser.add_argument("--catalog-db", type=Path, default=DEFAULT_CATALOG_DB)
     parser.add_argument("--site-db", type=Path, default=DEFAULT_SITE_DB)
@@ -738,8 +742,8 @@ def catalog_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-report", action="store_true", help="跳过本轮的 Markdown 采集报告")
     parser.add_argument("--download-root", type=Path, default=DEFAULT_DOWNLOAD_ROOT)
     args = parser.parse_args(argv)
-    if (args.limit is not None and args.limit < 1) or args.offset < 0 or args.notice_page_size < 1:
-        parser.error("--limit 和 --notice-page-size 必须大于 0，--offset 不得小于 0")
+    if (args.limit is not None and args.limit < 1) or args.offset < 0:
+        parser.error("--limit 必须大于 0，--offset 不得小于 0")
     if not args.catalog_db.exists():
         parser.error(f"目录数据库不存在：{args.catalog_db}")
     args.catalog_db = args.catalog_db.expanduser().resolve()
@@ -761,35 +765,43 @@ def catalog_main(argv: list[str] | None = None) -> int:
 
 
 def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    change_filters = {
-        "company": args.company or "",
-        "trademark": args.trademark or "",
-        "product_name": args.product_name or "",
-        "model_code": args.model_code or "",
-    }
-    change_mode = bool(args.change_notice_url)
-    if not change_mode and (any(change_filters.values()) or args.change_all):
-        parser.error("变更扩展公示筛选参数必须与 --change-notice-url 一起使用")
-    if change_mode and args.exclude_existing:
-        parser.error("变更扩展公示模式会强制刷新已有型号，不能与 --exclude-existing 同时使用")
-    if change_mode and not any(change_filters.values()) and not args.change_all:
-        parser.error("遍历整批变更扩展公示时必须显式使用 --all")
+    republish_mode = bool(args.republished_from_status or args.republished_batch)
+    if args.republished_from_status and args.republished_batch:
+        parser.error("--republished-from-status 与 --republished-batch 只能选一个来源")
+    if args.allow_stale_status and not args.republished_from_status:
+        parser.error("--allow-stale-status 只在 --republished-from-status 下有意义")
+    if republish_mode and args.exclude_existing:
+        parser.error("正式发布重发模式会强制刷新已有型号，不能与 --exclude-existing 同时使用")
+    if republish_mode and args.from_file:
+        parser.error("正式发布重发模式自带清单，不能与 -f/--from-file 同时使用")
+    if args.dry_run and not republish_mode:
+        parser.error("--dry-run 只在正式发布重发模式下可用")
 
-    notice_source: change_notice.ChangeNoticeSource | None = None
-    notice_total = 0
-    notice_rows: list[dict[str, str]] = []
-    if change_mode:
-        notice_source = change_notice.load_change_notice_source(args.change_notice_url)
-        notice_rows, notice_total = change_notice.query_change_notice(
-            notice_source,
-            **change_filters,
-            page_size=args.notice_page_size,
-            limit=args.limit,
+    republished_source: republished.RepublishedSource | None = None
+    if republish_mode:
+        try:
+            if args.republished_from_status:
+                republished_source = republished.from_status(
+                    args.site_db, catalog_db=args.catalog_db, pdf_root=UPSTREAM_ROOT,
+                    allow_stale=args.allow_stale_status,
+                )
+            else:
+                republished_source = republished.from_batches(
+                    args.site_db,
+                    republished.parse_batches(args.republished_batch),
+                    UPSTREAM_ROOT / "downloads" / "announcement_batches",
+                )
+        except republished.RepublishedError as exc:
+            parser.error(str(exc))
+        republished_source = republished_source.limited(args.limit)
+        for note in republished_source.notes:
+            print(f"说明：{note}", flush=True)
+        selected = select_republished_models(
+            args.catalog_db, args.site_db, republished_source.rows
         )
-        selected = select_change_notice_models(args.catalog_db, args.site_db, notice_rows)
         if not selected:
-            parser.error("变更扩展公示查询没有返回可采集的精确产品型号")
-        batch = f"变更扩展公示{notice_source.batch}"
+            parser.error("正式发布重发清单为空：本地没有被更高批次重新发布的产品")
+        batch = republished_source.label
     elif args.from_file:
         batch, selected = select_models_from_file(args.catalog_db, args.from_file, args.limit)
     else:
@@ -805,15 +817,21 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         )
     args.site_db.parent.mkdir(parents=True, exist_ok=True)
     args.download_root.mkdir(parents=True, exist_ok=True)
-    if notice_source:
-        selection_path = write_change_notice_snapshot(
-            notice_source,
-            total=notice_total,
-            rows=notice_rows,
+    if republished_source is not None:
+        selection_path = write_republished_snapshot(
+            republished_source,
             selected=selected,
             output_root=args.download_root,
-            filters=change_filters,
         )
+        if args.dry_run:
+            by_batch = Counter(row["republished_batch"] for row in republished_source.rows)
+            scope = (f"本轮清单 {len(republished_source.rows)} 个产品"
+                     + (f"（候选共 {republished_source.candidate_total} 个）"
+                        if republished_source.candidate_total != len(republished_source.rows) else ""))
+            print(f"{scope}，覆盖 {len(selected)} 个型号；"
+                  + "、".join(f"第{batch_no}批 {count} 个" for batch_no, count in sorted(by_batch.items()))
+                  + f"\n清单快照：{selection_path}\n预演模式：未查询官方接口，未下载 PDF，未写业务库。", flush=True)
+            return 0
     else:
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"batch{batch}".replace("及更早", "_and_earlier"))
         selection_path = args.download_root / f"seed_{scope}_{len(selected)}_offset{args.offset}.json"
@@ -836,23 +854,23 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     conn = sqlite3.connect(args.site_db)
     ensure_schema(conn)
     selector = {
-        "mode": "change_notice" if change_mode else "catalog",
+        "mode": "republished" if republish_mode else "catalog",
         "catalog": CATALOG_NAME,
         "catalog_batch": batch,
         "through_earlier_batches": args.through_earlier_batches,
         "exclude_existing": args.exclude_existing,
         "category": "全部" if args.all_categories else "乘用车",
-        "limit": args.limit if change_mode else (args.limit or 100),
+        "limit": args.limit if republish_mode else (args.limit or 100),
         "offset": args.offset,
     }
-    if notice_source:
-        selector["change_notice"] = {
-            "notice_url": notice_source.notice_url,
-            "title": notice_source.title,
-            "published_at": notice_source.published_at,
-            "batch": notice_source.batch,
-            "filters": change_filters,
-            "total": notice_total,
+    if republished_source is not None:
+        selector["republished"] = {
+            "origin": republished_source.origin,
+            "generation": republished_source.generation,
+            "batches": republished_source.batches,
+            "stale_batches": republished_source.stale_batches,
+            "total": len(republished_source.rows),
+            "total_candidates": republished_source.candidate_total,
         }
     cursor = conn.execute(
         "INSERT INTO ingestion_runs(started_at, selector_json, selected_models, parse_failures, publish_failures) "
@@ -886,10 +904,10 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 print(f"  查询失败：{message}", file=sys.stderr, flush=True)
                 continue
             if not rows:
-                if change_mode:
+                if republish_mode:
                     awaiting_effective += 1
                     message = (
-                        f"正式公告接口尚未返回公示第{item['notice_batch']}批的精确型号"
+                        f"记录第{item['republished_batch']}批重新发布，正式接口现在查不到该精确型号"
                     )
                     conn.execute(
                         "UPDATE run_models SET status='awaiting_effective', error=? "
@@ -897,7 +915,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                         (message, run_id, vehicle_id),
                     )
                     conn.commit()
-                    print(f"  待正式生效：{message}", flush=True)
+                    print(f"  接口与记录不一致：{message}", flush=True)
                     continue
                 conn.execute(
                     "UPDATE run_models SET status='no_match', error='' WHERE run_id=? AND vehicle_id=?",
@@ -907,14 +925,16 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 print("  公告接口未找到精确型号。", flush=True)
                 continue
 
-            if change_mode:
+            if republish_mode:
                 rows = core.filter_latest_batch(rows)
                 actual_batch = str(rows[0].get("gppc") or rows[0].get("pc") or "")
-                expected_batch = item["notice_batch"]
+                expected_batch = item["republished_batch"]
                 if not batch_is_at_least(actual_batch, expected_batch):
+                    # 清单来自正式发布记录，接口批次反而更低说明记录已与源不符，
+                    # 不能拿更旧的一版覆盖本地已有参数页。
                     awaiting_effective += 1
                     message = (
-                        f"公示第{expected_batch}批，正式公告当前最高为第{actual_batch or '未知'}批"
+                        f"记录第{expected_batch}批，正式接口当前最高为第{actual_batch or '未知'}批"
                     )
                     conn.execute(
                         "UPDATE run_models SET status='awaiting_effective', error=? "
@@ -922,18 +942,18 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                         (message, run_id, vehicle_id),
                     )
                     conn.commit()
-                    print(f"  待正式生效：{message}", flush=True)
+                    print(f"  接口与记录不一致：{message}", flush=True)
                     continue
                 rows = [
                     {
                         **row,
-                        "_change_notice": {
-                            "batch": expected_batch,
-                            "title": item["notice_title"],
-                            "detail_url": item["notice_detail_url"],
-                            "company": item["notice_company"],
-                            "trademark": item["notice_trademark"],
-                            "product_name": item["notice_product_name"],
+                        "_republished": {
+                            "recorded_batch": expected_batch,
+                            "local_batch": item["local_batch"],
+                            "product_id": item["republished_product_id"],
+                            "company": item["republished_company"],
+                            "trademark": item["republished_trademark"],
+                            "product_name": item["republished_product_name"],
                         },
                     }
                     for row in rows
@@ -988,7 +1008,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
     print(
         f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
-        f"待正式生效 {awaiting_effective}，查询失败 {query_failures}，"
+        f"接口与记录不一致 {awaiting_effective}，查询失败 {query_failures}，"
         f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，非 PDF {non_pdf}。\n"
         f"数据库：{args.site_db}\n目录快照：{selection_path}",
         flush=True,

@@ -69,17 +69,27 @@ def input_signature(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root: 
                 p.name: _stat(p) for p in sorted(cache_dir.glob('batch*.json'))}, 'logic': logic}
 
 
-def _paths(db_path: Path, catalog_db: Path | None = None, pdf_root: Path | None = None,
-           cache_dir: Path | None = None, out_dir: Path | None = None) -> tuple[Path, Path, Path, Path, Path]:
+def status_output_dir(db_path: Path, out_dir: Path | None = None) -> Path:
+    """统计记录的落盘目录：业务库路径决定默认值。
+
+    读记录和读同一代候选明细的调用方必须都走这里；两处各自拼路径时，
+    自定义业务库会让 generation 与 snapshots/ 落在不同目录。
+    """
     db = db_path.expanduser().resolve()
-    root = pdf_root.expanduser().resolve() if pdf_root else db.parent.parent
     # 自定义业务库不得把共享 PDF 根对应的主库统计覆盖成测试/临时库结果。
     default_output = (db.parent.parent / 'var/reports/collection-status'
                       if db.name == 'announcement_site.sqlite' and db.parent.name == 'data'
                       else db.parent / (db.stem + '-collection-status'))
+    return (out_dir or default_output).expanduser().resolve()
+
+
+def _paths(db_path: Path, catalog_db: Path | None = None, pdf_root: Path | None = None,
+           cache_dir: Path | None = None, out_dir: Path | None = None) -> tuple[Path, Path, Path, Path, Path]:
+    db = db_path.expanduser().resolve()
+    root = pdf_root.expanduser().resolve() if pdf_root else db.parent.parent
     return (db, (catalog_db or root / 'data/jianmian_catalog.sqlite').expanduser().resolve(),
             (cache_dir or root / 'downloads/announcement_batches').expanduser().resolve(), root,
-            (out_dir or default_output).expanduser().resolve())
+            status_output_dir(db_path, out_dir))
 
 
 def _read_json(path: Path) -> dict:

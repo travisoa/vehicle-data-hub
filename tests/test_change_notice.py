@@ -114,20 +114,6 @@ def test_query_change_notice_fetches_pages_and_honors_limit(monkeypatch):
     assert calls == [1, 2]
 
 
-def test_latest_effective_rows_requires_exact_model_and_highest_batch(monkeypatch):
-    monkeypatch.setattr(
-        change_notice.core,
-        "query_all_pages",
-        lambda **kwargs: [
-            {"clxh": "ABC6500EV", "gppc": "403"},
-            {"clxh": "ABC6500EV", "gppc": "409"},
-            {"clxh": "ABC6500EV-L", "gppc": "410"},
-        ],
-    )
-    rows = change_notice.latest_effective_rows("abc6500ev")
-    assert rows == [{"clxh": "ABC6500EV", "gppc": "409"}]
-
-
 def test_new_product_notice_uses_headers_not_fixed_column_positions():
     html = '''<div class="page-content"><table>
       <tr><th>序号</th><th>企业名称</th><th>产品型号</th><th>产品名称</th><th>商标</th></tr>

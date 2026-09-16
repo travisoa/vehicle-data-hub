@@ -260,19 +260,24 @@ def verify_coverage(batch: str, products: dict[str, dict],
     return missed
 
 
-def cache_is_complete(payload: dict, *, verify: bool = True) -> bool:
-    """无下载源/部分失败/过期缓存不能证明本轮的批次内容。"""
+def cache_is_complete(payload: dict, *, verify: bool = True, fresh: bool = True) -> bool:
+    """无下载源/部分失败/过期缓存不能证明本轮的批次内容。
+
+    ``fresh=False`` 只放宽新鲜期，供把过期缓存当历史基线并单独标记的调用方使用；
+    版本、完整性、交叉校验和"抓取时间不得在未来"一律不放宽。
+    """
     if (payload.get("cache_version") != CACHE_VERSION or not payload.get("complete")
             or payload.get("absent_upstream")):
         return False
     if verify and set(payload.get("verify_prefixes", [])) != set(VERIFY_PREFIXES):
         return False
     try:
-        fetched = datetime.fromisoformat(payload["fetched_at"])
-        age = datetime.now(timezone.utc) - fetched
-        return 0 <= age.total_seconds() <= CACHE_MAX_AGE_DAYS * 86400
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(payload["fetched_at"])).total_seconds()
     except (KeyError, TypeError, ValueError):
         return False
+    if age < 0:
+        return False
+    return not fresh or age <= CACHE_MAX_AGE_DAYS * 86400
 
 
 def write_cache(path: Path, payload: dict) -> None:

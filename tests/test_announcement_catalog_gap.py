@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -50,3 +50,12 @@ def test_unverified_and_expired_cache_require_refresh():
     assert gap.cache_is_complete(payload)
     payload['fetched_at'] = '2020-01-01T00:00:00+00:00'
     assert not gap.cache_is_complete(payload)
+    # 过期缓存可作历史基线，但只放宽新鲜期：版本和交叉校验仍然拦得住。
+    assert gap.cache_is_complete(payload, fresh=False)
+    payload['verify_prefixes'] = []
+    assert not gap.cache_is_complete(payload, fresh=False)
+    # 抓取时间在未来说明时钟或缓存有问题，放宽新鲜期也不接受。
+    payload['verify_prefixes'] = list(gap.VERIFY_PREFIXES)
+    payload['fetched_at'] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    assert not gap.cache_is_complete(payload)
+    assert not gap.cache_is_complete(payload, fresh=False)

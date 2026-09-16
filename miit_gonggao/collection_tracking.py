@@ -1,4 +1,7 @@
-"""近期公告/公示的逐事件跟踪。采集记录和 PDF 统一归上游管理。"""
+"""近期正式公告的逐事件跟踪。采集记录和 PDF 统一归上游管理。
+
+公示只用于提前了解，不登记、不驱动采集：事件一律来自正式发布。
+"""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +21,7 @@ else:
 
 DAYS = 60
 BATCHES = 2
-KINDS = {'formal', 'new_notice', 'change_notice'}
+KINDS = {'formal'}  # 公示不作为入口，事件只接受正式发布
 # 工信部公告里汽车、摩托车、挂车、三轮汽车、低速汽车是彼此独立的产品序列，各有各的
 # 型号编制规则。本站只做汽车四频道（范围见 Website/docs/collection-boundary.md），其余序列
 # 不登记、不采集、不入库。判定必须看产品名称：摩托车型号同样是「字母+数字」结构，
@@ -118,9 +121,7 @@ def in_window(event: dict, latest_batch: int, *, today: date | None = None) -> b
         published = parse_date(event['first_seen_at'])
     if published is not None and not 0 <= (today - published).days <= DAYS:
         return False
-    if event['kind'] == 'formal' or event['batch'] <= latest_batch:
-        return latest_batch - BATCHES + 1 <= event['batch'] <= latest_batch
-    return True  # 尚未正式生效的新公示，仍须满足上面的 60 天上限。
+    return latest_batch - BATCHES + 1 <= event['batch'] <= latest_batch
 
 
 def register_event(conn: sqlite3.Connection, *, model_code: str, batch: int, kind: str,
@@ -131,9 +132,9 @@ def register_event(conn: sqlite3.Connection, *, model_code: str, batch: int, kin
     host = urlparse(source_url).hostname or ''
     if not any(host == suffix or host.endswith('.' + suffix)
                for suffix in ('miit.gov.cn', 'miit-eidc.org.cn')):
-        raise ValueError('公告/公示必须使用官方来源 URL')
+        raise ValueError('公告事件必须使用官方来源 URL')
     model_code = model_code.strip().upper()
-    # 公示页面 URL 不参与身份，文章路径变化也不会反复重置同批同型号的完成记录。
+    # 来源 URL 不参与身份，文章路径变化也不会反复重置同批同型号的完成记录。
     key = json.dumps([model_code, batch, kind, product_id], ensure_ascii=False)
     event_id = hashlib.sha256(key.encode()).hexdigest()[:24]
     conn.execute(
@@ -203,22 +204,6 @@ def register_catalog(conn: sqlite3.Connection, catalog_db: Path, latest_batch: i
     return count
 
 
-def register_notice(conn: sqlite3.Connection, source, rows: list[dict], kind: str) -> int:
-    if kind not in {'new_notice', 'change_notice'}:
-        raise ValueError('公示类型无效')
-    count = 0
-    for row in rows:
-        name = row.get('product_name') or row.get('clmc') or ''
-        row = {**row, **classify_vehicle(row['model_code'], name, row)}
-        if row['inclusion_gate'] == 'excluded':
-            continue  # 公示快照保留原始条目，本站只登记整车。
-        register_event(conn, model_code=row['model_code'], batch=int(source.batch), kind=kind,
-                       source_url=source.notice_url, title=source.title,
-                       event_date=source.published_at, metadata=row)
-        count += 1
-    return count
-
-
 def matching_documents(conn: sqlite3.Connection, event: dict) -> list[tuple]:
     condition = 'and a.source_product_id=?' if event['product_id'] else ''
     args = [event['model_code'], str(event['batch'])]
@@ -281,10 +266,15 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
     data_version = conn.execute('pragma data_version').fetchone()[0]
     maximum = latest_formal_batch(conn)
     pending, dormant, resolved, deferred, remaining = [], [], [], [], []
-    excluded, scope_review = [], []
+    excluded, scope_review, legacy_notice = [], [], []
     groups: set[tuple] = set()
     evidence = scope_evidence(conn)
     for event in sorted(events(conn), key=lambda e: (e['last_checked_at'] or '', e['event_id'])):
+        if event['kind'] != 'formal':
+            # 公示不再登记，但旧库里可能留着 new_notice/change_notice 行。它们不是正式发布，
+            # 不能驱动查询和下载；历史保留在源库，只是不进计划。
+            legacy_notice.append(event['event_id'])
+            continue
         scope = event_scope(event, evidence)
         if scope['inclusion_gate'] != 'accepted':
             (excluded if scope['inclusion_gate'] == 'excluded' else scope_review).append(event['event_id'])
@@ -309,6 +299,7 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
                       'pending': pending, 'dormant': dormant, 'resolved': resolved,
                       'deferred': deferred, 'remaining': remaining,
                       'excluded': excluded, 'scope_review': scope_review,
+                      'legacy_notice': legacy_notice,
                       'query_groups': len(groups)}, conn, evidence, data_version)
 
 
@@ -379,7 +370,7 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                 vehicle_id = existing[0]
             else:
                 vehicle_id = seed.upsert_vehicle(conn, {
-                    'model_code': model, 'common_name': model, 'catalog': '公告/公示跟踪',
+                    'model_code': model, 'common_name': model, 'catalog': '正式公告跟踪',
                     'batch': str(batch), 'category': next((json.loads(e['metadata_json']).get('category')
                         for e in group if json.loads(e['metadata_json']).get('category')), ''),
                     'seq': '', 'company': meta.get('company') or meta.get('qymc') or '',
@@ -387,8 +378,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             seed.begin_model(conn, run_id, index, vehicle_id)
             status, error = 'done', ''
             try:
-                rows = ([] if batch > plan['latest_batch'] and all(e['kind'] != 'formal' for e in group)
-                        else seed.core.query_all_pages(model_code=model, pc=str(batch), page_size=50))
+                # 事件只来自正式发布，登记本身就把该批次纳入最高正式批次，不存在"尚未生效"的等待。
+                rows = seed.core.query_all_pages(model_code=model, pc=str(batch), page_size=50)
                 rows = [r for r in rows if str(r.get('clxh') or '').strip().upper() == model
                         and str(r.get('gppc') or r.get('pc') or '') == str(batch)]
             except Exception as exc:
@@ -432,7 +423,7 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                 event_status, event_error = status, error
                 if status != 'query_failed':
                     if not selected:
-                        event_status = 'awaiting_effective' if event['kind'] != 'formal' else 'no_match'
+                        event_status = 'no_match'
                     elif all(ok for ok, _ in selected):
                         event_status = 'done'
                     elif all(msg.startswith('接口返回非 PDF') for ok, msg in selected if not ok):
@@ -484,9 +475,6 @@ def main() -> int:
     commands = parser.add_subparsers(dest='command', required=True)
     batch = commands.add_parser('register-batch')
     batch.add_argument('cache', type=Path)
-    notice = commands.add_parser('register-notice')
-    notice.add_argument('--url', required=True)
-    notice.add_argument('--kind', choices=['new_notice', 'change_notice'], required=True)
     catalog = commands.add_parser('register-catalog')
     catalog.add_argument('--latest-batch', type=int, required=True)
     commands.add_parser('fingerprint')
@@ -516,18 +504,6 @@ def main() -> int:
             with conn:
                 count = register_catalog(conn, args.catalog_db, args.latest_batch)
             print(json.dumps({'registered': count}))
-        elif args.command == 'register-notice':
-            source = seed.change_notice.load_change_notice_source(args.url)
-            rows, total = seed.change_notice.query_change_notice(source)
-            if not rows or len(rows) != total:
-                raise RuntimeError('官方公示清单为空或不完整，不能登记为成功')
-            snapshot = seed.write_change_notice_snapshot(
-                source, total=total, rows=rows, selected=rows,
-                output_root=args.pdf_root / 'downloads/announcement_site', filters={},
-            )
-            with conn:
-                count = register_notice(conn, source, rows, args.kind)
-            print(json.dumps({'registered': count, 'snapshot': str(snapshot)}, ensure_ascii=False))
         elif args.command == 'fingerprint':
             print(public_fingerprint(conn))
         elif args.command == 'plan':

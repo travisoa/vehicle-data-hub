@@ -1,9 +1,10 @@
-"""网站采集脚本的上游路径契约与变更扩展公示刷新测试。"""
+"""网站采集脚本的上游路径契约与正式发布重发刷新测试。"""
 
 from __future__ import annotations
 
 import json
 from contextlib import closing
+from datetime import datetime, timezone
 import sqlite3
 import sys
 from pathlib import Path
@@ -63,35 +64,59 @@ def make_catalog_db(path: Path, *, model_code: str = "ABC6500EV") -> Path:
     return path
 
 
-def source(batch: str = "409") -> seed.change_notice.ChangeNoticeSource:
-    return seed.change_notice.ChangeNoticeSource(
-        notice_url="https://www.miit.gov.cn/change-409.html",
-        title=f"第{batch}批《道路机动车辆生产企业及产品公告》变更扩展公示",
-        published_at="2026-08-28 10:00",
-        batch=batch,
-        iframe_url="https://www.miit.gov.cn/change-409/index.html",
-        unit_url="https://www.miit.gov.cn/api/unit",
-        unit_params={},
-    )
+def seed_local_announcement(site_db: Path, upstream_root: Path, *, batch: str = "407",
+                            product_id: str = "product-407", model_code: str = "ABC6500EV") -> None:
+    """本地已有一份有效参数页：只有这种产品才谈得上被更高批次重发后刷新。"""
+    relative = f"downloads/announcement_site/示例牌/{model_code}/第{batch}批/{product_id}.pdf"
+    path = upstream_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-1.4\nlocal-copy")
+    with closing(sqlite3.connect(site_db)) as conn, conn:
+        conn.executescript(seed.SCHEMA)
+        conn.execute(
+            "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
+            "catalog_category, catalog_seq, catalog_company) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("示例车", model_code, seed.CATALOG_NAME, "32", "乘用车", "1", "示例汽车有限公司"),
+        )
+        conn.execute("INSERT OR IGNORE INTO batches(batch) VALUES (?)", (batch,))
+        conn.execute(
+            "INSERT INTO announcements(source_product_id, vehicle_id, batch_id, company, trademark, "
+            "model_code, product_name, raw_json, first_seen_at) SELECT ?, v.id, b.id, ?, ?, ?, ?, '{}', ? "
+            "FROM vehicles v, batches b WHERE v.announcement_model_code=? AND b.batch=?",
+            (product_id, "示例汽车有限公司", "示例牌", model_code, "多用途乘用车",
+             "2026-09-12T00:00:00+00:00", model_code, batch),
+        )
+        conn.execute(
+            "INSERT INTO documents(announcement_id, relative_path, is_pdf, bytes, sha256, downloaded_at, error) "
+            "SELECT id, ?, 1, ?, 'x', ?, '' FROM announcements WHERE source_product_id=?",
+            (relative, path.stat().st_size, "2026-09-12T00:00:00+00:00", product_id),
+        )
 
 
-def notice_row(batch: str = "409", model_code: str = "ABC6500EV") -> dict[str, str]:
-    return {
-        "notice_title": "多用途乘用车",
-        "notice_batch": batch,
-        "company": "示例汽车有限公司",
-        "trademark": "示例牌",
-        "product_name": "多用途乘用车",
-        "model_code": model_code,
-        "detail_url": "https://www.miit.gov.cn/change-409/detail.html",
-    }
+def write_batch_cache(cache_dir: Path, batch: int, *, product_id: str = "product-407",
+                      model_code: str = "ABC6500EV",
+                      extra: tuple[tuple[str, str], ...] = ()) -> None:
+    """正式批次枚举缓存：同一产品 ID 在更高批次再次出现即为重新发布。"""
+    from scripts import announcement_catalog_gap as gap
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / f"batch{batch}.json").write_text(json.dumps({
+        "batch": batch, "cache_version": gap.CACHE_VERSION, "complete": True, "failures": [],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "verify_prefixes": list(gap.VERIFY_PREFIXES), "verify_missed": 0,
+        "products": [{"cpid": pid, "clxh": code, "clmc": "多用途乘用车",
+                      "gppc": str(batch), "pc": str(batch), "dataTag": "Z",
+                      "cpsb": "示例牌", "qymc": "示例汽车有限公司"}
+                     for pid, code in ((product_id, model_code), *extra)],
+    }, ensure_ascii=False), encoding="utf-8")
 
 
-def run_change_ingestion(
+def run_republished_ingestion(
     monkeypatch,
     tmp_path: Path,
     *,
     announcement_batch: str,
+    recorded_batch: int = 409,
     download=None,
     parse=None,
 ) -> tuple[int, Path, Path]:
@@ -100,12 +125,8 @@ def run_change_ingestion(
     upstream_root = tmp_path / "vehicle-data-hub"
     download_root = upstream_root / "downloads" / "announcement_site"
     monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
-    monkeypatch.setattr(seed.change_notice, "load_change_notice_source", lambda _url: source())
-    monkeypatch.setattr(
-        seed.change_notice,
-        "query_change_notice",
-        lambda *_args, **_kwargs: ([notice_row()], 1),
-    )
+    seed_local_announcement(site_db, upstream_root)
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", recorded_batch)
     monkeypatch.setattr(
         seed.core,
         "query_all_pages",
@@ -116,7 +137,8 @@ def run_change_ingestion(
                 "qymc": "示例汽车有限公司",
                 "cpsb": "示例牌",
                 "gppc": announcement_batch,
-                "cpid": f"product-{announcement_batch}",
+                # 官方重发沿用同一产品 ID——正是重发判据的前提，也是刷新能收敛的原因。
+                "cpid": "product-407",
                 "dataTag": "Z",
             }
         ],
@@ -131,9 +153,8 @@ def run_change_ingestion(
         "argv",
         [
             "seed_announcement_site.py",
-            "--change-notice-url",
-            source().notice_url,
-            "--all",
+            "--republished-batch",
+            str(recorded_batch),
             "--limit",
             "10",
             "--catalog-db",
@@ -169,42 +190,121 @@ def test_existing_business_db_gets_the_awaiting_effective_column(tmp_path: Path)
     assert "awaiting_effective" in columns
 
 
-def test_change_notice_waits_until_the_formal_batch_is_effective(monkeypatch, tmp_path: Path):
-    exit_code, site_db, upstream_root = run_change_ingestion(
+def test_republished_refresh_stops_when_the_interface_batch_is_lower(monkeypatch, tmp_path: Path):
+    """清单记录第409批重发，接口却只给第408批：不能拿更旧的一版覆盖本地参数页。"""
+    exit_code, site_db, upstream_root = run_republished_ingestion(
         monkeypatch, tmp_path, announcement_batch="408"
     )
     assert exit_code == 2
     with sqlite3.connect(site_db) as conn:
         assert conn.execute("SELECT awaiting_effective FROM ingestion_runs").fetchone()[0] == 1
-        status, error = conn.execute("SELECT status, error FROM run_models").fetchone()
+        status, error = conn.execute(
+            "SELECT status, error FROM run_models ORDER BY run_id DESC LIMIT 1").fetchone()
         assert status == "awaiting_effective"
         assert "当前最高为第408批" in error
-        assert conn.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 0
+        # 本地那份第407批的记录仍是唯一一条，没有被更旧的接口结果改写。
+        batches = [row[0] for row in conn.execute(
+            "SELECT b.batch FROM announcements a JOIN batches b ON b.id=a.batch_id")]
+        assert batches == ["407"]
     assert list((upstream_root / "downloads" / "announcement_site" / "_snapshots").glob("*.json"))
 
 
-def test_change_notice_ingests_latest_pdf_and_records_provenance(monkeypatch, tmp_path: Path):
+def test_republished_refresh_ingests_the_new_batch_and_records_provenance(monkeypatch, tmp_path: Path):
     def fake_download(_row, folder: Path):
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / "示例牌_ABC6500EV_409.pdf"
         path.write_bytes(b"%PDF-1.4\nwebsite-test")
         return path, True, path.stat().st_size
 
-    exit_code, site_db, upstream_root = run_change_ingestion(
+    exit_code, site_db, upstream_root = run_republished_ingestion(
         monkeypatch, tmp_path, announcement_batch="409", download=fake_download
     )
     assert exit_code == 0
     with sqlite3.connect(site_db) as conn:
-        relative_path = conn.execute("SELECT relative_path FROM documents").fetchone()[0]
-        raw_json = json.loads(conn.execute("SELECT raw_json FROM announcements").fetchone()[0])
+        relative_path, batch = conn.execute(
+            "SELECT d.relative_path, b.batch FROM documents d "
+            "JOIN announcements a ON a.id=d.announcement_id JOIN batches b ON b.id=a.batch_id "
+            "WHERE a.source_product_id='product-407'").fetchone()
+        raw_json = json.loads(conn.execute(
+            "SELECT raw_json FROM announcements WHERE source_product_id='product-407'").fetchone()[0])
         assert relative_path.startswith("downloads/announcement_site/")
-        assert raw_json["_change_notice"]["batch"] == "409"
+        assert raw_json["_republished"]["recorded_batch"] == "409"
+        assert raw_json["_republished"]["local_batch"] == "407"
+        # 同一产品 ID 被就地刷新到新批次，而不是另起一行。
+        assert batch == "409"
+        assert conn.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 1
         assert conn.execute("SELECT awaiting_effective FROM ingestion_runs").fetchone()[0] == 0
-        assert conn.execute("SELECT status FROM run_models").fetchone()[0] == "done"
+        assert conn.execute(
+            "SELECT status FROM run_models ORDER BY run_id DESC LIMIT 1").fetchone()[0] == "done"
     assert (upstream_root / relative_path).read_bytes().startswith(b"%PDF")
+    # 刷新后本地批次已追平，同一份缓存不再把它列为候选：重复执行会收敛，不会反复下载。
+    again = seed.republished.from_batches(
+        site_db, [409], upstream_root / "downloads" / "announcement_batches"
+    )
+    assert again.rows == []
 
 
-def test_change_notice_models_are_not_excluded_when_already_in_the_site_db(tmp_path: Path):
+def test_republished_dry_run_lists_candidates_without_touching_the_network_or_db(monkeypatch, tmp_path: Path):
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: pytest.fail("预演不得查询官方接口"))
+    monkeypatch.setattr(seed.core, "download_param_page",
+                        lambda *_args, **_kwargs: pytest.fail("预演不得下载 PDF"))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-batch", "409", "--dry-run",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+    assert seed.main() == 0
+    snapshots = list((upstream_root / "downloads" / "announcement_site" /
+                      seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
+    assert len(snapshots) == 1
+    payload = json.loads(snapshots[0].read_text(encoding="utf-8"))
+    assert [row["product_id"] for row in payload["rows"]] == ["product-407"]
+    assert payload["rows"][0]["republished_batch"] == 409
+    with sqlite3.connect(site_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 1
+
+
+def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkeypatch, tmp_path: Path, capsys):
+    """--limit 截断后，预演统计和快照都必须描述本轮实际处理范围。"""
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    seed_local_announcement(site_db, upstream_root, product_id="product-407b", model_code="ABC6500EV2")
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409,
+                      extra=(("product-407b", "ABC6500EV2"),))
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: pytest.fail("预演不得查询官方接口"))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-batch", "409", "--dry-run", "--limit", "1",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+    assert seed.main() == 0
+    printed = capsys.readouterr().out
+    assert "本轮清单 1 个产品（候选共 2 个）" in printed
+    assert "覆盖 1 个型号" in printed
+    assert "其余 1 个留待后续轮次" in printed
+    assert "第409批 1 个" in printed  # 批次分布按本轮清单统计，不是全部候选
+    payload = json.loads(next(
+        (upstream_root / "downloads" / "announcement_site" /
+         seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json")
+    ).read_text(encoding="utf-8"))
+    assert payload["total"] == 1 and payload["total_candidates"] == 2
+    assert [row["product_id"] for row in payload["rows"]] == ["product-407"]
+    assert len(payload["selected_models"]) == 1
+
+
+def test_republished_models_are_not_excluded_when_already_in_the_site_db(tmp_path: Path):
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     with sqlite3.connect(site_db) as conn:
@@ -214,14 +314,17 @@ def test_change_notice_models_are_not_excluded_when_already_in_the_site_db(tmp_p
             "catalog_category, catalog_seq, catalog_company) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("旧车型名", "ABC6500EV", seed.CATALOG_NAME, "31", "乘用车", "1", "示例企业"),
         )
-    selected = seed.select_change_notice_models(catalog_db, site_db, [notice_row(), notice_row()])
+    row = {"product_id": "product-407", "model_code": "ABC6500EV", "company": "示例汽车有限公司",
+           "trademark": "示例牌", "product_name": "多用途乘用车",
+           "republished_batch": 409, "local_batch": 407}
+    selected = seed.select_republished_models(catalog_db, site_db, [row, dict(row)])
     assert len(selected) == 1
     assert selected[0]["model_code"] == "ABC6500EV"
-    assert selected[0]["notice_batch"] == "409"
+    assert selected[0]["republished_batch"] == "409"
 
 
 def test_candidate_lookup_does_not_leak_sqlite_connections(tmp_path):
-    """`with sqlite3.connect(...)` 只管事务不关连接；变更公示模式逐行调用这两个
+    """`with sqlite3.connect(...)` 只管事务不关连接；重发刷新模式逐行调用这两个
     查询，泄漏的连接会随清单长度一直累积。"""
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
@@ -458,7 +561,7 @@ def test_run_reports_failure_phases_separately(monkeypatch, tmp_path, failure):
 
     if failure == 'publish':
         monkeypatch.setattr(seed.os, 'link', fail_link)
-    code, db, _ = run_change_ingestion(monkeypatch, tmp_path, announcement_batch='409', download=download,
+    code, db, _ = run_republished_ingestion(monkeypatch, tmp_path, announcement_batch='409', download=download,
         parse=lambda *_: ({}, 'layout unsupported' if failure == 'parse' else ''))
     assert code == 2
     with closing(sqlite3.connect(db)) as conn:

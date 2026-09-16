@@ -18,7 +18,7 @@ from miit_gonggao import collection_manifest as manifest
 from miit_gonggao import collection_report, collection_tracking as tracking
 from scripts import announcement_catalog_gap as gap
 from test_collect_cached_announcements import fake_download, product, setup
-from test_seed_announcement_site import run_change_ingestion
+from test_seed_announcement_site import run_republished_ingestion
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def test_catalog_refreshes_after_commit_even_when_report_fails(tmp_path, monkeyp
         raise OSError("report unavailable")
 
     monkeypatch.setattr(collection_report, "write_report", fail_report)
-    result, db, _ = run_change_ingestion(monkeypatch, tmp_path, announcement_batch="408")
+    result, db, _ = run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="408")
     assert result == 2
     assert len(refresh_calls) == 1
     assert refresh_calls[0][0] == db
@@ -59,7 +59,7 @@ def test_catalog_interrupt_still_refreshes_committed_run(tmp_path, monkeypatch, 
         raise KeyboardInterrupt()
 
     with pytest.raises(KeyboardInterrupt):
-        run_change_ingestion(monkeypatch, tmp_path, announcement_batch="409", download=interrupt)
+        run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="409", download=interrupt)
     assert len(refresh_calls) == 1
     with closing(sqlite3.connect(tmp_path / "site.sqlite")) as conn:
         assert conn.execute("select status from run_models").fetchone()[0] == "interrupted"

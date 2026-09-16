@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""查询工信部变更扩展公示，并按公示型号下载最新有效公告参数页。"""
+"""只读查询工信部变更扩展公示，供提前了解尚未正式发布的变更。
+
+公示不作为任何采集入口：本模块不下载 PDF、不写业务库。正式发布之后，用
+``main.py gonggao collect --republished-from-status``（或 ``--republished-batch``）
+按正式公告的重新发布记录刷新已有参数页。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,6 @@ import json
 import math
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,16 +275,6 @@ def query_change_notice(
     return rows, total
 
 
-def latest_effective_rows(model_code: str) -> list[dict[str, Any]]:
-    rows = core.query_all_pages(model_code=model_code, page_size=50)
-    exact = [
-        row
-        for row in rows
-        if str(row.get("clxh") or "").strip().upper() == model_code.strip().upper()
-    ]
-    return core.filter_latest_batch(exact)
-
-
 def _write_snapshot(
     source: ChangeNoticeSource,
     *,
@@ -329,87 +323,6 @@ def _print_rows(rows: list[dict[str, str]]) -> None:
         )
 
 
-def _download_latest_pdfs(
-    rows: list[dict[str, str]],
-    *,
-    output_dir: Path,
-    flat_output: bool,
-) -> int:
-    entries: list[dict[str, Any]] = []
-    errors: list[str] = []
-    non_pdf: list[str] = []
-    seen_models: set[str] = set()
-
-    for notice_row in rows:
-        model_code = notice_row["model_code"].strip()
-        model_key = model_code.upper()
-        if not model_code or model_key in seen_models:
-            continue
-        seen_models.add(model_key)
-        try:
-            products = latest_effective_rows(model_code)
-        except Exception as exc:  # noqa: BLE001 - 单型号失败不能中断整批
-            errors.append(model_code)
-            print(f"最新公告查询失败，跳过: {model_code} ({exc})", file=sys.stderr)
-            continue
-        if not products:
-            errors.append(model_code)
-            print(f"公告接口未找到精确型号，跳过: {model_code}", file=sys.stderr)
-            continue
-
-        for product in products:
-            batch = str(product.get("gppc") or product.get("pc") or "")
-            trademark = str(product.get("cpsb") or notice_row["trademark"])
-            download_dir = output_dir if flat_output else core.build_announcement_download_dir(
-                output_dir,
-                trademark=trademark,
-                vehicle_folder=model_code,
-                batch=batch,
-            )
-            label = f"{model_code}（公示第{notice_row['notice_batch']}批 -> 最新公告第{batch}批）"
-            try:
-                path, is_pdf, byte_count = core.download_param_page(product, download_dir)
-            except Exception as exc:  # noqa: BLE001 - 单条失败不能中断整批
-                errors.append(label)
-                print(f"PDF 下载失败，跳过: {label} ({exc})", file=sys.stderr)
-                continue
-            entries.append(
-                {
-                    "notice": notice_row,
-                    "announcement": {
-                        "qymc": product.get("qymc", ""),
-                        "cpsb": product.get("cpsb", ""),
-                        "clxh": product.get("clxh", ""),
-                        "clmc": product.get("clmc", ""),
-                        "gppc": batch,
-                        "cpid": product.get("cpid") or product.get("gid") or "",
-                        "dataTag": product.get("dataTag", ""),
-                    },
-                    "folder": os.fspath(download_dir),
-                    "file": os.fspath(path),
-                    "bytes": byte_count,
-                    "ok_pdf": is_pdf,
-                }
-            )
-            print(f"已下载: {label}\n  {path}")
-            if not is_pdf:
-                non_pdf.append(label)
-                print(f"返回内容不是 PDF，已存为 HTML: {path}", file=sys.stderr)
-
-    snapshot_dir = output_dir / core.ANNOUNCEMENT_SNAPSHOT_DIRNAME
-    manifest_path = core.write_download_manifest(entries, snapshot_dir)
-    print(f"下载索引: {manifest_path}")
-    if errors:
-        print(f"以下 {len(errors)} 条失败: {'; '.join(errors)}", file=sys.stderr)
-    if non_pdf:
-        print(f"以下 {len(non_pdf)} 条不是 PDF: {'; '.join(non_pdf)}", file=sys.stderr)
-    ok_count = sum(1 for entry in entries if entry["ok_pdf"])
-    return core.download_exit_code(
-        ok_pdf_count=ok_count,
-        problem_count=len(errors) + len(non_pdf),
-    )
-
-
 def command_changes(args: argparse.Namespace) -> int:
     filters = {
         "company": args.company or "",
@@ -445,42 +358,32 @@ def command_changes(args: argparse.Namespace) -> int:
     print(f"匹配结果: {total} 条；本次返回: {len(rows)} 条")
     _print_rows(rows)
     print(f"查询快照: {snapshot}")
-
-    if not args.download:
-        return 0
-    if not rows:
-        print("公示查询结果为空，没有可用于拉取最新 PDF 的产品型号。", file=sys.stderr)
-        return core.EXIT_DOWNLOAD_FAILED
-    return _download_latest_pdfs(
-        rows,
-        output_dir=output_dir,
-        flat_output=args.flat_output,
-    )
+    print("公示只用于提前了解，不作为采集入口；正式发布后用 "
+          "`main.py gonggao collect --republished-from-status` 刷新已有参数页。")
+    return 0
 
 
 def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "changes",
         aliases=["change-notice"],
-        help="查询变更扩展公示，并按公示型号下载最新有效公告参数页 PDF",
+        help="只读查询变更扩展公示，供提前了解；不下载、不进入采集",
     )
     parser.add_argument("--company", help="公示企业名称")
     parser.add_argument("--trademark", help="公示产品商标")
     parser.add_argument("--product-name", help="公示产品名称")
     parser.add_argument("--model-code", help="公示产品型号")
     parser.add_argument("--all", action="store_true", help="允许遍历整批公示；无查询条件时必须显式指定")
-    parser.add_argument("--download", action="store_true", help="按公示型号下载当前最高有效批次参数页 PDF")
-    parser.add_argument("--limit", type=core.positive_int, help="限制返回及下载的公示条数")
+    parser.add_argument("--limit", type=core.positive_int, help="限制返回的公示条数")
     parser.add_argument("--page-size", type=core.positive_int, default=100, help="公示查询每页条数，默认 100")
     parser.add_argument(
         "--notice-url",
         default=DEFAULT_CHANGE_NOTICE_URL,
         help="工信部变更扩展公示文章 URL；新批次可显式覆盖",
     )
-    parser.add_argument("--flat-output", action="store_true", help="PDF 直接保存到输出目录根目录")
     parser.add_argument(
         "--output-dir",
         default=os.fspath(core.DEFAULT_ANNOUNCEMENT_DIR),
-        help=f"PDF 与快照输出根目录，默认 {core.DEFAULT_ANNOUNCEMENT_DIR}",
+        help=f"查询快照输出根目录，默认 {core.DEFAULT_ANNOUNCEMENT_DIR}",
     )
     parser.set_defaults(func=command_changes)

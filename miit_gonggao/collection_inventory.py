@@ -110,8 +110,7 @@ def load_caches(cache_dir: Path, observed_at: datetime):
                 raise ValueError(f'{path}: products must be a list')
         # Reuse the upstream completeness/version/prefix contract independently of
         # freshness, which is reported against the explicit inventory date below.
-        fresh_probe = {**data, 'fetched_at': datetime.now(timezone.utc).isoformat()}
-        if not G.cache_is_complete(fresh_probe) or data.get('failures'):
+        if not G.cache_is_complete(data, fresh=False) or data.get('failures'):
             skipped.append({'file': path.name, 'reason': 'cache_is_complete=False',
                             'fetched_at': data.get('fetched_at'), 'count': len(items)})
             continue
