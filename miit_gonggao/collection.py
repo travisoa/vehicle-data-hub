@@ -442,8 +442,10 @@ def select_republished_models(
         if not model_code or model_key in seen:
             continue
         seen.add(model_key)
-        base = _catalog_item(catalog_db, model_code) or _existing_vehicle_item(
-            site_db, model_code
+        # 重发对象一定已在业务库里，它的目录归属是此前采集定下的，本轮只换参数页，
+        # 不能让目录库的另一条同型号记录（如车船税目录）改写 catalog_* 和分类依据。
+        base = _existing_vehicle_item(site_db, model_code) or _catalog_item(
+            catalog_db, model_code
         ) or {
             "catalog": "正式发布重发",
             "batch": str(row.get("republished_batch") or ""),

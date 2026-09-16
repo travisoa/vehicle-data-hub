@@ -352,6 +352,42 @@ def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkey
     assert len(payload["selected_models"]) == 1
 
 
+def test_republished_refresh_keeps_the_existing_catalog_identity(tmp_path: Path):
+    """已有车型的目录归属由此前采集定下，重发只换参数页，不能被目录库的另一条记录改写。
+
+    同型号常同时出现在购置税目录和车船税目录里，后者批次更高。按批次取目录会把
+    catalog_category 改成「插电式混合动力乘用车」这类值，分类硬链接随即建不出来。
+    """
+    catalog_db = tmp_path / "catalog.sqlite"
+    with sqlite3.connect(catalog_db) as conn:
+        conn.execute("CREATE TABLE catalog_rows (id INTEGER PRIMARY KEY, catalog TEXT, batch TEXT, "
+                     "category TEXT, seq TEXT, company TEXT, trademark TEXT, model_code TEXT, "
+                     "common_name TEXT)")
+        conn.execute("INSERT INTO catalog_rows(catalog,batch,category,seq,company,trademark,"
+                     "model_code,common_name) VALUES ('减免车辆购置税的新能源汽车车型目录','31',"
+                     "'乘用车','1','示例汽车有限公司','示例牌','ABC6500EV','示例车')")
+        conn.execute("INSERT INTO catalog_rows(catalog,batch,category,seq,company,trademark,"
+                     "model_code,common_name) VALUES ('享受车船税减免优惠的节约能源汽车车型目录','86',"
+                     "'插电式混合动力乘用车','9','示例汽车有限公司','示例牌','ABC6500EV','示例车')")
+    site_db = tmp_path / "site.sqlite"
+    with sqlite3.connect(site_db) as conn:
+        conn.executescript(seed.SCHEMA)
+        conn.execute(
+            "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
+            "catalog_category, catalog_seq, catalog_company) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("示例车", "ABC6500EV", "减免车辆购置税的新能源汽车车型目录", "31", "乘用车", "1", "示例汽车有限公司"),
+        )
+    row = {"product_id": "product-407", "model_code": "ABC6500EV", "company": "示例汽车有限公司",
+           "trademark": "示例牌", "product_name": "多用途乘用车",
+           "republished_batch": 409, "local_batch": 407}
+    selected = seed.select_republished_models(catalog_db, site_db, [row])
+    assert len(selected) == 1
+    # 分类硬链接只认精确的「乘用车」及商用车类别，批次更高的车船税目录不得顶掉它。
+    assert selected[0]["category"] == "乘用车"
+    assert selected[0]["catalog"] == "减免车辆购置税的新能源汽车车型目录"
+    assert selected[0]["batch"] == "31"
+
+
 def test_republished_models_are_not_excluded_when_already_in_the_site_db(tmp_path: Path):
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
