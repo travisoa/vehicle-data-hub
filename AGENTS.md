@@ -106,6 +106,11 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   所以已下载但解析失败的重发只有后者会选中，前者把它留在统计的 `pdf_unparsed` 候选里。
   正式接口批次低于记录批次时该型号记 `awaiting_effective` 并跳过，绝不用更旧的一版覆盖本地已有参数页。
   `--limit` 在该模式下按候选产品计数，去重后型号数可能更少；`--dry-run` 的统计与快照都按本轮清单输出。
+- 批次枚举与按型号查询是两个官方接口，口径不一定一致：缓存把产品列进更高批次，不等于查询
+  接口认那一批是当前有效版本。`--dry-run --verify` 按型号只读核实清单，分出 `confirmed`
+  （真重发）/`stale_record`（接口批次更低）/`missing`（查不到精确型号）/`failed`（未核实），
+  结果并入同一份清单快照。实际采集时 `batch_is_at_least` 已逐条核实，所以 `--verify` 只在
+  `--dry-run` 下可用。
 - 事件消费端只认 `kind='formal'`。旧库里遗留的 `new_notice`/`change_notice` 行原样保留在
   `tracking_events`，但不进重试计划（`plan` 把它们单列为 `legacy_notice`），Website 构库也会跳过
   并记入 `tracking_non_formal_skipped`。不得删除源库历史来"解决"这个问题。

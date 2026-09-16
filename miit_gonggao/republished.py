@@ -246,3 +246,51 @@ def from_status(site_db: Path, *, catalog_db: Path | None = None, pdf_root: Path
         notes.append("统计记录当前为 " + state["status"] + "，本轮按显式允许过期执行。")
     return RepublishedSource(origin="status", rows=rows, batches=batches,
                              generation=generation, notes=notes)
+
+
+def verify_against_api(rows: list[dict[str, Any]], *, query: Any = None,
+                       on_result: Any = None) -> dict[str, list[dict[str, Any]]]:
+    """按型号查正式接口，核实记录批次是否真的取得到。
+
+    批次枚举缓存与按型号查询是两个接口，口径并不总是一致：缓存把某产品列进更高
+    批次，不等于查询接口会把那一批当作该型号的当前有效版本。不核实就采集，这类
+    条目每轮都会重新入选、逐个请求一遍，再被 ``awaiting_effective`` 挡下来。
+
+    只读接口，不下载、不写库。返回四类：
+    - ``confirmed``：接口最高批次已达记录批次，是真重发；
+    - ``stale_record``：接口最高批次更低，记录与源不符，采集必然跳过；
+    - ``missing``：接口查不到该精确型号；
+    - ``failed``：本次查询失败，未核实，不能据此下结论。
+    """
+    from miit_gonggao import core
+
+    query = query or core.query_all_pages
+    result: dict[str, list[dict[str, Any]]] = {
+        "confirmed": [], "stale_record": [], "missing": [], "failed": []}
+    for index, row in enumerate(rows, start=1):
+        model = str(row.get("model_code") or "").strip()
+        recorded = row.get("republished_batch")
+        outcome = dict(row)
+        try:
+            api_rows = query(model_code=model, page_size=50)
+        except Exception as exc:  # noqa: BLE001 - 单条失败不能中断整批核实
+            outcome["verify_error"] = f"{type(exc).__name__}: {exc}"
+            bucket = "failed"
+        else:
+            batches = sorted(
+                int(value) for item in api_rows
+                if str(item.get("clxh") or "").strip().upper() == model.upper()
+                and (value := str(item.get("gppc") or item.get("pc") or "")).isdigit()
+            )
+            outcome["api_batches"] = batches
+            outcome["api_latest_batch"] = batches[-1] if batches else None
+            if not batches:
+                bucket = "missing"
+            elif isinstance(recorded, int) and batches[-1] >= recorded:
+                bucket = "confirmed"
+            else:
+                bucket = "stale_record"
+        result[bucket].append(outcome)
+        if on_result is not None:
+            on_result(index, len(rows), model, bucket, outcome)
+    return result

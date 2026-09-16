@@ -488,6 +488,7 @@ def write_republished_snapshot(
     *,
     selected: list[dict[str, str]],
     output_root: Path,
+    verification: dict[str, list[dict[str, Any]]] | None = None,
 ) -> Path:
     snapshot_dir = output_root / core.ANNOUNCEMENT_SNAPSHOT_DIRNAME
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -507,6 +508,10 @@ def write_republished_snapshot(
                 "total_candidates": source.candidate_total,
                 "rows": source.rows,
                 "selected_models": selected,
+                **({"verification": {
+                    "counts": {name: len(items) for name, items in verification.items()},
+                    **verification,
+                }} if verification is not None else {}),
             },
             ensure_ascii=False,
             indent=2,
@@ -775,6 +780,11 @@ def catalog_main(argv: list[str] | None = None) -> int:
         help="只生成重发清单快照并输出统计，不查询、不下载、不写业务库",
     )
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="配合 --dry-run：按型号查正式接口核实清单，分辨真重发与枚举缓存的假阳性；只读不下载",
+    )
+    parser.add_argument(
         "--min-interval", type=float,
         help="本进程请求最小间隔（秒），须与最大间隔同时给出；默认沿用 core 的 0.8–1.8",
     )
@@ -826,6 +836,9 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("正式发布重发模式自带清单，不能与 -f/--from-file 同时使用")
     if args.dry_run and not republish_mode:
         parser.error("--dry-run 只在正式发布重发模式下可用")
+    if args.verify and not args.dry_run:
+        # 真正采集时 batch_is_at_least 已经逐条核实，再单独查一遍只是重复请求。
+        parser.error("--verify 只在 --dry-run 下可用；实际采集本身就会核实接口批次")
 
     republished_source: republished.RepublishedSource | None = None
     if republish_mode:
@@ -868,19 +881,36 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     args.site_db.parent.mkdir(parents=True, exist_ok=True)
     args.download_root.mkdir(parents=True, exist_ok=True)
     if republished_source is not None:
+        verification = None
+        if args.verify:
+            print(f"开始按型号核实 {len(republished_source.rows)} 条候选（只读查询，不下载）……",
+                  flush=True)
+
+            def _report(index: int, total: int, model: str, bucket: str, _outcome: dict) -> None:
+                if bucket != "confirmed":  # 真重发是常态，只报需要人看的三类
+                    print(f"  [{index}/{total}] {model}：{bucket}", flush=True)
+
+            with request_pace(args):
+                verification = republished.verify_against_api(
+                    republished_source.rows, on_result=_report)
+            print("核实结果：" + "、".join(
+                f"{name} {len(items)} 条" for name, items in verification.items()), flush=True)
         selection_path = write_republished_snapshot(
             republished_source,
             selected=selected,
             output_root=args.download_root,
+            verification=verification,
         )
         if args.dry_run:
             by_batch = Counter(row["republished_batch"] for row in republished_source.rows)
             scope = (f"本轮清单 {len(republished_source.rows)} 个产品"
                      + (f"（候选共 {republished_source.candidate_total} 个）"
                         if republished_source.candidate_total != len(republished_source.rows) else ""))
+            checked = ("已按接口核实；" if verification is not None
+                       else "未查询官方接口，")
             print(f"{scope}，覆盖 {len(selected)} 个型号；"
                   + "、".join(f"第{batch_no}批 {count} 个" for batch_no, count in sorted(by_batch.items()))
-                  + f"\n清单快照：{selection_path}\n预演模式：未查询官方接口，未下载 PDF，未写业务库。", flush=True)
+                  + f"\n清单快照：{selection_path}\n预演模式：{checked}未下载 PDF，未写业务库。", flush=True)
             return 0
     else:
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"batch{batch}".replace("及更早", "_and_earlier"))

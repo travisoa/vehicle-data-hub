@@ -388,6 +388,77 @@ def test_republished_refresh_keeps_the_existing_catalog_identity(tmp_path: Path)
     assert selected[0]["batch"] == "31"
 
 
+def test_verify_separates_real_republication_from_cache_noise():
+    """批次枚举与按型号查询是两个接口，口径不一定一致；核实要能分出四种结局。"""
+    rows = [
+        {"model_code": "AA1", "republished_batch": 409, "product_id": "p1"},
+        {"model_code": "BB2", "republished_batch": 382, "product_id": "p2"},
+        {"model_code": "CC3", "republished_batch": 409, "product_id": "p3"},
+        {"model_code": "DD4", "republished_batch": 409, "product_id": "p4"},
+    ]
+
+    def fake_query(*, model_code: str, page_size: int):
+        if model_code == "AA1":  # 接口已给到记录批次：真重发
+            return [{"clxh": "AA1", "gppc": "407"}, {"clxh": "AA1", "gppc": "409"}]
+        if model_code == "BB2":  # 缓存说 382，接口最高只有 380：记录与源不符
+            return [{"clxh": "BB2", "gppc": "380"}]
+        if model_code == "CC3":  # 只有近似型号，精确型号查不到
+            return [{"clxh": "CC3-L", "gppc": "409"}]
+        raise RuntimeError("接口超时")
+
+    result = seed.republished.verify_against_api(rows, query=fake_query)
+    assert [row["model_code"] for row in result["confirmed"]] == ["AA1"]
+    assert [row["model_code"] for row in result["stale_record"]] == ["BB2"]
+    assert [row["model_code"] for row in result["missing"]] == ["CC3"]
+    assert [row["model_code"] for row in result["failed"]] == ["DD4"]
+    assert result["confirmed"][0]["api_latest_batch"] == 409
+    assert result["stale_record"][0]["api_latest_batch"] == 380
+    assert result["missing"][0]["api_batches"] == []
+    # 查询失败是"未核实"，不能被当成任何一种结论
+    assert "接口超时" in result["failed"][0]["verify_error"]
+    assert "api_latest_batch" not in result["failed"][0]
+
+
+def test_verify_needs_dry_run_because_collection_already_checks(monkeypatch, tmp_path: Path):
+    """实际采集本身逐条核实接口批次，再单独查一遍只是重复请求。"""
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口"))
+    with pytest.raises(SystemExit) as exc:
+        run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="409",
+                                  extra_args=("--verify",))
+    assert exc.value.code == 2
+
+
+def test_dry_run_verify_records_the_api_check_in_one_snapshot(monkeypatch, tmp_path: Path):
+    """核实结果与清单写在同一份快照里，且全程不下载。"""
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
+    # 缓存说第 409 批重发，接口最高只到 407：这条是枚举缓存的假阳性
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: [{"clxh": "ABC6500EV", "gppc": "407"}])
+    monkeypatch.setattr(seed.core, "download_param_page",
+                        lambda *_args, **_kwargs: pytest.fail("核实不得下载 PDF"))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-batch", "409", "--dry-run", "--verify",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+    assert seed.main() == 0
+    snapshots = list((upstream_root / "downloads" / "announcement_site" /
+                      seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
+    assert len(snapshots) == 1  # 核实不另起一份快照
+    payload = json.loads(snapshots[0].read_text(encoding="utf-8"))
+    assert payload["verification"]["counts"] == {
+        "confirmed": 0, "stale_record": 1, "missing": 0, "failed": 0}
+    assert payload["verification"]["stale_record"][0]["api_latest_batch"] == 407
+    with sqlite3.connect(site_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()[0] == 0
+
+
 def test_republished_models_are_not_excluded_when_already_in_the_site_db(tmp_path: Path):
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
