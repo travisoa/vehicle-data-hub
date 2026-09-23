@@ -443,8 +443,9 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     pdf_root=pdf_root, catalog_db=catalog_db,
                 )
                 ok, message = outcome
-                results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message, outcome.image_failed)
-                counts['image_failures'] += outcome.image_failed
+                image_failed = getattr(outcome, 'image_failed', False)
+                results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message, image_failed)
+                counts['image_failures'] += image_failed
                 if not ok:
                     key = ('parse_failures' if message.startswith('解析失败') else
                            'download_failures' if message.startswith('下载失败') else

@@ -1095,7 +1095,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                     if ok_pdf or message.startswith("解析失败"):
                         pdf_count += 1
                         model_pdf_count += 1
-                    if outcome.image_failed:
+                    # 兼容只返回 (ok, message) 的替身，与 download_param_page 的 .images 同一做法
+                    if getattr(outcome, "image_failed", False):
                         image_failures += 1
                         pace.slow_down("image_failed")
                         if ok_pdf:

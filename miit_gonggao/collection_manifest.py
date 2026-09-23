@@ -344,7 +344,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                         pdf_root=args.pdf_root, catalog_db=args.catalog_db,
                                     )
                                     ok, message = outcome
-                                    stored_image_failed = outcome.image_failed
+                                    stored_image_failed = getattr(outcome, "image_failed", False)
                                     status = "downloaded" if ok else failure_status(message)
                                     current = local_document(conn, row["cpid"], args.pdf_root)
                                     byte_count = current[2] if current else 0
