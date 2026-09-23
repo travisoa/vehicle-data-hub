@@ -313,7 +313,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 下载 PDF 后默认同时下载“产品型号 → 公告产品主要技术参数”详情页的全部原图，包括
 整车照片和选装拼图；`fetch`、`query --download`、`jianmian search --download` 及批量采集
-共用该行为。图片保存规则见下文“公告原图”；只查询、批量预览和已存在 PDF 的跳过路径不发起图片下载。
+共用该行为；批量采集与 `query --download` 可加 `--no-images` 只下载 PDF。图片保存与重试规则见下文“公告原图”；只查询和批量预览不发起图片下载，已存在 PDF 的跳过路径只为上次图片获取失败的产品重取图片。
 
 ---
 
@@ -382,24 +382,30 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 ### 公告原图
 
 `miit_gonggao.images.download_product_images(row, output_dir)` 通过 `queryCpData` 取得正式详情，
-核对产品 ID、型号和批次，解析页面实际列出的 `getPic` 链接，不猜测连续照片编号。
-详情页返回的会话 Cookie 只在本次同源图片请求中使用，不写入日志或索引；所有请求仍走
+核对产品 ID、型号和批次，只收页面实际列出的同源 `getPic` 照片链接，不猜测连续照片编号；
+页面上的标志、装饰图等其他图片直接略过，`getPic` 链接的产品身份不符时整页拒绝。
+详情页返回的全部会话 Cookie 只在本次同源图片请求中使用，不写入日志或索引；所有请求仍走
 `core.http_request` 的串行节流和重试。图片必须通过 Pillow 解码，不能把验证 HTML 当作 JPEG。
 遇到访问验证页会停止该产品余下图片请求并记录失败，不自动处理验证码。
 
 图片位于 PDF 同批次目录的 `images/<型号>_<产品ID>/`，文件名包含官方照片名和 SHA-256，
-不覆盖历史原图。`manifest.json` 是本次结果，`manifest_<时间>.json` 保留各次结果；索引记录
-产品身份、来源 URL、相对目录、文件名、尺寸、字节数、哈希及逐图 `status/error`。
+不覆盖历史原图，文件与索引权限与 PDF 一致（0644）。`manifest.json` 是最近一次结果，
+`manifest_<时间>.json` 保留各次结果；失败重采（新 PDF 解析失败等）只追加历史，不替换已有的当前索引。
+索引记录产品身份、来源 URL、相对目录、文件名、尺寸、字节数、哈希及逐图 `status/error`。
 `no_images` 表示核验通过的详情页没有图片，`failed/partial` 表示获取异常。
 原图中的多个选装局部通常是一张官方拼图，下载不拆图，也不凭照片序号推断配置类型。
 
-已有 PDF 可用 `query --images-only` 独立补图，目录参数沿用 `--output-dir/--vehicle-folder`，
-不重下 PDF、不改业务库收录状态。其退出码为 0（成功或明确无图）、1（图片全失败）、
-2（有图成功且有失败）。普通 `--download` 仍以 PDF 为主，图片异常报部分成功。
-`core.download_param_page` 返回 `ParameterPageDownload`，保留三项解包，并通过 `.images`
-提供图片结果。批量采集在原 `store_announcement` 中移交图片暂存文件，图片异常不回滚 PDF；
-`ingestion_runs.image_failures` 单列异常产品数，逐型号结果、固定清单日志及报告保留异常。
-已有 PDF 的跳过规则保持，新增能力不会自动补采全库历史图片。
+- **补图**：已有 PDF 可用 `query --images-only` 独立补图，目录参数沿用 `--output-dir/--vehicle-folder`；
+  目标目录找不到该产品 PDF 时跳过并报异常，避免图片与 PDF 分离。不重下 PDF、不改业务库收录状态。
+  退出码按产品计：0 全部取得图片或核验无图，1 没有任何产品完成，2 部分产品完成、另有失败。
+- **重试**：固定清单采集和近期公告跟踪遇到“已有有效 PDF、上次图片获取失败”的产品，只重取图片，
+  不重下 PDF。没有图片索引的历史产品不补采，新增能力不会扩大历史采集范围。
+- **关闭**：`gonggao collect`、`collection_tracking collect` 与 `query --download` 可加 `--no-images`，
+  本进程只下载 PDF，也不检查或重试图片。
+- **批量采集**：`store_announcement` 移交图片暂存文件，图片异常不回滚 PDF，结果的 `image_failed`
+  单列图片异常；移交失败时写入失败索引供下次重试，索引也写不进才保留暂存目录。
+  `ingestion_runs.image_failures` 单列异常产品数，逐型号结果、固定清单日志及报告保留异常。
+  `core.download_param_page` 返回 `ParameterPageDownload`，保留三项解包，并通过 `.images` 提供图片结果。
 
 ---
 

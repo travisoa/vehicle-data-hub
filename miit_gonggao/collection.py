@@ -576,6 +576,17 @@ def relative_pdf_path(path: Path, pdf_root: Path) -> str:
         raise RuntimeError(f"下载文件不在上游根目录内：{resolved_path}") from exc
 
 
+class StoreOutcome(tuple):
+    """store_announcement 的 (ok, message) 两项结果；image_failed 单列图片异常，调用方不从文案里查找。"""
+
+    image_failed: bool
+
+    def __new__(cls, ok: bool, message: str, image_failed: bool = False) -> "StoreOutcome":
+        outcome = super().__new__(cls, (ok, message))
+        outcome.image_failed = image_failed
+        return outcome
+
+
 def store_announcement(
     conn: sqlite3.Connection,
     *,
@@ -585,8 +596,8 @@ def store_announcement(
     download_root: Path,
     pdf_root: Path,
     catalog_db: Path,
-) -> tuple[bool, str]:
-    from miit_gonggao.images import publish_images
+) -> StoreOutcome:
+    from miit_gonggao.images import publish_images, record_image_failure
 
     product_id = source_product_id(row)
     trademark = str(row.get("cpsb") or "未标注商标")
@@ -652,17 +663,23 @@ def store_announcement(
                 # 发布失败不能把暂存路径作为正式文档写入；保留原文件供恢复并记录位置。
                 keep_staging = True
                 retained = relative_pdf_path(path, pdf_root)
-                return False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}"
+                return StoreOutcome(False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}")
 
+            # 失败重采不改写旧版本：图片与历史索引照常发布，已有的当前图片索引保持不变。
+            replace_current = not (previous and error)
             try:
-                publish_images(row, staging, folder)
+                publish_images(row, staging, folder, replace_current=replace_current)
             except Exception as exc:
-                keep_staging = True
-                image_error = f"图片下载不完整：图片发布失败 {type(exc).__name__}: {exc}；暂存目录：{staging}"
+                image_error = f"图片下载不完整：图片发布失败 {type(exc).__name__}: {exc}"
+                # 写入失败索引后，后续采集按图片异常只重取图片；索引也写不进时才保留暂存目录待人工处理。
+                if not record_image_failure(row, folder, image_error, replace_current=replace_current):
+                    keep_staging = True
+                    image_error += f"；暂存目录：{staging}"
 
         if previous and error:
             # 失败重采不改写任何旧版本，包括 HTML 和仅回填了目录字段的记录。
-            return False, "; ".join(value for value in (error, image_error) if value)
+            return StoreOutcome(False, "; ".join(value for value in (error, image_error) if value),
+                                bool(image_error))
 
         conn.execute("SAVEPOINT store_announcement")
         try:
@@ -707,8 +724,9 @@ def store_announcement(
             raise
         else:
             conn.execute("RELEASE store_announcement")
-        # PDF 状态不因图片失败回滚；上层单独统计图片异常。
-        return is_pdf and not error, "; ".join(value for value in (error, image_error) if value)
+        # PDF 状态不因图片失败回滚；上层按 image_failed 单独统计图片异常。
+        return StoreOutcome(is_pdf and not error, "; ".join(value for value in (error, image_error) if value),
+                            bool(image_error))
     finally:
         if not keep_staging:
             try:
@@ -806,6 +824,7 @@ def catalog_main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-interval", type=float, help="本进程请求最大间隔（秒），须与最小间隔同时给出",
     )
+    parser.add_argument("--no-images", action="store_true", help="只下载 PDF，不获取详情页原图")
     parser.add_argument("--catalog-db", type=Path, default=DEFAULT_CATALOG_DB)
     parser.add_argument("--site-db", type=Path, default=DEFAULT_SITE_DB)
     parser.add_argument("--report-dir", type=Path,
@@ -983,8 +1002,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     awaiting_effective = announcement_count = pdf_count = 0
     pace_warning = ""
     try:
-        # 提速只覆盖本进程；下载或查询失败会自动恢复默认间隔。
-        with request_pace(args) as pace:
+        # 提速与 --no-images 只覆盖本进程；下载或查询失败会自动恢复默认间隔。
+        with request_pace(args) as pace, core.image_downloads(not getattr(args, "no_images", False)):
             for index, item in enumerate(selected, start=1):
                 vehicle_id = upsert_vehicle(conn, item)
                 begin_model(conn, run_id, index, vehicle_id)
@@ -1063,7 +1082,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 model_pdf_count = 0
                 for row in rows:
                     announcement_count += 1
-                    ok_pdf, message = store_announcement(
+                    outcome = store_announcement(
                         conn,
                         row=row,
                         vehicle_id=vehicle_id,
@@ -1072,10 +1091,11 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                         pdf_root=UPSTREAM_ROOT,
                         catalog_db=args.catalog_db,
                     )
+                    ok_pdf, message = outcome
                     if ok_pdf or message.startswith("解析失败"):
                         pdf_count += 1
                         model_pdf_count += 1
-                    if "图片下载不完整：" in message:
+                    if outcome.image_failed:
                         image_failures += 1
                         pace.slow_down("image_failed")
                         if ok_pdf:

@@ -162,10 +162,27 @@ def local_document(conn: sqlite3.Connection, product_id: str, pdf_root: Path) ->
         return "parse_failed", f"已有 PDF 解析问题，未重复下载：{error}", len(content)
     from miit_gonggao.images import read_image_result
 
-    image_result = read_image_result(json.loads(row[7]), path.parent)
+    # --no-images 的进程只管 PDF，不因旧的图片异常把产品算作未完成
+    image_result = read_image_result(json.loads(row[7]), path.parent) if seed.core.DOWNLOAD_IMAGES else None
     if image_result and image_result.get("failed"):
         return "image_failed", "图片下载不完整：已有 PDF 有效，图片异常仍需补采", len(content)
     return "skipped_existing", "", len(content)
+
+
+def retry_document_images(conn: sqlite3.Connection, product_id: str, pdf_root: Path) -> bool:
+    """已有有效 PDF 但图片异常的产品只重取图片，不重下 PDF；实际发起获取时返回 True。"""
+    from miit_gonggao.images import retry_failed_images
+
+    row = conn.execute(
+        "SELECT d.relative_path,a.raw_json FROM announcements a JOIN documents d ON d.announcement_id=a.id "
+        "WHERE a.source_product_id=?", (product_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return False
+    folder = (pdf_root / row[0]).resolve().parent
+    if not folder.is_relative_to(pdf_root.resolve()):
+        return False
+    return retry_failed_images(json.loads(row[1]), folder) is not None
 
 
 def vehicle_id(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
@@ -269,7 +286,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in manifest["products"]:
         grouped.setdefault(row["clxh"], []).append(row)
-    with (request_pace(args) as pace, database_lock(args.site_db),
+    with (request_pace(args) as pace, seed.core.image_downloads(not getattr(args, "no_images", False)),
+          database_lock(args.site_db),
           closing(sqlite3.connect(args.site_db, timeout=5)) as conn):
         try:
             run_id = claim_run(conn, args, manifest)
@@ -309,17 +327,24 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                 break
                             item_started = time.monotonic()
                             cached = local_document(conn, row["cpid"], args.pdf_root)
+                            image_retried = bool(cached and cached[0] == "image_failed"
+                                                 and retry_document_images(conn, row["cpid"], args.pdf_root))
+                            if image_retried:
+                                cached = local_document(conn, row["cpid"], args.pdf_root)
                             attempted = cached is None
+                            stored_image_failed = False
                             if cached:
                                 status, message, byte_count = cached
                             else:
                                 attempts += 1
                                 try:
-                                    ok, message = seed.store_announcement(
+                                    outcome = seed.store_announcement(
                                         conn, row=row, vehicle_id=vid, market_name=model,
                                         download_root=args.pdf_root / "downloads" / "announcement_site",
                                         pdf_root=args.pdf_root, catalog_db=args.catalog_db,
                                     )
+                                    ok, message = outcome
+                                    stored_image_failed = outcome.image_failed
                                     status = "downloaded" if ok else failure_status(message)
                                     current = local_document(conn, row["cpid"], args.pdf_root)
                                     byte_count = current[2] if current else 0
@@ -336,11 +361,13 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             processed += 1
                             model_processed += 1
                             counters[status] += 1
-                            image_failed = "图片下载不完整：" in message
+                            image_failed = status == "image_failed" or stored_image_failed
                             if image_failed:
                                 if status != "image_failed":
                                     counters["image_failed"] += 1
-                                pace.slow_down("image_failed")
+                                if attempted or image_retried:
+                                    # 只有本轮实际请求失败才降速，历史记录里的图片异常不影响请求节奏
+                                    pace.slow_down("image_failed")
                             pdf_bytes += byte_count if status in SUCCESS else 0
                             downloaded_bytes += byte_count if status == "downloaded" else 0
                             if status not in SUCCESS or image_failed:
@@ -358,7 +385,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             record = {"run_id": run_id, "pid": os.getpid(), "at": seed.utc_now(), "cpid": row["cpid"],
                                       "model_code": model, "batch": str(row.get("gppc") or row.get("pc")),
                                       "status": status, "error": message, "bytes": byte_count,
-                                      "image_failed": image_failed,
+                                      "image_failed": image_failed, "image_retried": image_retried,
                                       "attempted_download": attempted, "elapsed_seconds": round(elapsed, 3),
                                       "source_generation_error": source_error}
                             results.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -413,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="实际下载；默认只校验清单")
     parser.add_argument("--min-interval", type=float, help="本进程请求最小间隔（秒），须与最大间隔同时给出")
     parser.add_argument("--max-interval", type=float, help="本进程请求最大间隔（秒），遇下载失败/非 PDF 恢复默认")
+    parser.add_argument("--no-images", action="store_true", help="只下载 PDF，不获取或重试详情页原图")
     args = parser.parse_args(argv)
     try:
         manifest = load_manifest(args.manifest, args.manifest_sha256, catalog_db=args.catalog_db)
@@ -422,7 +450,8 @@ def main(argv: list[str] | None = None) -> int:
                               "models": manifest["expected_models"], "manifest_sha256": args.manifest_sha256.lower(),
                               "site_db": str(args.site_db), "pdf_root": str(args.pdf_root),
                               "request_interval": list(interval or seed.core.REQUEST_MIN_INTERVAL),
-                              "requested_interval": list(interval) if interval is not None else None},
+                              "requested_interval": list(interval) if interval is not None else None,
+                              "download_images": not getattr(args, "no_images", False)},
                              ensure_ascii=False))
             return 0
         with signal_handlers(stop := StopFlag()):

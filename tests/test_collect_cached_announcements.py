@@ -116,10 +116,47 @@ def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatc
     assert models(args) == [('ABC6500EV', 'partial')]
     with sqlite3.connect(args.site_db) as conn:
         assert conn.execute('SELECT image_failures FROM ingestion_runs').fetchone()[0] == 1
+    retries = []
+
+    def retry(row, folder, status='failed'):
+        retries.append(row['cpid'])
+        result = {**images.new_result(row, folder), 'status': status, 'failed': int(status == 'failed')}
+        images.write_result(result, images.image_folder(row, folder))
+        return result
+
+    monkeypatch.setattr(images, 'download_product_images', retry)
     args.resume_run = 1
     assert cached.collect(args, payload) == 2
     assert calls == ['p1']  # 保留有效 PDF，不为图片异常重复下载 PDF。
+    assert retries == ['p1']  # 只重取图片
     assert progress(args)['results']['image_failed'] == 1
+
+    monkeypatch.setattr(images, 'download_product_images', lambda row, folder: retry(row, folder, 'ok'))
+    assert cached.collect(args, payload) == 0
+    assert calls == ['p1'] and retries == ['p1', 'p1']
+    assert progress(args)['results'] == {'skipped_existing': 1}
+
+
+def test_no_images_run_neither_checks_nor_retries_images(tmp_path, monkeypatch):
+    from miit_gonggao import images
+
+    args, payload = setup(tmp_path)
+
+    def download(row, folder):
+        assert seed.core.DOWNLOAD_IMAGES is not getattr(args, 'no_images', False)
+        path = folder / 'p1.pdf'
+        path.write_bytes(b'%PDF test')
+        result = {**images.new_result(row, folder), 'failed': 1, 'error': 'offline'}
+        images.write_result(result, images.image_folder(row, folder))
+        return seed.core.ParameterPageDownload(path, True, path.stat().st_size, result)
+
+    monkeypatch.setattr(seed.core, 'download_param_page', download)
+    assert cached.collect(args, payload) == 2
+    monkeypatch.setattr(images, 'download_product_images', lambda *a: pytest.fail('--no-images 不应重取图片'))
+    args.no_images, args.resume_run = True, 1
+    assert cached.collect(args, payload) == 0
+    assert progress(args)['results'] == {'skipped_existing': 1}
+    assert seed.core.DOWNLOAD_IMAGES  # 只在本进程本次采集内关闭
 
 
 def test_exact_ids_and_model_aggregation_and_dry_run(tmp_path, monkeypatch):

@@ -30,7 +30,11 @@ def image_folder(row: dict[str, Any], output_dir: Path) -> Path:
 
 
 def parse_image_links(content: bytes, row: dict[str, Any]) -> list[dict[str, str]]:
-    """不猜测连续编号，也不把验证页、错误车型或外站链接当成照片清单。"""
+    """不猜测连续编号，也不把验证页、错误车型或外站链接当成照片清单。
+
+    只收同源 getPic 链接；页面上的其他图片（标志、装饰图、外站图片）不是公告照片，直接略过。
+    getPic 链接的产品 ID、批次与本产品不符时拒绝整页，避免登记别的产品的照片。
+    """
     soup = BeautifulSoup(content, "html.parser")
     fields = {}
     for tr in soup.find_all("tr"):
@@ -48,12 +52,11 @@ def parse_image_links(content: bytes, row: dict[str, Any]) -> list[dict[str, str
     seen = set()
     for img in soup.select("img[src]"):
         url = urlsplit(urljoin(core.DETAIL_URL, img["src"]))
+        if url.scheme != base.scheme or url.netloc != base.netloc or url.path != base.path + "/getPic":
+            continue
         params = parse_qs(url.query)
-        if (url.scheme != base.scheme or url.netloc != base.netloc
-                or url.path != base.path + "/getPic"
-                or params.get("gid") != [gid] or params.get("pc") != [batch]
-                or len(params.get("zpname", [])) != 1):
-            raise ValueError("详情页图片链接的来源或产品身份不符")
+        if params.get("gid") != [gid] or params.get("pc") != [batch] or len(params.get("zpname", [])) != 1:
+            raise ValueError("详情页照片链接的产品身份不符")
         name = params["zpname"][0]
         if name not in seen:
             seen.add(name)
@@ -68,6 +71,8 @@ def atomic_write(path: Path, content: bytes) -> None:
         temporary = Path(handle.name)
         handle.write(content)
     try:
+        # NamedTemporaryFile 建的是 0600；与同目录 PDF 一致，新文件 0644，替换时沿用原权限
+        os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o644)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -80,21 +85,14 @@ def download_product_images(row: dict[str, Any], output_dir: Path) -> dict[str, 
     Cookie 仅在本次详情页和同源图片之间使用，不保存到文件或日志。
     """
     folder = image_folder(row, output_dir)
-    result: dict[str, Any] = {
-        "schema_version": 1,
-        "product_id": str(row.get("cpid") or row.get("gid") or ""),
-        "model_code": str(row.get("clxh") or ""),
-        "batch": str(row.get("gppc") or row.get("pc") or ""),
-        "detail_url": core.DETAIL_URL,
-        "directory": folder.relative_to(output_dir).as_posix(),
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-        "status": "failed", "error": "", "images": [], "downloaded": 0, "failed": 0,
-    }
+    result = new_result(row, output_dir)
     try:
         content, response_headers = core.post_form(core.DETAIL_URL, core.product_payload(row))
         links = parse_image_links(content, row)
         cookie = SimpleCookie()
-        cookie.load(response_headers.get("set-cookie", ""))
+        # http_request 把多条 Set-Cookie 逐行保留，逐条解析才不会只剩最后一个
+        for line in response_headers.get("set-cookie", "").splitlines():
+            cookie.load(line)
         headers = {"User-Agent": "Mozilla/5.0 gonggao-tool/0.1", "Referer": core.DETAIL_URL}
         if cookie:
             headers["Cookie"] = "; ".join(f"{key}={item.value}" for key, item in cookie.items())
@@ -132,14 +130,33 @@ def download_product_images(row: dict[str, Any], output_dir: Path) -> dict[str, 
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["failed"] += 1
-    payload = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    atomic_write(folder / f"manifest_{stamp}.json", payload)
-    atomic_write(folder / "manifest.json", payload)
+    write_result(result, folder)
     print(f"公告图片：{result['downloaded']} 张成功，{result['failed']} 项失败；索引：{folder / 'manifest.json'}")
     if result["failed"]:
         print(f"图片下载不完整：{result['model_code']}；{result['error'] or '详见图片索引'}", file=sys.stderr)
     return result
+
+
+def new_result(row: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "product_id": str(row.get("cpid") or row.get("gid") or ""),
+        "model_code": str(row.get("clxh") or ""),
+        "batch": str(row.get("gppc") or row.get("pc") or ""),
+        "detail_url": core.DETAIL_URL,
+        "directory": image_folder(row, output_dir).relative_to(output_dir).as_posix(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "status": "failed", "error": "", "images": [], "downloaded": 0, "failed": 0,
+    }
+
+
+def write_result(result: dict[str, Any], folder: Path, *, replace_current: bool = True) -> None:
+    """先写本次历史索引，再按需替换当前索引。"""
+    payload = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    atomic_write(folder / f"manifest_{stamp}.json", payload)
+    if replace_current or not (folder / "manifest.json").exists():
+        atomic_write(folder / "manifest.json", payload)
 
 
 def read_image_result(row: dict[str, Any], output_dir: Path) -> dict[str, Any] | None:
@@ -152,8 +169,37 @@ def read_image_result(row: dict[str, Any], output_dir: Path) -> dict[str, Any] |
         return {"status": "failed", "failed": 1, "error": f"图片索引无法读取：{exc}"}
 
 
-def publish_images(row: dict[str, Any], staging: Path, output_dir: Path) -> None:
-    """采集暂存目录移交：先发布不可变图片/历史索引，再替换当前索引。"""
+def retry_failed_images(row: dict[str, Any], output_dir: Path) -> dict[str, Any] | None:
+    """已有有效 PDF 的产品，上次图片获取失败或不完整时只重取图片，不重下 PDF。
+
+    没有图片索引（启用图片前的历史产品）或上次已完整时返回 None，不借此扩大历史补图范围；
+    本进程关闭图片下载时同样返回 None。
+    """
+    if not core.DOWNLOAD_IMAGES:
+        return None
+    previous = read_image_result(row, output_dir)
+    if not previous or not previous.get("failed"):
+        return None
+    return download_product_images(row, output_dir)
+
+
+def record_image_failure(row: dict[str, Any], output_dir: Path, error: str, *,
+                         replace_current: bool = True) -> bool:
+    """图片未能移交到正式目录时写入失败索引，后续采集据此重试；写入失败返回 False。"""
+    try:
+        result = new_result(row, output_dir)
+        result.update(error=error, failed=1)
+        write_result(result, image_folder(row, output_dir), replace_current=replace_current)
+    except OSError:
+        return False
+    return True
+
+
+def publish_images(row: dict[str, Any], staging: Path, output_dir: Path, *, replace_current: bool = True) -> None:
+    """采集暂存目录移交：先发布不可变图片/历史索引，再替换当前索引。
+
+    replace_current=False 用于失败重采：图片与历史索引照常发布，已有的当前索引保持不变。
+    """
     source = image_folder(row, staging)
     if not source.exists():
         return
@@ -168,4 +214,5 @@ def publish_images(row: dict[str, Any], staging: Path, output_dir: Path) -> None
         except FileExistsError:
             if path.read_bytes() != target.read_bytes():
                 raise RuntimeError(f"图片目标已存在且内容不同：{target}")
-    atomic_write(destination / "manifest.json", (source / "manifest.json").read_bytes())
+    if replace_current or not (destination / "manifest.json").exists():
+        atomic_write(destination / "manifest.json", (source / "manifest.json").read_bytes())

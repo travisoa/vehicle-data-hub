@@ -238,18 +238,23 @@ def has_valid_documents(conn: sqlite3.Connection, event: dict, pdf_root: Path) -
 
 
 def document_image_error(conn: sqlite3.Connection, event: dict, pdf_root: Path) -> str:
-    from miit_gonggao.images import read_image_result
+    """已有有效 PDF 的产品：上次图片获取失败时只重取图片（不重下 PDF），仍失败才返回异常说明。"""
+    from miit_gonggao import core
+    from miit_gonggao.images import read_image_result, retry_failed_images
 
+    if not core.DOWNLOAD_IMAGES:
+        return ''
     for product_id, relative, _size, _is_pdf in matching_documents(conn, event):
         if not relative:
             continue
         folder = (pdf_root / relative).resolve().parent
         if not folder.is_relative_to(pdf_root.resolve()):
             continue
-        raw = conn.execute("SELECT raw_json FROM announcements WHERE source_product_id=?", (product_id,)).fetchone()
-        result = read_image_result(json.loads(raw[0]), folder)
+        raw = json.loads(conn.execute("SELECT raw_json FROM announcements WHERE source_product_id=?",
+                                      (product_id,)).fetchone()[0])
+        result = retry_failed_images(raw, folder) or read_image_result(raw, folder)
         if result and result.get('failed'):
-            return '图片下载不完整：已有 PDF 有效，图片异常仍需补采'
+            return '图片下载不完整：已有 PDF 有效，重取图片仍未完整'
     return ''
 
 
@@ -413,7 +418,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             needed = {e['product_id'] for e in group if e['product_id']}
             if rows and all(e['product_id'] for e in group):
                 rows = [r for r in rows if str(r.get('cpid')) in needed]
-            results: dict[str, tuple[bool, str]] = {}
+            # 产品 ID -> (PDF 是否可用, 说明, 图片是否异常)
+            results: dict[str, tuple[bool, str, bool]] = {}
             for row in rows:
                 scope = classify_vehicle(model, row.get('clmc') or '', row)
                 if scope['inclusion_gate'] != 'accepted':
@@ -422,23 +428,23 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     results[str(row.get('cpid') or '')] = (
                         False, f"官方返回产品范围校验未通过: {model} / {row.get('cpid') or '缺少产品 ID'} / "
                         f"{row.get('clmc') or '缺少产品名称 clmc'} "
-                        f"({scope['inclusion_gate']}: {scope['scope_reason']})",
+                        f"({scope['inclusion_gate']}: {scope['scope_reason']})", False,
                     )
                     continue
                 probe = {**group[0], 'product_id': str(row['cpid'])}
                 if has_valid_documents(conn, probe, pdf_root):
                     image_error = document_image_error(conn, probe, pdf_root)
                     counts['image_failures'] += bool(image_error)
-                    results[str(row['cpid'])] = (True, image_error)
+                    results[str(row['cpid'])] = (True, image_error, bool(image_error))
                     continue
-                ok, message = seed.store_announcement(
+                outcome = seed.store_announcement(
                     conn, row=row, vehicle_id=vehicle_id, market_name=model,
                     download_root=pdf_root / 'downloads/announcement_site',
                     pdf_root=pdf_root, catalog_db=catalog_db,
                 )
-                results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message)
-                if '图片下载不完整：' in message:
-                    counts['image_failures'] += 1
+                ok, message = outcome
+                results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message, outcome.image_failed)
+                counts['image_failures'] += outcome.image_failed
                 if not ok:
                     key = ('parse_failures' if message.startswith('解析失败') else
                            'download_failures' if message.startswith('下载失败') else
@@ -452,14 +458,14 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                 if status != 'query_failed':
                     if not selected:
                         event_status = 'no_match'
-                    elif all(ok for ok, _ in selected) and not any('图片下载不完整：' in msg for _, msg in selected):
+                    elif all(ok and not image_failed for ok, _, image_failed in selected):
                         event_status = 'done'
-                    elif any(not ok for ok, _ in selected) and all(
-                            msg.startswith('接口返回非 PDF') for ok, msg in selected if not ok):
+                    elif any(not ok for ok, _, _ in selected) and all(
+                            msg.startswith('接口返回非 PDF') for ok, msg, _ in selected if not ok):
                         event_status = 'no_document'
                     else:
                         event_status = 'partial'
-                    event_error = '; '.join(msg for _, msg in selected if msg)
+                    event_error = '; '.join(msg for _, msg, _ in selected if msg)
                 conn.execute(
                     'update tracking_events set status=?,last_checked_at=?,next_check_at=?, '
                     'attempts=attempts+1,last_error=? where event_id=?',
@@ -511,6 +517,7 @@ def main() -> int:
     plan_parser.add_argument('--limit', type=int, default=400)
     collect_parser = commands.add_parser('collect')
     collect_parser.add_argument('--limit', type=int, default=400)
+    collect_parser.add_argument('--no-images', action='store_true', help='只下载 PDF，不获取或重试详情页原图')
     args = parser.parse_args()
     if hasattr(args, 'limit') and args.limit < 1:
         parser.error('--limit 必须大于 0')
@@ -538,8 +545,9 @@ def main() -> int:
         elif args.command == 'plan':
             print(json.dumps(retry_plan(conn, args.pdf_root, limit=args.limit), ensure_ascii=False, indent=2))
         else:
-            result = collect(conn, retry_plan(conn, args.pdf_root, limit=args.limit),
-                             catalog_db=args.catalog_db, pdf_root=args.pdf_root)
+            with seed.core.image_downloads(not args.no_images):
+                result = collect(conn, retry_plan(conn, args.pdf_root, limit=args.limit),
+                                 catalog_db=args.catalog_db, pdf_root=args.pdf_root)
             if result.get('run_id'):
                 try:
                     try:

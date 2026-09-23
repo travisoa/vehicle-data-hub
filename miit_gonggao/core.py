@@ -13,6 +13,7 @@ import string
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -254,6 +255,20 @@ def old_frontend_value(value: str | None) -> str:
 REQUEST_RETRIES = 3
 REQUEST_BACKOFF = 2.0
 REQUEST_MIN_INTERVAL = (0.8, 1.8)
+# 下载 PDF 后是否同时获取详情页原图；采集命令的 --no-images 只在本进程内关闭。
+DOWNLOAD_IMAGES = True
+
+
+@contextmanager
+def image_downloads(enabled: bool):
+    """本进程临时关闭图片下载，退出时恢复；不改默认值。"""
+    global DOWNLOAD_IMAGES
+    original = DOWNLOAD_IMAGES
+    DOWNLOAD_IMAGES = original and enabled
+    try:
+        yield
+    finally:
+        DOWNLOAD_IMAGES = original
 
 _last_request_at = 0.0
 
@@ -288,7 +303,14 @@ def http_request(
         )
         try:
             with request.urlopen(req, timeout=timeout) as resp:
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                resp_headers: dict[str, str] = {}
+                for key, value in resp.headers.items():
+                    key = key.lower()
+                    if key == "set-cookie" and key in resp_headers:
+                        # 多条 Set-Cookie 不能按逗号合并（Expires 含逗号），逐行保留，由调用方逐行解析
+                        resp_headers[key] += "\n" + value
+                    else:
+                        resp_headers[key] = value
                 return resp.read(), resp_headers
         except error.HTTPError as exc:
             if exc.code < 500:
@@ -548,13 +570,9 @@ class ParameterPageDownload:
         yield self.byte_count
 
 
-def download_param_page(row: dict[str, Any], output_dir: Path) -> ParameterPageDownload:
-    """保存 PDF 后默认补充详情页原图；图片失败不丢失 PDF 结果。"""
-    from miit_gonggao.images import download_product_images
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    content, _headers = post_form(PDF_URL, product_payload(row))
-    stem = "_".join(
+def param_page_stem(row: dict[str, Any]) -> str:
+    """参数页文件名（不含扩展名）：商标_型号_批次_产品ID。"""
+    return "_".join(
         safe_part(str(part))
         for part in [
             row.get("cpsb", ""),
@@ -564,12 +582,21 @@ def download_param_page(row: dict[str, Any], output_dir: Path) -> ParameterPageD
         ]
         if part
     )
+
+
+def download_param_page(row: dict[str, Any], output_dir: Path) -> ParameterPageDownload:
+    """保存 PDF 后默认补充详情页原图；图片失败不丢失 PDF 结果。"""
+    from miit_gonggao.images import download_product_images
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    content, _headers = post_form(PDF_URL, product_payload(row))
+    stem = param_page_stem(row)
     is_pdf = is_pdf_bytes(content)
     suffix = ".pdf" if is_pdf else ".html"
     path = output_dir / f"{stem}{suffix}"
     path.write_bytes(content)
     result = ParameterPageDownload(path, is_pdf, len(content))
-    if is_pdf:
+    if is_pdf and DOWNLOAD_IMAGES:
         try:
             result.images = download_product_images(row, output_dir)
         except Exception as exc:
@@ -652,6 +679,15 @@ def write_download_manifest(entries: list[dict[str, Any]], output_dir: Path) -> 
 
 
 def command_query(args: argparse.Namespace) -> int:
+    no_images = getattr(args, "no_images", False)
+    if no_images and getattr(args, "images_only", False):
+        print("--images-only 与 --no-images 不能同时使用", file=sys.stderr)
+        return EXIT_DOWNLOAD_FAILED
+    with image_downloads(not no_images):
+        return _command_query(args)
+
+
+def _command_query(args: argparse.Namespace) -> int:
     images_only = getattr(args, "images_only", False)
     mappings = load_mappings(Path(args.mapping_file).expanduser().resolve())
     mapping = find_mapping(args.vehicle, mappings)
@@ -762,7 +798,7 @@ def command_query(args: argparse.Namespace) -> int:
         print(f"下载根目录: {output_dir}")
         errors: list[str] = []
         non_pdf: list[str] = []
-        image_problems = image_count = 0
+        image_problems = image_count = image_ok_products = 0
         for row in selected:
             label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
             download_dir = output_dir if args.flat_output else build_announcement_download_dir(
@@ -784,13 +820,23 @@ def command_query(args: argparse.Namespace) -> int:
             if images_only:
                 from miit_gonggao.images import download_product_images
 
-                try:
-                    image_result = download_product_images(row, download_dir)
-                except Exception as exc:
-                    image_result = {"status": "failed", "downloaded": 0, "failed": 1, "error": str(exc)}
+                stem = param_page_stem(row)
+                if not ((download_dir / f"{stem}.pdf").is_file() or any(download_dir.glob(f"*_{stem}.pdf"))):
+                    # 图片须与 PDF 同批次目录；目录参数与采集时不一致时存到别处，网站构库找不到
+                    message = (f"未在 {download_dir} 找到该产品 PDF（{stem}.pdf），跳过补图；"
+                               "请核对 --output-dir/--vehicle-folder")
+                    print(f"{label}: {message}", file=sys.stderr)
+                    image_result = {"status": "missing_pdf", "downloaded": 0, "failed": 1, "error": message}
+                else:
+                    try:
+                        image_result = download_product_images(row, download_dir)
+                    except Exception as exc:
+                        image_result = {"status": "failed", "downloaded": 0, "failed": 1, "error": str(exc)}
                 manifest_entries.append({**identity, "images": image_result})
                 image_count += image_result["downloaded"]
                 image_problems += image_result["failed"]
+                # 核验无图也算该产品完成；退出码按产品判断全失败与部分成功
+                image_ok_products += int(image_result["downloaded"] > 0 or image_result["status"] == "no_images")
                 continue
             try:
                 downloaded = download_param_page(row, download_dir)
@@ -834,7 +880,7 @@ def command_query(args: argparse.Namespace) -> int:
         if image_count or image_problems or images_only:
             print(f"图片汇总：成功 {image_count} 张，异常 {image_problems} 项。")
         if images_only:
-            return download_exit_code(ok_pdf_count=image_count, problem_count=image_problems)
+            return download_exit_code(ok_pdf_count=image_ok_products, problem_count=image_problems)
         if errors:
             print(f"以下 {len(errors)} 条下载失败: {'; '.join(errors)}", file=sys.stderr)
         if non_pdf:
@@ -896,7 +942,9 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--all-pages", action="store_true", help="拉取全部分页")
     download_mode = query_parser.add_mutually_exclusive_group()
     download_mode.add_argument("--download", action="store_true", help="下载公告参数页 PDF，并默认下载详情页原图")
-    download_mode.add_argument("--images-only", action="store_true", help="仅下载详情页原图，不重新下载 PDF")
+    download_mode.add_argument("--images-only", action="store_true",
+                               help="仅为目标目录中已有 PDF 的产品下载详情页原图，不重新下载 PDF")
+    query_parser.add_argument("--no-images", action="store_true", help="配合 --download：只下载 PDF，不获取详情页原图")
     query_parser.add_argument("--detail-html", action="store_true", help="同时保存主要技术参数 HTML")
     query_parser.add_argument("--vehicle-folder", help="下载时使用的车型目录名；默认按查询配置或查询条件自动生成")
     query_parser.add_argument("--flat-output", action="store_true", help="下载文件直接保存到输出目录根目录，兼容旧版平铺结构")

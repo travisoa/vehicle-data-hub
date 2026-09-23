@@ -257,7 +257,7 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   `batch_or_chassis_id`，不得把底盘 ID 当作公告批次。解析仅跳过明确整行合计，缺列、未知合并行
   和缺型号均报告表格行号并停止登记，不静默丢弃产品行。
 - PDF 只认 `%PDF` 魔数；不是 PDF 时保留 `.html` 供人工检查。非 PDF 属预期情形，只有**全部**条目都没拿到 PDF 才算失败（退出码 1），部分非 PDF 退出码为 2
-- PDF 下载成功后默认同时获取详情页原图；复用 `core.download_param_page` 和 `images.download_product_images`，批量暂存发布仍走 `store_announcement`。图片及逐图索引保存在同批次 `images/<型号>_<产品ID>/`；会话、校验、错误与补图接口契约见 [README 公告原图](README.md#公告原图)。只查询、预览和既有 PDF 跳过路径不补图，不借此扩大历史采集范围。
+- PDF 下载成功后默认同时获取详情页原图；复用 `core.download_param_page` 和 `images.download_product_images`，批量暂存发布仍走 `store_announcement`。图片及逐图索引保存在同批次 `images/<型号>_<产品ID>/`；会话、校验、错误、重试与补图接口契约见 [README 公告原图](README.md#公告原图)。只查询和预览不补图；既有 PDF 跳过路径只对上次图片获取失败的产品重取图片，不重下 PDF，不借此扩大历史采集范围。只要 PDF 时用 `--no-images`。
 - 不要删除既有 `output/`、`downloads/` 内容，除非用户明确要求
 
 ## 开发规则
