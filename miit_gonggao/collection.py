@@ -97,7 +97,7 @@ def finish_model(conn: sqlite3.Connection, run_id: int, vehicle_id: int, status:
 def finish_run(conn: sqlite3.Connection, run_id: int, counts: dict, reason: str = "") -> int:
     """统一记录阶段统计与中断结局；完成时间不代表所有产品成功。"""
     columns = ("query_failures", "download_failures", "non_pdf_documents", "awaiting_effective",
-               "parse_failures", "publish_failures")
+               "parse_failures", "publish_failures", "image_failures")
     interrupted = conn.execute(
         "UPDATE run_models SET status='interrupted',error=COALESCE(NULLIF(error,''),?) "
         "WHERE run_id=? AND status='querying'",
@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     non_pdf_documents INTEGER NOT NULL DEFAULT 0,
     awaiting_effective INTEGER NOT NULL DEFAULT 0,
     parse_failures INTEGER NOT NULL DEFAULT 0,
-    publish_failures INTEGER NOT NULL DEFAULT 0
+    publish_failures INTEGER NOT NULL DEFAULT 0,
+    image_failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS brands (
     id INTEGER PRIMARY KEY,
@@ -207,7 +208,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """创建业务库表，并为既有数据库补齐可向后兼容的运行状态列。"""
     conn.executescript(SCHEMA)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(ingestion_runs)")}
-    for column in ("awaiting_effective", "parse_failures", "publish_failures"):
+    for column in ("awaiting_effective", "parse_failures", "publish_failures", "image_failures"):
         if column not in columns:
             # 历史轮次没有分项统计，NULL 表示未知，不能伪造为零。
             definition = "INTEGER NOT NULL DEFAULT 0" if column == "awaiting_effective" else "INTEGER"
@@ -585,6 +586,8 @@ def store_announcement(
     pdf_root: Path,
     catalog_db: Path,
 ) -> tuple[bool, str]:
+    from miit_gonggao.images import publish_images
+
     product_id = source_product_id(row)
     trademark = str(row.get("cpsb") or "未标注商标")
     batch = str(row.get("gppc") or row.get("pc") or "未标注批次")
@@ -609,9 +612,14 @@ def store_announcement(
         byte_count = 0
         relative_path = f"failed/{safe_part(product_id)}"
         error = ""
+        image_error = ""
         try:
-            path, is_pdf, byte_count = core.download_param_page(row, staging)
+            downloaded = core.download_param_page(row, staging)
+            path, is_pdf, byte_count = downloaded
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            image_result = getattr(downloaded, "images", None)
+            if image_result and image_result["failed"]:
+                image_error = f"图片下载不完整：{image_result['failed']} 项失败；{image_result.get('error', '')}"
         except Exception as exc:
             error = f"下载失败：{type(exc).__name__}: {exc}"
             is_pdf, byte_count, digest = False, 0, None
@@ -646,9 +654,15 @@ def store_announcement(
                 retained = relative_pdf_path(path, pdf_root)
                 return False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}"
 
+            try:
+                publish_images(row, staging, folder)
+            except Exception as exc:
+                keep_staging = True
+                image_error = f"图片下载不完整：图片发布失败 {type(exc).__name__}: {exc}；暂存目录：{staging}"
+
         if previous and error:
             # 失败重采不改写任何旧版本，包括 HTML 和仅回填了目录字段的记录。
-            return False, error
+            return False, "; ".join(value for value in (error, image_error) if value)
 
         conn.execute("SAVEPOINT store_announcement")
         try:
@@ -693,7 +707,8 @@ def store_announcement(
             raise
         else:
             conn.execute("RELEASE store_announcement")
-        return is_pdf and not error, error
+        # PDF 状态不因图片失败回滚；上层单独统计图片异常。
+        return is_pdf and not error, "; ".join(value for value in (error, image_error) if value)
     finally:
         if not keep_staging:
             try:
@@ -964,7 +979,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if backfilled:
         print(f"已补齐 {backfilled} 份既有公告的目录参数。", flush=True)
 
-    query_failures = download_failures = non_pdf = parse_failures = publish_failures = 0
+    query_failures = download_failures = non_pdf = parse_failures = publish_failures = image_failures = 0
     awaiting_effective = announcement_count = pdf_count = 0
     pace_warning = ""
     try:
@@ -1060,6 +1075,11 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                     if ok_pdf or message.startswith("解析失败"):
                         pdf_count += 1
                         model_pdf_count += 1
+                    if "图片下载不完整：" in message:
+                        image_failures += 1
+                        pace.slow_down("image_failed")
+                        if ok_pdf:
+                            errors.append(message)
                     if not ok_pdf:
                         if message.startswith("下载失败"):
                             download_failures += 1
@@ -1085,6 +1105,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 "query_failures": query_failures, "download_failures": download_failures,
                 "non_pdf_documents": non_pdf, "awaiting_effective": awaiting_effective,
                 "parse_failures": parse_failures, "publish_failures": publish_failures,
+                "image_failures": image_failures,
             })
         finally:
             conn.close()
@@ -1096,7 +1117,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     print(
         f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
         f"接口与记录不一致 {awaiting_effective}，查询失败 {query_failures}，"
-        f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，非 PDF {non_pdf}。"
+        f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，"
+        f"图片异常产品 {image_failures}，非 PDF {non_pdf}。"
         + (f"\n{pace_warning}" if pace_warning else "")
         + f"\n数据库：{args.site_db}\n目录快照：{selection_path}",
         flush=True,
@@ -1120,7 +1142,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             print(f"采集报告生成失败（不影响采集结果）：{type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
     return 2 if any((awaiting_effective, query_failures, download_failures,
-                     parse_failures, publish_failures, non_pdf)) else 0
+                     parse_failures, publish_failures, non_pdf, image_failures)) else 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -96,6 +96,32 @@ def seed_existing(args, row, *, parse_error: str = "") -> tuple[Path, bytes]:
     return path, path.read_bytes()
 
 
+def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatch):
+    from miit_gonggao import images
+
+    args, payload = setup(tmp_path)
+    calls = []
+
+    def download(row, folder):
+        calls.append(row['cpid'])
+        path = folder / 'p1.pdf'
+        path.write_bytes(b'%PDF test')
+        result = {'status': 'failed', 'failed': 1, 'downloaded': 0, 'error': 'offline'}
+        images.atomic_write(images.image_folder(row, folder) / 'manifest.json', json.dumps(result).encode())
+        return seed.core.ParameterPageDownload(path, True, path.stat().st_size, result)
+
+    monkeypatch.setattr(seed.core, 'download_param_page', download)
+    assert cached.collect(args, payload) == 2
+    assert progress(args)['results']['image_failed'] == 1
+    assert models(args) == [('ABC6500EV', 'partial')]
+    with sqlite3.connect(args.site_db) as conn:
+        assert conn.execute('SELECT image_failures FROM ingestion_runs').fetchone()[0] == 1
+    args.resume_run = 1
+    assert cached.collect(args, payload) == 2
+    assert calls == ['p1']  # 保留有效 PDF，不为图片异常重复下载 PDF。
+    assert progress(args)['results']['image_failed'] == 1
+
+
 def test_exact_ids_and_model_aggregation_and_dry_run(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path, [product("p2"), product("p1"), product("p3", "DEF6500EV")])
     calls: list[str] = []

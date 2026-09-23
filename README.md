@@ -304,12 +304,16 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 | 退出码 | 含义 |
 | :---: | --- |
-| `0` | 全部成功，每条都是 PDF |
+| `0` | PDF 全部成功，详情页图片已下载或页面明确没有图片 |
 | `1` | 全失败——一份 PDF 都没拿到（含查询结果为空） |
-| `2` | 部分成功——已拿到 PDF，另有条目下载失败或返回的不是 PDF |
+| `2` | 部分成功——已拿到 PDF，另有 PDF 或图片下载异常 |
 
 接口未返回 PDF 属预期情形（保留同名 `.html` 供人工检查），因此不会让整批算作失败。
 `main.py fetch` 据此把退出码 2 视为成功，仅在结尾单独列出「部分成功」的车型。
+
+下载 PDF 后默认同时下载“产品型号 → 公告产品主要技术参数”详情页的全部原图，包括
+整车照片和选装拼图；`fetch`、`query --download`、`jianmian search --download` 及批量采集
+共用该行为。图片保存规则见下文“公告原图”；只查询、批量预览和已存在 PDF 的跳过路径不发起图片下载。
 
 ---
 
@@ -336,6 +340,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 ```bash
 .venv/bin/python main.py gonggao query --trademark "<商标>" --model-prefix <型号前缀> --latest-batch --download
+.venv/bin/python main.py gonggao query --model-code <完整型号> --latest-batch --images-only --vehicle-folder <车型>
 .venv/bin/python main.py gonggao changes --model-code <完整公告型号>
 .venv/bin/python main.py autohome --models "<车型名>" --browser-login --browser-fallback
 .venv/bin/python main.py autohome --capture-file /path/to/autohome_config.html
@@ -347,7 +352,8 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 **`gonggao query`**：`--trademark` 产品商标 / `--company` 企业 / `--model-code` 型号模糊匹配 /
 `--vehicle-name` 车辆名称 / `--pc` 批次 / `--model-prefix` 型号前缀（可重复）/
 `--exclude-model-prefix` 排除前缀（可重复）/ `--row-filter FIELD=VALUE` 任意字段后置筛选（可重复）/
-`--latest-batch` 仅保留最高批次 / `--all-pages` 拉取全部分页 / `--download` 下载 PDF /
+`--latest-batch` 仅保留最高批次 / `--all-pages` 拉取全部分页 / `--download` 下载 PDF 和原图 /
+`--images-only` 只补图片（与 `--download` 互斥）/
 `--detail-html` 同时保存技术参数 HTML / `--vehicle-folder` 指定下载目录名 / `--limit` 条数限制
 
 **`gonggao changes`**（只读，不下载）：`--company` 公示企业 / `--trademark` 公示商标 /
@@ -372,6 +378,28 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 `--browser-channel` / `--output-dir`
 
 </details>
+
+### 公告原图
+
+`miit_gonggao.images.download_product_images(row, output_dir)` 通过 `queryCpData` 取得正式详情，
+核对产品 ID、型号和批次，解析页面实际列出的 `getPic` 链接，不猜测连续照片编号。
+详情页返回的会话 Cookie 只在本次同源图片请求中使用，不写入日志或索引；所有请求仍走
+`core.http_request` 的串行节流和重试。图片必须通过 Pillow 解码，不能把验证 HTML 当作 JPEG。
+遇到访问验证页会停止该产品余下图片请求并记录失败，不自动处理验证码。
+
+图片位于 PDF 同批次目录的 `images/<型号>_<产品ID>/`，文件名包含官方照片名和 SHA-256，
+不覆盖历史原图。`manifest.json` 是本次结果，`manifest_<时间>.json` 保留各次结果；索引记录
+产品身份、来源 URL、相对目录、文件名、尺寸、字节数、哈希及逐图 `status/error`。
+`no_images` 表示核验通过的详情页没有图片，`failed/partial` 表示获取异常。
+原图中的多个选装局部通常是一张官方拼图，下载不拆图，也不凭照片序号推断配置类型。
+
+已有 PDF 可用 `query --images-only` 独立补图，目录参数沿用 `--output-dir/--vehicle-folder`，
+不重下 PDF、不改业务库收录状态。其退出码为 0（成功或明确无图）、1（图片全失败）、
+2（有图成功且有失败）。普通 `--download` 仍以 PDF 为主，图片异常报部分成功。
+`core.download_param_page` 返回 `ParameterPageDownload`，保留三项解包，并通过 `.images`
+提供图片结果。批量采集在原 `store_announcement` 中移交图片暂存文件，图片异常不回滚 PDF；
+`ingestion_runs.image_failures` 单列异常产品数，逐型号结果、固定清单日志及报告保留异常。
+已有 PDF 的跳过规则保持，新增能力不会自动补采全库历史图片。
 
 ---
 
@@ -693,6 +721,7 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 | `output/jianmian_by_category/全量.xlsx` | 减免税目录全量表（列结构与分类文件相同） |
 | `output/jianmian_by_category/<类别>.xlsx` | 减免税目录分类导出（6 个固定 xlsx） |
 | `downloads/announcement_site/<品牌>/<车型>/第<批次>批/*.pdf` | 工信部公告参数页 PDF；接口未返回 PDF 时保留同名 `.html` 供人工核查 |
+| `downloads/announcement_site/<品牌>/<车型>/第<批次>批/images/<型号>_<产品ID>/` | 详情页原图、当前及历次图片索引；原图名带内容哈希 |
 | `downloads/benchmark/<车型>.json` | 口碑与销量原始数据缓存（`report --offline` 复用） |
 | `downloads/announcement_site/_snapshots/query_*.json` / `manifest_*.json` | `gonggao query --download` 的查询快照与下载索引；索引含成功与失败两类条目（`status` 为 `ok`/`not_pdf`/`download_failed`）。网站批量采集用本项目 `gonggao collect`，统一登记 `data/announcement_site.sqlite`，保留独立的来源证据 |
 | `downloads/announcement_site/_revisions/` | 公告网站动态页面变更前的 PDF 快照；`manifest.json` 记录原始哈希、当前哈希、PDF 生成时间与字段差异，不参与主库分类或普通查询 |
@@ -731,6 +760,7 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 │   └── utils/                 # cleaners（含 build_export_filename）/ logger
 ├── miit_gonggao/
 │   ├── core.py                # 公告查询、参数页 PDF 下载、统一节流与重试
+│   ├── images.py              # 详情页原图、同源会话、图片校验与索引
 │   ├── jianmian.py            # 减免购置税/车船税目录抓取、解析、SQLite 与 Excel
 │   └── review_export.py       # 公告参数页 PDF 转公告参数 Excel
 ├── benchmark/                 # 竞品对标

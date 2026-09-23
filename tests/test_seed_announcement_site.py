@@ -19,6 +19,22 @@ def isolate_persistent_status(monkeypatch):
     monkeypatch.setattr(seed, "refresh_collection_status", lambda *_args, **_kwargs: None)
 
 
+def test_catalog_image_failures_keep_pdf_and_report_partial(tmp_path, monkeypatch):
+    def download(row, folder):
+        path = folder / 'product-407.pdf'
+        path.write_bytes(b'%PDF new')
+        return seed.core.ParameterPageDownload(path, True, path.stat().st_size,
+            {'failed': 1, 'downloaded': 0, 'status': 'failed', 'error': 'offline'})
+
+    code, db, _root = run_republished_ingestion(
+        monkeypatch, tmp_path, announcement_batch='409', download=download)
+    assert code == 2
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT image_failures,download_failures FROM ingestion_runs').fetchone() == (1, 0)
+        assert conn.execute('SELECT status FROM run_models').fetchone()[0] == 'partial'
+        assert conn.execute('SELECT is_pdf FROM documents').fetchone()[0] == 1
+
+
 def test_database_lock_resolves_legacy_symlink(tmp_path):
     target = tmp_path / "upstream.sqlite"
     target.touch()

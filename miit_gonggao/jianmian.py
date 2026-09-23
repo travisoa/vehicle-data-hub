@@ -1264,6 +1264,7 @@ def command_search(args: argparse.Namespace) -> int:
         errors: list[str] = []
         non_pdf: list[str] = []
         ok_pdf_count = 0
+        image_count = image_problems = 0
         for row in resolved:
             label = f"{row.get('cpsb', '')} {row.get('clxh', '')}".strip()
             folder = core.build_announcement_download_dir(
@@ -1273,7 +1274,8 @@ def command_search(args: argparse.Namespace) -> int:
                 batch=str(row.get("gppc") or row.get("pc") or ""),
             )
             try:
-                path, is_pdf, _ = core.download_param_page(row, folder)
+                downloaded = core.download_param_page(row, folder)
+                path, is_pdf, _ = downloaded
             except Exception as exc:  # noqa: BLE001
                 errors.append(label)
                 print(f"下载失败，跳过: {label} ({exc})", file=sys.stderr)
@@ -1283,6 +1285,11 @@ def command_search(args: argparse.Namespace) -> int:
                 ok_pdf_count += 1
             else:
                 non_pdf.append(label)
+            image_result = getattr(downloaded, "images", None)
+            if image_result is not None:
+                image_count += image_result["downloaded"]
+                image_problems += image_result["failed"]
+        print(f"图片汇总：成功 {image_count} 张，异常 {image_problems} 项。")
         if errors:
             print(f"以下 {len(errors)} 条下载失败: {'; '.join(errors)}", file=sys.stderr)
         if non_pdf:
@@ -1291,14 +1298,14 @@ def command_search(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         code = core.download_exit_code(
-            ok_pdf_count=ok_pdf_count, problem_count=len(errors) + len(non_pdf)
+            ok_pdf_count=ok_pdf_count, problem_count=len(errors) + len(non_pdf) + image_problems
         )
         if code == core.EXIT_DOWNLOAD_FAILED:
             print("没有成功下载任何 PDF。", file=sys.stderr)
         elif code == core.EXIT_DOWNLOAD_PARTIAL:
             print(
                 f"部分成功：已下载 {ok_pdf_count} 份 PDF，"
-                f"另有 {len(errors) + len(non_pdf)} 条需人工检查。",
+                f"另有 {len(errors) + len(non_pdf)} 条 PDF、{image_problems} 项图片需检查。",
                 file=sys.stderr,
             )
         return code
@@ -1481,7 +1488,7 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     search_parser = jm_sub.add_parser("search", help="按通用名称/型号/企业/商标检索目录库")
     search_parser.add_argument("keyword", help="检索词，例如 <市场名>")
     search_parser.add_argument("--resolve", action="store_true", help="用公告接口按型号反查商标与批次")
-    search_parser.add_argument("--download", action="store_true", help="反查后下载公告参数页 PDF（隐含 --resolve）")
+    search_parser.add_argument("--download", action="store_true", help="反查后下载公告 PDF 和详情页原图（隐含 --resolve）")
     search_parser.add_argument("--latest-batch", action="store_true", help="--resolve/--download 时只保留最高公告批次")
     search_parser.add_argument("--all-batches", action="store_true", help="下载全部历史批次（覆盖 --latest-batch）")
     search_parser.add_argument("--limit", type=core.positive_int, help="限制展示条数")

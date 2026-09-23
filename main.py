@@ -3,7 +3,7 @@
 
 用法：
     python3 main.py fetch <车型A> <车型B>            # 两个来源都抓
-    python3 main.py fetch <车型> --source gonggao    # 只下载工信部公告 PDF
+    python3 main.py fetch <车型> --source gonggao    # 下载工信部公告 PDF 和详情页原图
     python3 main.py fetch <车型> --source autohome   # 只抓汽车之家配置 Excel
     python3 main.py autohome --models "<车型>"       # 汽车之家配置抓取完整 CLI
     python3 main.py gonggao collect -f <型号名单>    # 批量下载并登记统一业务库
@@ -52,7 +52,7 @@ def split_vehicle_args(values: list[str]) -> list[str]:
 def build_fetch_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py fetch",
-        description="按车型需求同时下载汽车之家车型配置 Excel 和工信部公告参数页 PDF",
+        description="按车型需求下载汽车之家配置 Excel、工信部公告 PDF 和详情页原图",
     )
     parser.add_argument("vehicles", nargs="+", help="一个或多个车型名，可空格或逗号分隔")
     parser.add_argument(

@@ -135,7 +135,7 @@ def signal_handlers(stop: StopFlag):
 def local_document(conn: sqlite3.Connection, product_id: str, pdf_root: Path) -> tuple[str, str, int] | None:
     """只跳过实际文件有效的 PDF；已有 PDF 的解析问题保留供专项处理。"""
     row = conn.execute(
-        "SELECT d.relative_path,d.is_pdf,d.bytes,d.sha256,d.error,f.fields_json,f.parse_error "
+        "SELECT d.relative_path,d.is_pdf,d.bytes,d.sha256,d.error,f.fields_json,f.parse_error,a.raw_json "
         "FROM announcements a JOIN documents d ON d.announcement_id=a.id "
         "LEFT JOIN announcement_fields f ON f.announcement_id=a.id WHERE a.source_product_id=?",
         (product_id,),
@@ -160,6 +160,11 @@ def local_document(conn: sqlite3.Connection, product_id: str, pdf_root: Path) ->
         error = error or "已有有效 PDF 的解析字段 JSON 异常"
     if error:
         return "parse_failed", f"已有 PDF 解析问题，未重复下载：{error}", len(content)
+    from miit_gonggao.images import read_image_result
+
+    image_result = read_image_result(json.loads(row[7]), path.parent)
+    if image_result and image_result.get("failed"):
+        return "image_failed", "图片下载不完整：已有 PDF 有效，图片异常仍需补采", len(content)
     return "skipped_existing", "", len(content)
 
 
@@ -176,9 +181,8 @@ def vehicle_id(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
 
 
 def claim_run(conn: sqlite3.Connection, args: argparse.Namespace, manifest: dict[str, Any]) -> int:
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ingestion_runs'").fetchone():
-        seed.ensure_schema(conn)
-        conn.commit()
+    seed.ensure_schema(conn)
+    conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         unfinished = [r[0] for r in conn.execute("SELECT id FROM ingestion_runs WHERE completed_at IS NULL")]
@@ -319,7 +323,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                     status = "downloaded" if ok else failure_status(message)
                                     current = local_document(conn, row["cpid"], args.pdf_root)
                                     byte_count = current[2] if current else 0
-                                    if ok and (not current or current[0] != "skipped_existing"):
+                                    if ok and (not current or current[0] not in {"skipped_existing", "image_failed"}):
                                         status, message = "parse_failed", "下载返回成功但本地 PDF/解析校验未通过"
                                     conn.commit()
                                 except Exception as exc:
@@ -332,9 +336,14 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             processed += 1
                             model_processed += 1
                             counters[status] += 1
+                            image_failed = "图片下载不完整：" in message
+                            if image_failed:
+                                if status != "image_failed":
+                                    counters["image_failed"] += 1
+                                pace.slow_down("image_failed")
                             pdf_bytes += byte_count if status in SUCCESS else 0
                             downloaded_bytes += byte_count if status == "downloaded" else 0
-                            if status not in SUCCESS:
+                            if status not in SUCCESS or image_failed:
                                 errors.append(f"{row['cpid']}: {message}")
                                 print(f"[{processed}/{manifest['expected_products']}] {model} "
                                       f"{row['cpid']} {status}: {message}",
@@ -349,6 +358,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             record = {"run_id": run_id, "pid": os.getpid(), "at": seed.utc_now(), "cpid": row["cpid"],
                                       "model_code": model, "batch": str(row.get("gppc") or row.get("pc")),
                                       "status": status, "error": message, "bytes": byte_count,
+                                      "image_failed": image_failed,
                                       "attempted_download": attempted, "elapsed_seconds": round(elapsed, 3),
                                       "source_generation_error": source_error}
                             results.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -371,8 +381,10 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                     seed.finish_run(conn, run_id, {
                         "download_failures": counters["download_failed"], "non_pdf_documents": counters["non_pdf"],
                         "parse_failures": counters["parse_failed"], "publish_failures": counters["publish_failed"],
+                        "image_failures": counters["image_failed"],
                     }, stop.reason)
-                    all_successful = sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
+                    all_successful = (sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
+                                      and not counters["image_failed"])
                     state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
                     atomic_json(progress_path, progress(state))
                 finally:

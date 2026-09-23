@@ -97,6 +97,7 @@ def build_report(conn: sqlite3.Connection, run_id: int, catalog_db: Path) -> str
          run["download_failures"]],
         ["解析失败", run["parse_failures"] if parse_count is not None else "未单独记录"],
         ["发布失败", run["publish_failures"] if publish_count is not None else "未单独记录"],
+        ["图片异常产品", dict(run).get("image_failures") if dict(run).get("image_failures") is not None else "未单独记录"],
         ["非 PDF", run["non_pdf_documents"]],
     ])
 

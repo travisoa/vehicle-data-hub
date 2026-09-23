@@ -237,6 +237,22 @@ def has_valid_documents(conn: sqlite3.Connection, event: dict, pdf_root: Path) -
     return True
 
 
+def document_image_error(conn: sqlite3.Connection, event: dict, pdf_root: Path) -> str:
+    from miit_gonggao.images import read_image_result
+
+    for product_id, relative, _size, _is_pdf in matching_documents(conn, event):
+        if not relative:
+            continue
+        folder = (pdf_root / relative).resolve().parent
+        if not folder.is_relative_to(pdf_root.resolve()):
+            continue
+        raw = conn.execute("SELECT raw_json FROM announcements WHERE source_product_id=?", (product_id,)).fetchone()
+        result = read_image_result(json.loads(raw[0]), folder)
+        if result and result.get('failed'):
+            return '图片下载不完整：已有 PDF 有效，图片异常仍需补采'
+    return ''
+
+
 def latest_formal_batch(conn: sqlite3.Connection) -> int:
     actual = conn.execute('select coalesce(max(cast(batch as integer)),0) from batches').fetchone()[0]
     tracked = max((e['batch'] for e in events(conn) if e['kind'] == 'formal'), default=0)
@@ -341,8 +357,13 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     if row[1] == 'main' and row[2]), None)
     if conn.execute('select 1 from ingestion_runs where completed_at is null').fetchone():
         raise RuntimeError('存在未完成采集，不能另起一轮')
+    resolved_image_failures = 0
+    resolved_events = {event['event_id']: event for event in events(conn)} if plan['resolved'] else {}
     for event_id in plan['resolved']:
-        conn.execute("update tracking_events set status='done',last_error='' where event_id=?", (event_id,))
+        image_error = document_image_error(conn, resolved_events[event_id], pdf_root)
+        resolved_image_failures += bool(image_error)
+        conn.execute("update tracking_events set status=?,last_error=? where event_id=?",
+                     ('partial' if image_error else 'done', image_error, event_id))
     grouped: dict[tuple, list[dict]] = {}
     for event in plan['pending']:
         grouped.setdefault((event['model_code'], event['batch']), []).append(event)
@@ -351,14 +372,17 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         if plan['resolved']:
             seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
                                            reason="tracking_resolved")
-        return {'queries': 0, 'errors': 0}
+        result = {'queries': 0, 'errors': resolved_image_failures}
+        if resolved_image_failures:
+            result['image_failures'] = resolved_image_failures
+        return result
     run_id = conn.execute(
         'insert into ingestion_runs(started_at,selector_json,selected_models,parse_failures,publish_failures) '
         'values (?,?,?,0,0)', (utc_now(), json.dumps({'mode': 'recent_events', 'days': DAYS,
                                                    'batches': BATCHES}), len({key[0] for key in grouped})),
     ).lastrowid
     counts = dict(query_failures=0, download_failures=0, non_pdf_documents=0,
-                  parse_failures=0, publish_failures=0, awaiting_effective=0)
+                  parse_failures=0, publish_failures=0, awaiting_effective=0, image_failures=0)
     scope_counts = dict(scope_excluded=0, scope_review=0)
     checked = 0
     try:
@@ -403,7 +427,9 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     continue
                 probe = {**group[0], 'product_id': str(row['cpid'])}
                 if has_valid_documents(conn, probe, pdf_root):
-                    results[str(row['cpid'])] = (True, '')
+                    image_error = document_image_error(conn, probe, pdf_root)
+                    counts['image_failures'] += bool(image_error)
+                    results[str(row['cpid'])] = (True, image_error)
                     continue
                 ok, message = seed.store_announcement(
                     conn, row=row, vehicle_id=vehicle_id, market_name=model,
@@ -411,6 +437,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     pdf_root=pdf_root, catalog_db=catalog_db,
                 )
                 results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message)
+                if '图片下载不完整：' in message:
+                    counts['image_failures'] += 1
                 if not ok:
                     key = ('parse_failures' if message.startswith('解析失败') else
                            'download_failures' if message.startswith('下载失败') else
@@ -424,9 +452,10 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                 if status != 'query_failed':
                     if not selected:
                         event_status = 'no_match'
-                    elif all(ok for ok, _ in selected):
+                    elif all(ok for ok, _ in selected) and not any('图片下载不完整：' in msg for _, msg in selected):
                         event_status = 'done'
-                    elif all(msg.startswith('接口返回非 PDF') for ok, msg in selected if not ok):
+                    elif any(not ok for ok, _ in selected) and all(
+                            msg.startswith('接口返回非 PDF') for ok, msg in selected if not ok):
                         event_status = 'no_document'
                     else:
                         event_status = 'partial'
@@ -458,8 +487,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         finally:
             seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
                                            run_id=run_id, reason="tracking_collection")
-    errors = (sum(counts[k] for k in ('query_failures', 'download_failures', 'publish_failures'))
-              + sum(scope_counts.values()))
+    errors = (sum(counts[k] for k in ('query_failures', 'download_failures', 'publish_failures', 'image_failures'))
+              + sum(scope_counts.values()) + resolved_image_failures)
     return {'run_id': run_id, 'queries': checked, 'errors': errors, **counts, **scope_counts}
 
 
