@@ -426,6 +426,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
 | 提速 | `gonggao collect` 各模式与固定清单共用 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
+| 本地 PDF 旧解析结果修复 | `gonggao reparse --layout converted_vehicle` | 默认只读预览；`--apply` 写回解析字段，不下载、不改 PDF 或文档登记 |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
 
@@ -487,6 +488,20 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 `gonggao query --download` 继续支持临时查询与文件下载，保留原 CLI 输出/退出码契约；
 其 `manifest_*.json` 是原始查询下载证据。网站批量采集应使用 `gonggao collect`，
 不要用临时查询下载代替业务库登记。
+
+### 存量解析字段修复
+
+`main.py gonggao reparse --layout converted_vehicle` 修复尚未标记改装车版式的库存记录：
+用当前解析器读取本地 PDF，只有重新识别为该版式且文件哈希与登记一致才形成差异。
+这不是强制重解析已标记记录的通用入口。默认预览；已授权写回时加 `--apply`，
+可用 `--limit N` 限制实际修改条数，`--workers N` 控制本地解析进程数。
+
+写回沿用采集排他锁，有未完成采集时拒绝执行；只替换 `announcement_fields` 的 PDF 解析键，
+目录补充的续驶里程、电池参数等原样保留。解析失败、文件缺失或哈希不符的记录不覆盖旧值。
+执行前把原始字段、解析错误及文档哈希保存在 `var/runs/<时间>-reparse-<版式>/changes.jsonl`；
+留档失败不会改库，计划后字段或文档登记改变则整批回滚。`summary.json` 的 `phase=prepared`
+表示已保存计划但结果未确认，`completed` 才包含已提交条数；中断后先读回业务库确认，勿把准备阶段当成功。
+写回成功后统一刷新一次收录统计。PDF 原件、图片与文档登记保持不变。
 
 ### 下载记录与数据目录
 
