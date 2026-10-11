@@ -381,6 +381,12 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 ### 公告原图
 
+**执行授权**：单独下载公告照片、补图或重试历史图片，须用户明确指令，不主动执行。
+仅要求公告或参数页 PDF 时，使用 `gonggao collect`、`collection_tracking collect` 或
+`gonggao query --download` 并加 `--no-images`。`fetch`、`jianmian search --download`
+默认同时取图且没有关闭图片参数，未获图片授权时应先查询/反查型号，再转上述 PDF 入口。
+下文描述图片功能及程序默认行为，不构成图片下载授权。
+
 `miit_gonggao.images.download_product_images(row, output_dir)` 通过 `queryCpData` 取得正式详情，
 核对产品 ID、型号和批次，只收页面实际列出的同源 `getPic` 照片链接，不猜测连续照片编号；
 页面上的标志、装饰图等其他图片直接略过，`getPic` 链接的产品身份不符时整页拒绝。
