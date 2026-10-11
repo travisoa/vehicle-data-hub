@@ -227,6 +227,147 @@ def test_republished_refresh_stops_when_the_interface_batch_is_lower(monkeypatch
     assert list((upstream_root / "downloads" / "announcement_site" / "_snapshots").glob("*.json"))
 
 
+@pytest.mark.parametrize("candidate_batch", [None, "408", "409"])
+def test_republished_from_status_only_collects_the_selected_product_id(
+    monkeypatch, tmp_path: Path, candidate_batch: str | None
+):
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    download_root = upstream_root / "downloads" / "announcement_site"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    candidate = {
+        "product_id": "product-407", "model_code": "ABC6500EV", "company": "示例汽车有限公司",
+        "trademark": "示例牌", "product_name": "多用途乘用车",
+        "republished_batch": 409, "local_batch": 407,
+    }
+    monkeypatch.setattr(seed.republished, "from_status", lambda *_args, **_kwargs:
+                        seed.republished.RepublishedSource(
+                            origin="status", rows=[candidate], batches=[409], generation="fixture"))
+    api_rows = [{"clxh": "ABC6500EV", "cpid": "sibling-product", "gppc": "410"}]
+    if candidate_batch is not None:
+        api_rows.insert(0, {"clxh": "ABC6500EV", "cpid": "product-407", "gppc": candidate_batch})
+    monkeypatch.setattr(seed.core, "query_all_pages", lambda **_kwargs: api_rows)
+    collected: list[dict] = []
+    monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
+                        collected.append(kwargs["row"]) or (True, ""))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-from-status", "--no-images", "--no-report",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(download_root),
+    ])
+
+    assert seed.main() == (0 if candidate_batch == "409" else 2)
+    assert [row["cpid"] for row in collected] == (["product-407"] if candidate_batch == "409" else [])
+    if collected:
+        assert collected[0]["_republished"]["product_id"] == "product-407"
+    with sqlite3.connect(site_db) as conn:
+        assert conn.execute("SELECT awaiting_effective FROM ingestion_runs").fetchone()[0] == (
+            0 if candidate_batch == "409" else 1
+        )
+        assert conn.execute("SELECT status FROM run_models").fetchone()[0] == (
+            "done" if candidate_batch == "409" else "awaiting_effective"
+        )
+
+
+def test_republished_from_status_queries_the_recorded_batch(monkeypatch, tmp_path: Path):
+    """无批次型号查询只给旧版时，仍要取得清单所指的正式重发批次。"""
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root, batch="380", product_id="selected")
+    candidate = {
+        "product_id": "selected", "model_code": "ABC6500EV", "company": "示例汽车有限公司",
+        "trademark": "示例牌", "product_name": "多用途乘用车",
+        "republished_batch": 382, "local_batch": 380,
+    }
+    monkeypatch.setattr(seed.republished, "from_status", lambda *_args, **_kwargs:
+                        seed.republished.RepublishedSource(
+                            origin="status", rows=[candidate], batches=[382], generation="fixture"))
+    calls: list[str] = []
+
+    def query(*, model_code: str, page_size: int, pc: str = "") -> list[dict]:
+        assert model_code == "ABC6500EV" and page_size == 50
+        calls.append(pc)
+        if not pc:
+            return [{"clxh": model_code, "cpid": "selected", "gppc": "380"}]
+        assert pc == "382"
+        return [
+            {"clxh": model_code, "cpid": "selected", "gppc": "382"},
+            {"clxh": model_code, "cpid": "sibling", "gppc": "382"},
+        ]
+
+    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    collected: list[dict] = []
+    monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
+                        collected.append(kwargs["row"]) or (True, ""))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-from-status", "--no-images", "--no-report",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+
+    assert seed.main() == 0
+    assert calls == ["382"]
+    assert [(row["cpid"], row["gppc"]) for row in collected] == [("selected", "382")]
+
+
+def test_republished_batch_queries_union_and_dedupe_rows(monkeypatch):
+    calls: list[str] = []
+
+    def query(*, model_code: str, pc: str, page_size: int) -> list[dict]:
+        assert model_code == "ABC6500EV" and page_size == 50
+        calls.append(pc)
+        repeated = {"clxh": model_code, "cpid": "selected-a", "gppc": "382"}
+        return [repeated] if pc == "382" else [repeated, {"clxh": model_code, "cpid": "selected-b", "gppc": "383"}]
+
+    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    rows = seed.query_republished_candidate_batches("ABC6500EV", [
+        {"republished_batch": 383}, {"republished_batch": 382}, {"republished_batch": 382},
+    ])
+    assert calls == ["382", "383"]
+    assert [(row["cpid"], row["gppc"]) for row in rows] == [
+        ("selected-a", "382"), ("selected-b", "383")
+    ]
+
+
+def test_model_list_collection_keeps_the_unscoped_batch_query(monkeypatch, tmp_path: Path):
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", tmp_path)
+    models = tmp_path / "models.txt"
+    models.write_text("ABC6500EV\n", encoding="utf-8")
+    calls: list[dict] = []
+    monkeypatch.setattr(seed.core, "query_all_pages", lambda **kwargs:
+                        calls.append(kwargs) or [])
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "-f", str(models), "--no-report",
+        "--catalog-db", str(catalog_db), "--site-db", str(tmp_path / "site.sqlite"),
+        "--download-root", str(tmp_path / "downloads"),
+    ])
+
+    assert seed.main() == 0
+    assert calls == [{"model_code": "ABC6500EV", "page_size": 50}]
+
+
+def test_republished_rows_for_one_model_keep_each_selected_product_id():
+    candidates = [
+        {"product_id": "selected-a", "republished_batch": 409, "local_batch": 407},
+        {"product_id": "selected-b", "republished_batch": 409, "local_batch": 407},
+    ]
+    rows, unresolved = seed.select_republished_product_rows(
+        [
+            {"cpid": "selected-a", "gppc": "409"},
+            {"cpid": "selected-b", "gppc": "408"},
+            {"cpid": "sibling-product", "gppc": "410"},
+        ],
+        candidates,
+    )
+    assert [row["cpid"] for row in rows] == ["selected-a"]
+    assert len(unresolved) == 1 and "selected-b" in unresolved[0]
+
+
 def test_republished_refresh_ingests_the_new_batch_and_records_provenance(monkeypatch, tmp_path: Path):
     def fake_download(_row, folder: Path):
         folder.mkdir(parents=True, exist_ok=True)
@@ -366,6 +507,83 @@ def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkey
     assert payload["total"] == 1 and payload["total_candidates"] == 2
     assert [row["product_id"] for row in payload["rows"]] == ["product-407"]
     assert len(payload["selected_models"]) == 1
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_republished_offset_selects_exact_later_product_and_audits_it(
+    monkeypatch, tmp_path: Path, dry_run: bool
+):
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    seed_local_announcement(site_db, upstream_root, product_id="product-407b", model_code="ABC6500EV2")
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409,
+                      extra=(("product-407b", "ABC6500EV2"),))
+    queries: list[dict] = []
+
+    def query(**kwargs):
+        queries.append(kwargs)
+        if dry_run:
+            pytest.fail("预演不得查询官方接口")
+        return [{"clxh": "ABC6500EV2", "cpid": "product-407b", "gppc": "409"}]
+
+    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    collected: list[str] = []
+    monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
+                        collected.append(kwargs["row"]["cpid"]) or (True, ""))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-batch", "409", "--offset", "1",
+        "--limit", "1", "--no-report", *(["--dry-run"] if dry_run else []),
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+
+    assert seed.main() == 0
+    snapshots = list((upstream_root / "downloads" / "announcement_site" /
+                      seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
+    assert len(snapshots) == 1
+    payload = json.loads(snapshots[0].read_text(encoding="utf-8"))
+    assert "_offset1_limit1_" in snapshots[0].name
+    assert (payload["total"], payload["total_candidates"], payload["offset"], payload["limit"]) == (
+        1, 2, 1, 1
+    )
+    assert payload["selected_product_ids"] == ["product-407b"]
+    assert [row["product_id"] for row in payload["rows"]] == ["product-407b"]
+    assert [row["model_code"] for row in payload["selected_models"]] == ["ABC6500EV2"]
+    assert queries == ([] if dry_run else [{"model_code": "ABC6500EV2", "pc": "409", "page_size": 50}])
+    assert collected == ([] if dry_run else ["product-407b"])
+    with sqlite3.connect(site_db) as conn:
+        selectors = [json.loads(row[0]) for row in conn.execute("SELECT selector_json FROM ingestion_runs")]
+    if dry_run:
+        assert selectors == []
+    else:
+        assert len(selectors) == 1
+        assert selectors[0]["republished"]["selected_product_ids"] == ["product-407b"]
+        assert selectors[0]["republished"]["selection_snapshot"] == str(snapshots[0])
+
+
+def test_republished_offset_past_the_candidate_pool_stops_before_snapshot(monkeypatch, tmp_path: Path):
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    upstream_root = tmp_path / "vehicle-data-hub"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
+    seed_local_announcement(site_db, upstream_root)
+    write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
+    monkeypatch.setattr(seed.core, "query_all_pages",
+                        lambda **_kwargs: pytest.fail("越界 offset 不得查询官方接口"))
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "--republished-batch", "409", "--offset", "1",
+        "--limit", "1", "--dry-run", "--catalog-db", str(catalog_db),
+        "--site-db", str(site_db),
+        "--download-root", str(upstream_root / "downloads" / "announcement_site"),
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        seed.main()
+    assert not list((upstream_root / "downloads" / "announcement_site" /
+                     seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
 
 
 def test_republished_refresh_keeps_the_existing_catalog_identity(tmp_path: Path):

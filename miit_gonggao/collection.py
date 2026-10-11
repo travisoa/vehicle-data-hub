@@ -484,6 +484,59 @@ def batch_is_at_least(actual: str, expected: str) -> bool:
     return bool(actual and expected and actual == expected)
 
 
+def select_republished_product_rows(
+    rows: list[dict[str, Any]], candidates: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """只采集清单中的产品 ID，并逐产品核实当前正式批次。"""
+    selected: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    for candidate in candidates:
+        product_id = str(candidate["product_id"]).strip()
+        matching = [row for row in rows if str(row.get("cpid") or "").strip() == product_id]
+        expected_batch = str(candidate["republished_batch"])
+        if not matching:
+            unresolved.append(
+                f"记录第{expected_batch}批重新发布，正式接口现在查不到产品 ID {product_id}"
+            )
+            continue
+        latest = core.filter_latest_batch(matching)[0]
+        actual_batch = str(latest.get("gppc") or latest.get("pc") or "")
+        if not batch_is_at_least(actual_batch, expected_batch):
+            unresolved.append(
+                f"产品 ID {product_id} 记录第{expected_batch}批，"
+                f"正式接口当前最高为第{actual_batch or '未知'}批"
+            )
+            continue
+        selected.append({
+            **latest,
+            "_republished": {
+                "recorded_batch": expected_batch,
+                "local_batch": str(candidate["local_batch"]),
+                "product_id": product_id,
+                "company": str(candidate.get("company") or ""),
+                "trademark": str(candidate.get("trademark") or ""),
+                "product_name": str(candidate.get("product_name") or ""),
+            },
+        })
+    return selected, unresolved
+
+
+def query_republished_candidate_batches(
+    model_code: str, candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """按清单的正式批次查询，避免无批次型号查询只返回旧版。"""
+    rows_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for batch in sorted({int(row["republished_batch"]) for row in candidates}):
+        for row in core.query_all_pages(model_code=model_code, pc=str(batch), page_size=50):
+            identity = (
+                str(row.get("clxh") or "").strip().upper(),
+                str(row.get("cpid") or "").strip(),
+                str(row.get("gppc") or row.get("pc") or "").strip(),
+            )
+            rows_by_identity.setdefault(identity, row)
+    return list(rows_by_identity.values())
+
+
 def write_republished_snapshot(
     source: republished.RepublishedSource,
     *,
@@ -493,8 +546,10 @@ def write_republished_snapshot(
 ) -> Path:
     snapshot_dir = output_root / core.ANNOUNCEMENT_SNAPSHOT_DIRNAME
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = snapshot_dir / f"republished_seed_{safe_part(source.snapshot_scope())}_{stamp}.json"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    scope = safe_part(source.snapshot_scope())
+    limit = source.selection_limit if source.selection_limit is not None else "all"
+    path = snapshot_dir / f"republished_seed_{scope}_offset{source.selection_offset}_limit{limit}_{stamp}.json"
     path.write_text(
         json.dumps(
             {
@@ -507,6 +562,9 @@ def write_republished_snapshot(
                 },
                 "total": len(source.rows),
                 "total_candidates": source.candidate_total,
+                "offset": source.selection_offset,
+                "limit": source.selection_limit,
+                "selected_product_ids": [row["product_id"] for row in source.rows],
                 "rows": source.rows,
                 "selected_models": selected,
                 **({"verification": {
@@ -783,7 +841,8 @@ def catalog_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="跳过网站数据库中已经处理过的公告型号，避免跨目录批次重复采集",
     )
-    parser.add_argument("--offset", type=int, default=0, help="跳过候选池开头的型号数，用于续跑下一批")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="跳过候选池开头的型号数；正式发布重发模式按候选产品计")
     parser.add_argument(
         "-f", "--from-file", type=Path,
         help="按型号清单采集（一行一个车辆型号，# 开头为注释）；"
@@ -875,6 +934,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("--verify 只在 --dry-run 下可用；实际采集本身就会核实接口批次")
 
     republished_source: republished.RepublishedSource | None = None
+    republished_by_model: dict[str, list[dict[str, Any]]] = {}
     if republish_mode:
         try:
             if args.republished_from_status:
@@ -890,7 +950,13 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 )
         except republished.RepublishedError as exc:
             parser.error(str(exc))
-        republished_source = republished_source.limited(args.limit)
+        republished_source = republished_source.limited(args.limit, offset=args.offset)
+        if not republished_source.rows:
+            parser.error(
+                f"跳过前 {args.offset} 个后没有重发候选；候选共 {republished_source.candidate_total} 个"
+            )
+        for row in republished_source.rows:
+            republished_by_model.setdefault(str(row["model_code"]).upper(), []).append(row)
         for note in republished_source.notes:
             print(f"说明：{note}", flush=True)
         selected = select_republished_models(
@@ -986,6 +1052,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             "stale_batches": republished_source.stale_batches,
             "total": len(republished_source.rows),
             "total_candidates": republished_source.candidate_total,
+            "selection_snapshot": str(selection_path),
+            "selected_product_ids": [row["product_id"] for row in republished_source.rows],
         }
     cursor = conn.execute(
         "INSERT INTO ingestion_runs(started_at, selector_json, selected_models, parse_failures, publish_failures) "
@@ -1009,7 +1077,12 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 begin_model(conn, run_id, index, vehicle_id)
                 print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
                 try:
-                    rows = core.query_all_pages(model_code=item["model_code"], page_size=50)
+                    if republish_mode:
+                        rows = query_republished_candidate_batches(
+                            item["model_code"], republished_by_model[item["model_code"].upper()]
+                        )
+                    else:
+                        rows = core.query_all_pages(model_code=item["model_code"], page_size=50)
                     rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
                 except Exception as exc:
                     query_failures += 1
@@ -1044,41 +1117,25 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                     print("  公告接口未找到精确型号。", flush=True)
                     continue
 
+                unresolved: list[str] = []
                 if republish_mode:
-                    rows = core.filter_latest_batch(rows)
-                    actual_batch = str(rows[0].get("gppc") or rows[0].get("pc") or "")
-                    expected_batch = item["republished_batch"]
-                    if not batch_is_at_least(actual_batch, expected_batch):
-                        # 清单来自正式发布记录，接口批次反而更低说明记录已与源不符，
-                        # 不能拿更旧的一版覆盖本地已有参数页。
+                    rows, unresolved = select_republished_product_rows(
+                        rows, republished_by_model[item["model_code"].upper()]
+                    )
+                    if unresolved:
                         awaiting_effective += 1
-                        message = (
-                            f"记录第{expected_batch}批，正式接口当前最高为第{actual_batch or '未知'}批"
-                        )
-                        conn.execute(
-                            "UPDATE run_models SET status='awaiting_effective', error=? "
-                            "WHERE run_id=? AND vehicle_id=?",
-                            (message, run_id, vehicle_id),
-                        )
-                        conn.commit()
-                        print(f"  接口与记录不一致：{message}", flush=True)
-                        continue
-                    rows = [
-                        {
-                            **row,
-                            "_republished": {
-                                "recorded_batch": expected_batch,
-                                "local_batch": item["local_batch"],
-                                "product_id": item["republished_product_id"],
-                                "company": item["republished_company"],
-                                "trademark": item["republished_trademark"],
-                                "product_name": item["republished_product_name"],
-                            },
-                        }
-                        for row in rows
-                    ]
+                        if not rows:
+                            message = "; ".join(unresolved)
+                            conn.execute(
+                                "UPDATE run_models SET status='awaiting_effective', error=? "
+                                "WHERE run_id=? AND vehicle_id=?",
+                                (message, run_id, vehicle_id),
+                            )
+                            conn.commit()
+                            print(f"  接口与记录不一致：{message}", flush=True)
+                            continue
 
-                errors: list[str] = []
+                errors: list[str] = unresolved.copy()
                 model_pdf_count = 0
                 for row in rows:
                     announcement_count += 1

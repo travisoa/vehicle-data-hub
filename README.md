@@ -157,7 +157,7 @@ output/对标报告_&lt;本品&gt;_20260823_160241.html
 <tbody>
 <tr><td nowrap width="1%"><strong>公告查询</strong></td><td>按商标、企业、车辆型号、名称与批次组合筛选；支持型号前缀的<strong>包含与排除</strong>（<code>--model-prefix</code> / <code>--exclude-model-prefix</code>）及任意字段后置筛选（<code>--row-filter</code>）</td></tr>
 <tr><td nowrap width="1%"><strong>变更扩展公示</strong></td><td><code>gonggao changes</code> 按公示企业、商标、产品名称或产品型号<strong>只读</strong>查询工信部变更扩展清单，供提前了解尚未正式发布的变更。公示不下载、不入库、不作为任何采集入口；公示批次与正式公告批次不强制相同。</td></tr>
-<tr><td nowrap width="1%"><strong>正式发布重发刷新</strong></td><td><code>gonggao collect --republished-from-status</code>（或 <code>--republished-batch &lt;批次&gt;</code>）按<strong>正式公告</strong>的重新发布记录刷新已有参数页：同一产品 ID 在更高正式批次再次出现即为变更扩展或勘误重发。前者读已落盘的收录统计记录、不重算，只收 PDF 已解析的产品；后者按批次枚举缓存现算，只要求本地有有效 PDF，因此已下载但解析失败的重发只有后者会选中。两者都排除底盘等非整车。</td></tr>
+<tr><td nowrap width="1%"><strong>正式发布重发刷新</strong></td><td><code>gonggao collect --republished-from-status</code>（或 <code>--republished-batch &lt;批次&gt;</code>）按<strong>正式公告</strong>的重新发布记录刷新已有参数页：同一产品 ID 在更高正式批次再次出现即为变更扩展或勘误重发。前者读已落盘的收录统计记录、不重算，只收 PDF 已解析的产品；后者按批次枚举缓存现算，只要求本地有有效 PDF，因此已下载但解析失败的重发只有后者会选中。实际采集按候选批次和型号查询，只下载清单中的产品 ID，并核对该产品批次；两者都排除底盘等非整车。</td></tr>
 <tr><td nowrap width="1%"><strong>参数页下载</strong></td><td><code>--download</code> 下载参数页 PDF 至 <code>downloads/announcement_site/&lt;品牌&gt;/&lt;车型&gt;/第&lt;批次&gt;批/</code>；查询快照与下载索引存入 <code>_snapshots/</code>；按 <code>%PDF</code> 头校验，非 PDF 时保留 <code>.html</code> 供人工核查；单条失败仅跳过并在结尾汇总，<strong>不中断整批</strong></td></tr>
 <tr><td nowrap width="1%"><strong>动态修订归档</strong></td><td>公告网站的参数页 PDF 由查询接口动态生成。同一产品 ID 后续返回的字段或批次发生变化时，当前版本留在主目录，旧快照归入 <code>downloads/announcement_site/_revisions/</code> 并在 <code>manifest.json</code> 记录哈希、PDF 生成时间、身份字段及差异；历史快照不参与普通车型查询和分类索引。</td></tr>
 <tr><td nowrap width="1%"><strong>目录反查</strong></td><td><code>jianmian search &lt;市场名&gt;</code> 以通用名称反查公告型号与商标；<code>--resolve</code> 经公告接口确认，<code>--download</code> 直接下载参数页</td></tr>
@@ -422,7 +422,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 目录或型号名单采集 | `gonggao collect` 的目录参数或 `-f` | 会查询同型号所有正式批次；不是固定批次下载 |
 | 已核验汽车整车产品 ID | `gonggao collect --manifest ...` | 只处理冻结清单；新能源 scope 仅收新能源，通用 scope 的非新能源/未知仅 408/409 批 |
 | 近期正式公告 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
-| 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 只刷新本地已有有效参数页且被更高正式批次重发的整车；公示不作为来源；`--dry-run` 只出清单不下载 |
+| 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 按候选正式批次查询，只下载清单产品 ID；`--offset` 后接 `--limit` 可抽取候选产品，快照记录实际 ID；公示不作为来源；`--dry-run` 只出清单不下载 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
 | 提速 | `gonggao collect` 各模式与固定清单共用 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |

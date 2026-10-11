@@ -41,21 +41,29 @@ class RepublishedSource:
     stale_batches: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     total_candidates: int | None = None
+    selection_offset: int = 0
+    selection_limit: int | None = None
 
     @property
     def candidate_total(self) -> int:
         """未截断前的候选产品总数；截断后仍用它说明本轮之外还剩多少。"""
         return len(self.rows) if self.total_candidates is None else self.total_candidates
 
-    def limited(self, limit: int | None) -> "RepublishedSource":
-        """按 --limit 截断本轮清单，让快照、统计与实际处理范围出自同一份 rows。"""
-        if limit is None or limit >= len(self.rows):
+    def limited(self, limit: int | None, *, offset: int = 0) -> "RepublishedSource":
+        """先跳过候选，再限制本轮产品数；保留完整候选数供快照审计。"""
+        if offset == 0 and (limit is None or limit >= len(self.rows)):
             return self
-        remaining = len(self.rows) - limit
+        selected = self.rows[offset:offset + limit if limit is not None else None]
+        notes = list(self.notes)
+        if offset:
+            notes.append(f"本轮按 --offset {offset} 跳过前 {min(offset, len(self.rows))} 个候选产品。")
+        if limit is not None and limit < len(self.rows) - offset:
+            remaining = len(self.rows) - offset - len(selected)
+            notes.append(f"本轮按 --limit {limit} 只处理接下来 {len(selected)} 个候选产品，"
+                         f"其余 {remaining} 个留待后续轮次。")
         return replace(
-            self, rows=self.rows[:limit], total_candidates=self.candidate_total,
-            notes=[*self.notes, f"本轮按 --limit {limit} 只处理前 {limit} 个候选产品，"
-                                f"其余 {remaining} 个留待后续轮次。"])
+            self, rows=selected, total_candidates=self.candidate_total,
+            selection_offset=offset, selection_limit=limit, notes=notes)
 
     @property
     def label(self) -> str:

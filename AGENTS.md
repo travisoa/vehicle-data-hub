@@ -105,13 +105,13 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   两者的重发判据都是同一产品 ID 在更高正式批次再次出现，但本地侧门槛不同：
   `--republished-from-status` 只收 PDF 已解析的产品，`--republished-batch` 只要求有有效 PDF，
   所以已下载但解析失败的重发只有后者会选中，前者把它留在统计的 `pdf_unparsed` 候选里。
-  正式接口批次低于记录批次时该型号记 `awaiting_effective` 并跳过，绝不用更旧的一版覆盖本地已有参数页。
-  `--limit` 在该模式下按候选产品计数，去重后型号数可能更少；`--dry-run` 的统计与快照都按本轮清单输出。
-- 批次枚举与按型号查询是两个官方接口，口径不一定一致：缓存把产品列进更高批次，不等于查询
-  接口认那一批是当前有效版本。`--dry-run --verify` 按型号只读核实清单，分出 `confirmed`
-  （真重发）/`stale_record`（接口批次更低）/`missing`（查不到精确型号）/`failed`（未核实），
-  结果并入同一份清单快照。实际采集时 `batch_is_at_least` 已逐条核实，所以 `--verify` 只在
-  `--dry-run` 下可用。
+  实际采集按清单批次和型号查询，只下载清单中的产品 ID；所选产品 ID 查不到或接口批次低于记录批次时
+  记 `awaiting_effective`，不能用同型号其他产品或更旧版本代替。
+  `--offset` 先按候选产品跳过，`--limit` 再限制本轮产品数，去重后型号数可能更少；
+  快照记录完整候选数、跳过数量及本轮产品 ID，`--dry-run` 与实际采集使用相同的清单切片。
+- 批次枚举与查询接口口径不一定一致；无批次型号查询也可能只返回旧版。
+  `--dry-run --verify` 使用无批次型号查询做只读预检，分出 `confirmed`/`stale_record`/`missing`/`failed`，
+  结果并入清单快照，不能替代实际采集时按批次和产品 ID 的核实；`--verify` 只在 `--dry-run` 下可用。
 - 事件消费端只认 `kind='formal'`。旧库里遗留的 `new_notice`/`change_notice` 行原样保留在
   `tracking_events`，但不进重试计划（`plan` 把它们单列为 `legacy_notice`），Website 构库也会跳过
   并记入 `tracking_non_formal_skipped`。不得删除源库历史来"解决"这个问题。
