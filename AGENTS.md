@@ -9,6 +9,8 @@
 - **汽车之家**（`autohome_cc/`）：按车型名抓配置，导出 Excel 对比表到 `output/`（含「配置分析」差异透视 sheet）
 - **工信部公告**（`miit_gonggao/`）：按商标/型号前缀查公告，下载参数页 PDF 和详情页原图到 `downloads/announcement_site/<品牌>/<车型>/<批次>/`；`review_export.py` 可把参数页 PDF 转成公告参数 Excel
 
+领域术语见 `GLOSSARY.md`。它也是 Website 共享业务术语的唯一定义处，术语变化时同步检查 Website 的 `GLOSSARY.md`。
+
 ## 与 Website 项目的边界
 
 数据流单向：本项目 → Website，不存在反向依赖。判断一处改动是否越界，只问一句：**它读写的资产，唯一写入方是谁？**
