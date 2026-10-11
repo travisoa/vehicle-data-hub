@@ -115,7 +115,9 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   结果并入清单快照，不能替代实际采集时按批次和产品 ID 的核实；`--verify` 只在 `--dry-run` 下可用。
 - 事件消费端只认 `kind='formal'`。旧库里遗留的 `new_notice`/`change_notice` 行原样保留在
   `tracking_events`，但不进重试计划（`plan` 把它们单列为 `legacy_notice`），Website 构库也会跳过
-  并记入 `tracking_non_formal_skipped`。不得删除源库历史来"解决"这个问题。
+  并记入 `tracking_non_formal_skipped`。近期事件的 `plan`/`collect` 可用 `--batch` 只处理指定正式批次；
+  未指定时沿用最近两批。处理精确事件清单用重复 `--event-id`，新能源范围同时用 `--nev-only`；
+  不得删除源库历史来"解决"这个问题。
 - 能力不足时，先定位缺少的参数、候选选择或恢复能力，在既有 `collection*.py` 中扩展。
   可按职责拆分内部策略模块，但必须接入原入口，复用 `store_announcement`、锁、解析、
   状态收尾和权威业务库；内部拆分不构成新增一套采集器的理由。

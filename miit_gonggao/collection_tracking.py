@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import closing, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -282,15 +283,37 @@ class RetryPlan(dict):
 
 
 def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None = None,
-               limit: int = 400) -> dict:
+               limit: int = 400, batch: int | None = None,
+               event_ids: Iterable[str] | None = None, nev_only: bool = False) -> dict:
     today = today or date.today()
     data_version = conn.execute('pragma data_version').fetchone()[0]
     maximum = latest_formal_batch(conn)
+    all_events = events(conn)
+    selected_ids = None
+    if event_ids is not None:
+        if isinstance(event_ids, str):
+            raise ValueError('事件 ID 必须以列表提供')
+        selected_ids = set(event_ids)
+        if not selected_ids or any(not isinstance(value, str) or not value for value in selected_ids):
+            raise ValueError('事件 ID 清单必须包含有效 ID')
+        by_id = {event['event_id']: event for event in all_events}
+        if unknown := selected_ids - by_id.keys():
+            raise ValueError('事件 ID 不存在: ' + ', '.join(sorted(unknown)))
+        for event_id in sorted(selected_ids):
+            event = by_id[event_id]
+            if event['kind'] != 'formal':
+                raise ValueError(f'事件不是正式公告: {event_id}')
+            if batch is not None and event['batch'] != batch:
+                raise ValueError(f'事件批次与 --batch 不符: {event_id} / {event["batch"]}')
     pending, dormant, resolved, deferred, remaining = [], [], [], [], []
     excluded, scope_review, legacy_notice = [], [], []
     groups: set[tuple] = set()
     evidence = scope_evidence(conn)
-    for event in sorted(events(conn), key=lambda e: (e['last_checked_at'] or '', e['event_id'])):
+    for event in sorted(all_events, key=lambda e: (e['last_checked_at'] or '', e['event_id'])):
+        if selected_ids is not None and event['event_id'] not in selected_ids:
+            continue
+        if batch is not None and event['batch'] != batch:
+            continue
         if event['kind'] != 'formal':
             # 公示不再登记，但旧库里可能留着 new_notice/change_notice 行。它们不是正式发布，
             # 不能驱动查询和下载；历史保留在源库，只是不进计划。
@@ -316,7 +339,10 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
             continue
         groups.add(key)
         pending.append(event)
-    return RetryPlan({'latest_batch': maximum, 'days': DAYS, 'batches': BATCHES,
+    return RetryPlan({'latest_batch': maximum, 'selected_batch': batch,
+                      'selected_event_ids': sorted(selected_ids) if selected_ids is not None else None,
+                      'nev_only': nev_only,
+                      'days': DAYS, 'batches': BATCHES,
                       'pending': pending, 'dormant': dormant, 'resolved': resolved,
                       'deferred': deferred, 'remaining': remaining,
                       'excluded': excluded, 'scope_review': scope_review,
@@ -348,7 +374,8 @@ def public_fingerprint(conn: sqlite3.Connection) -> str:
     return digest.hexdigest()
 
 
-def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root: Path) -> dict:
+def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root: Path,
+            nev_only: bool = False) -> dict:
     # 手动下载也不能绕过整车边界；在产生运行记录或网络请求之前拒绝失效/外部拼装的计划。
     evidence = plan.scope_evidence(conn) if isinstance(plan, RetryPlan) else scope_evidence(conn)
     if any(event_scope(e, evidence)['inclusion_gate'] != 'accepted' for e in plan['pending']):
@@ -357,6 +384,10 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         from . import collection as seed
     except ImportError:
         from miit_gonggao import collection as seed
+    nev_only = nev_only or bool(plan.get('nev_only'))
+    if nev_only:
+        from miit_gonggao.collection_manifest import NEV_TYPES, validate_catalog_energy
+        from miit_gonggao.vehicle_categories import normalize_energy
     seed.ensure_schema(conn)
     db_path = next((Path(row[2]) for row in conn.execute('pragma database_list')
                     if row[1] == 'main' and row[2]), None)
@@ -384,11 +415,17 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
     run_id = conn.execute(
         'insert into ingestion_runs(started_at,selector_json,selected_models,parse_failures,publish_failures) '
         'values (?,?,?,0,0)', (utc_now(), json.dumps({'mode': 'recent_events', 'days': DAYS,
-                                                   'batches': BATCHES}), len({key[0] for key in grouped})),
+                                                   'batches': BATCHES,
+                                                   'selected_batch': plan.get('selected_batch'),
+                                                   'selected_event_ids': plan.get('selected_event_ids'),
+                                                   'nev_only': nev_only}),
+                                  len({key[0] for key in grouped})),
     ).lastrowid
     counts = dict(query_failures=0, download_failures=0, non_pdf_documents=0,
                   parse_failures=0, publish_failures=0, awaiting_effective=0, image_failures=0)
     scope_counts = dict(scope_excluded=0, scope_review=0)
+    if nev_only:
+        scope_counts['energy_scope_rejected'] = 0
     checked = 0
     try:
         for index, ((model, batch), group) in enumerate(grouped.items(), 1):
@@ -431,6 +468,20 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                         f"({scope['inclusion_gate']}: {scope['scope_reason']})", False,
                     )
                     continue
+                if nev_only:
+                    name = row.get('clmc') or ''
+                    try:
+                        if any(term in name for term in ('普通混合动力', '非插电', '不可外接充电')):
+                            raise ValueError('公告产品名已明确非新能源，目录能源不能覆盖该证据')
+                        if normalize_energy('', name, '', '')[0] not in NEV_TYPES:
+                            validate_catalog_energy([(str(row.get('cpid') or ''), model, name)], catalog_db)
+                    except ValueError as exc:
+                        scope_counts['energy_scope_rejected'] += 1
+                        results[str(row.get('cpid') or '')] = (
+                            False, f'新能源范围校验未通过: {model} / {row.get("cpid") or "缺少产品 ID"} / '
+                            f'{name or "缺少产品名称 clmc"} ({exc})', False,
+                        )
+                        continue
                 probe = {**group[0], 'product_id': str(row['cpid'])}
                 if has_valid_documents(conn, probe, pdf_root):
                     image_error = document_image_error(conn, probe, pdf_root)
@@ -516,12 +567,21 @@ def main() -> int:
     commands.add_parser('fingerprint')
     plan_parser = commands.add_parser('plan')
     plan_parser.add_argument('--limit', type=int, default=400)
+    plan_parser.add_argument('--batch', type=int, help='只计划指定正式公告批次')
     collect_parser = commands.add_parser('collect')
     collect_parser.add_argument('--limit', type=int, default=400)
+    collect_parser.add_argument('--batch', type=int, help='只采集指定正式公告批次')
     collect_parser.add_argument('--no-images', action='store_true', help='只下载 PDF，不获取或重试详情页原图')
+    for command in (plan_parser, collect_parser):
+        command.add_argument('--event-id', action='append', dest='event_ids',
+                             help='只处理指定正式事件，可重复；未知 ID 或批次不符时拒绝执行')
+        command.add_argument('--nev-only', action='store_true',
+                             help='采集时仅接受具体新能源证据；模糊产品名须经同型号目录核验')
     args = parser.parse_args()
     if hasattr(args, 'limit') and args.limit < 1:
         parser.error('--limit 必须大于 0')
+    if hasattr(args, 'batch') and args.batch is not None and args.batch < 173:
+        parser.error('--batch 必须是有效的正式公告批次')
     if args.pdf_root.resolve() != seed.UPSTREAM_ROOT:
         parser.error('--pdf-root 必须与 VEHICLE_DATA_HUB_ROOT 一致')
     read_only = args.command in {'plan', 'fingerprint'}
@@ -544,11 +604,14 @@ def main() -> int:
         elif args.command == 'fingerprint':
             print(public_fingerprint(conn))
         elif args.command == 'plan':
-            print(json.dumps(retry_plan(conn, args.pdf_root, limit=args.limit), ensure_ascii=False, indent=2))
+            print(json.dumps(retry_plan(conn, args.pdf_root, limit=args.limit, batch=args.batch,
+                                        event_ids=args.event_ids, nev_only=args.nev_only),
+                             ensure_ascii=False, indent=2))
         else:
             with seed.core.image_downloads(not args.no_images):
-                result = collect(conn, retry_plan(conn, args.pdf_root, limit=args.limit),
-                                 catalog_db=args.catalog_db, pdf_root=args.pdf_root)
+                result = collect(conn, retry_plan(conn, args.pdf_root, limit=args.limit, batch=args.batch,
+                                                  event_ids=args.event_ids, nev_only=args.nev_only),
+                                 catalog_db=args.catalog_db, pdf_root=args.pdf_root, nev_only=args.nev_only)
             if result.get('run_id'):
                 try:
                     try:

@@ -466,6 +466,11 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 .venv/bin/python -m miit_gonggao.collection_report --run 24
 # 近期正式公告跟踪，只读生成计划
 .venv/bin/python -m miit_gonggao.collection_tracking plan --limit 400
+# 按正式公告批次隔离计划；collect 使用同一 --batch 参数时才下载该批次 PDF
+.venv/bin/python -m miit_gonggao.collection_tracking plan --batch 409
+.venv/bin/python -m miit_gonggao.collection_tracking collect --batch 409 --no-images
+# 精确事件名单；--event-id 可重复，新能源范围在实际下载前再次核验
+.venv/bin/python -m miit_gonggao.collection_tracking plan --batch 410 --event-id <事件ID> --nev-only
 ```
 
 固定清单模式加 `--apply` 才实际下载；恢复已有轮次还须 `--resume-run <ID>`，

@@ -172,6 +172,56 @@ def test_legacy_notice_events_never_enter_the_retry_plan(data):
         assert sorted(e['kind'] for e in tracking.events(conn)) == ['change_notice', 'formal']
 
 
+def test_tracking_batch_filter_isolates_plan_and_collect(data, monkeypatch, capsys):
+    """单批采集不查询另一批，也不更新另一批已找到 PDF 的事件。"""
+    from datetime import date
+
+    url = 'https://www.miit.gov.cn/example.html'
+    data.announcement(product('already', model='TEST4101BEV', batch=410))
+    with sqlite3.connect(data.db) as conn:
+        event_409 = tracking.register_event(
+            conn, model_code='TEST4091BEV', batch=409, kind='formal', source_url=url,
+            event_date='2026-09-12', metadata={'product_name': '纯电动客车'})
+        event_410 = tracking.register_event(
+            conn, model_code='TEST4102BEV', batch=410, kind='formal', source_url=url,
+            event_date='2026-09-12', metadata={'product_name': '纯电动客车'})
+        resolved_410 = tracking.register_event(
+            conn, model_code='TEST4101BEV', batch=410, kind='formal', product_id='already',
+            source_url=url, event_date='2026-09-12', metadata={'product_name': '纯电动客车'})
+        plan = tracking.retry_plan(conn, data.pdf_root, today=date(2026, 9, 16), batch=409)
+        assert [e['event_id'] for e in plan['pending']] == [event_409]
+        assert plan['resolved'] == []
+        assert plan['query_groups'] == 1
+        other = tracking.retry_plan(conn, data.pdf_root, today=date(2026, 9, 16), batch=410)
+        assert [e['event_id'] for e in other['pending']] == [event_410]
+        assert other['resolved'] == [resolved_410]
+
+    run_tracking(data, monkeypatch, 'plan', '--batch', '409')
+    cli_plan = json.loads(capsys.readouterr().out)
+    assert cli_plan['selected_batch'] == 409
+    assert [e['event_id'] for e in cli_plan['pending']] == [event_409]
+    assert cli_plan['resolved'] == []
+
+    queries = []
+
+    def query_409_only(**kwargs):
+        queries.append(kwargs)
+        assert kwargs['pc'] == '409'
+        return []
+
+    monkeypatch.setattr(collection.core, 'query_all_pages', query_409_only)
+    run_tracking(data, monkeypatch, 'collect', '--batch', '409', '--no-images')
+    assert len(queries) == 1
+    with sqlite3.connect(data.db) as conn:
+        selector = json.loads(conn.execute('select selector_json from ingestion_runs').fetchone()[0])
+        assert selector['selected_batch'] == 409
+        assert conn.execute('select event_id from tracking_attempts').fetchall() == [(event_409,)]
+        assert conn.execute('select status,attempts from tracking_events where event_id=?',
+                            (event_410,)).fetchone() == ('pending', 0)
+        assert conn.execute('select status,attempts from tracking_events where event_id=?',
+                            (resolved_410,)).fetchone() == ('pending', 0)
+
+
 def test_republished_from_status_defaults_to_the_same_dir_as_the_status_record(data):
     """不显式传 out_dir 时，候选明细必须跟着业务库走，而不是项目默认目录。"""
     data.bootstrap()
