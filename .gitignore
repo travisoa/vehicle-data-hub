@@ -20,3 +20,6 @@ release/
 .workbuddy/
 .backup/
 dist/
+# 本机安装的第三方 Agent 技能：Codex 读 .agents/skills，Claude Code 经 .claude/skills 软链接读取，不纳入版本管理
+.agents/skills/
+.claude/skills/
