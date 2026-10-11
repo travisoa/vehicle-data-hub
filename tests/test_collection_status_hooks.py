@@ -14,6 +14,7 @@ import pytest
 import main as entry
 import miit_gonggao
 from miit_gonggao import collection as seed
+from miit_gonggao.announcement_source import ScriptedSource
 from miit_gonggao import collection_manifest as manifest
 from miit_gonggao import collection_report, collection_tracking as tracking
 from scripts import announcement_catalog_gap as gap
@@ -70,8 +71,8 @@ def test_manifest_refreshes_once_per_finished_or_interrupted_batch(
         tmp_path, monkeypatch, refresh_calls, interrupt):
     args, payload = setup(tmp_path, [product("p1"), product("p2")])
     stop = manifest.StopFlag()
-    fake_download(monkeypatch, [], lambda _row: stop.request(signal.SIGTERM, None) if interrupt else None)
-    assert manifest.collect(args, payload, stop) == (130 if interrupt else 0)
+    source = fake_download([], lambda _row: stop.request(signal.SIGTERM, None) if interrupt else None)
+    assert manifest.collect(args, payload, stop, source=source) == (130 if interrupt else 0)
     assert len(refresh_calls) == 1
     assert refresh_calls[0][1]["run_id"] == 1
 
@@ -91,8 +92,9 @@ def _tracking_database(tmp_path):
 
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_tracking_refreshes_after_normal_or_exceptional_run(tmp_path, monkeypatch, refresh_calls, interrupt):
+    source = ScriptedSource()
     conn, event = _tracking_database(tmp_path)
-    monkeypatch.setattr(seed.core, "query_all_pages", lambda **_kwargs: [product()] if interrupt else [])
+    source.on_query = lambda **_kwargs: [product()] if interrupt else []
     if interrupt:
         def broken_store(*_args, **_kwargs):
             raise RuntimeError("interrupted storage")
@@ -101,9 +103,9 @@ def test_tracking_refreshes_after_normal_or_exceptional_run(tmp_path, monkeypatc
         plan = {"pending": [event], "resolved": [], "latest_batch": 409}
         if interrupt:
             with pytest.raises(RuntimeError, match="interrupted storage"):
-                tracking.collect(conn, plan, catalog_db=tmp_path / "catalog.sqlite", pdf_root=tmp_path)
+                tracking.collect(conn, plan, catalog_db=tmp_path / "catalog.sqlite", pdf_root=tmp_path, source=source)
         else:
-            tracking.collect(conn, plan, catalog_db=tmp_path / "catalog.sqlite", pdf_root=tmp_path)
+            tracking.collect(conn, plan, catalog_db=tmp_path / "catalog.sqlite", pdf_root=tmp_path, source=source)
         assert len(refresh_calls) == 1
     finally:
         conn.close()
@@ -146,8 +148,8 @@ def test_refresh_failure_preserves_collection_and_warns(tmp_path, monkeypatch, r
         raise OSError("snapshot unavailable")
     monkeypatch.setattr(miit_gonggao.collection_status, "refresh_after_collection", broken_refresh)
     args, payload = setup(tmp_path)
-    fake_download(monkeypatch, [])
-    assert manifest.collect(args, payload) == 0
+    source = fake_download([])
+    assert manifest.collect(args, payload, source=source) == 0
     assert "收录统计更新失败" in capsys.readouterr().err
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("select count(*) from documents").fetchone()[0] == 1

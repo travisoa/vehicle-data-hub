@@ -298,11 +298,13 @@ def _cache_reduction_error(previous: dict, removed: set[int]) -> StatusError:
 
 
 def render_report(snapshot: dict) -> str:
+    from miit_gonggao.vehicle_classification import NON_NEV_BATCH_LABEL
+
     summary = snapshot['summary']
     lines = ['# 公告收录统计记录', '', f"生成时间：{snapshot['generated_at']}；触发原因：{snapshot['reason']}；"
              f"采集轮次：{snapshot.get('run_id') or '—'}。", '',
              '统计来自上游业务库与已保存的官方批次缓存；产品 ID、目录型号和网站占位分别统计。',
-             '能源未确认的第 408/409 批整车属于待判定候选，未并入新能源或燃油板块。', '',
+             f'能源未确认的{NON_NEV_BATCH_LABEL}整车属于待判定候选，未并入新能源或燃油板块。', '',
              '| 分组 | 缓存内产品 ID | 已下载并解析 | 未下载 | 源站非 PDF |',
              '| --- | ---: | ---: | ---: | ---: |']
     for key, item in summary.get('in_scope_totals', {}).items():

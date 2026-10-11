@@ -13,6 +13,7 @@ import pytest
 
 from miit_gonggao import collection_manifest as cached
 from miit_gonggao import collection as seed
+from miit_gonggao.announcement_source import ScriptedSource
 
 
 def product(pid: str = "p1", model: str = "ABC6500EV", **overrides) -> dict:
@@ -39,10 +40,10 @@ def test_legacy_manifest_keeps_its_scope_when_resuming(tmp_path, monkeypatch):
     args.manifest.write_text(json.dumps(manifest), encoding='utf-8')
     args.manifest_sha256 = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
     loaded = cached.load_manifest(args.manifest, args.manifest_sha256)
-    fake_download(monkeypatch, [])
-    assert cached.collect(args, loaded) == 0
+    source = fake_download([])
+    assert cached.collect(args, loaded, source=source) == 0
     args.resume_run = 1
-    assert cached.collect(args, loaded) == 0
+    assert cached.collect(args, loaded, source=source) == 0
     with closing(sqlite3.connect(args.site_db)) as conn:
         selector = json.loads(conn.execute('select selector_json from ingestion_runs').fetchone()[0])
         assert selector['scope'] == cached.LEGACY_SCOPE
@@ -52,13 +53,14 @@ def test_legacy_manifest_keeps_its_scope_when_resuming(tmp_path, monkeypatch):
 def forbid_network(monkeypatch):
     def fail(*_args, **_kwargs):
         raise AssertionError("离线测试不得联网或扩大查询范围")
+    # 没有注入 ScriptedSource 的入口会走官方接口，这里让它直接失败。
     monkeypatch.setattr(seed.core, "post_form", fail)
     monkeypatch.setattr(seed.core, "query_all_pages", fail)
     monkeypatch.setattr(seed, "parse_pdf", lambda _path, _db: ({"model_code": "ABC6500EV"}, ""))
     monkeypatch.setattr(seed, "refresh_collection_status", lambda *_args, **_kwargs: None)
 
 
-def fake_download(monkeypatch, calls: list[str], behavior=None):
+def fake_download(calls: list[str], behavior=None) -> ScriptedSource:
     def download(row, target):
         calls.append(row["cpid"])
         if behavior:
@@ -67,7 +69,7 @@ def fake_download(monkeypatch, calls: list[str], behavior=None):
         content = b"%PDF-1.4\n" + row["cpid"].encode() + b"\n%%EOF"
         path.write_bytes(content)
         return path, True, len(content)
-    monkeypatch.setattr(seed.core, "download_param_page", download)
+    return ScriptedSource(on_download=download)
 
 
 def progress(args) -> dict:
@@ -80,7 +82,7 @@ def models(args) -> list[tuple]:
                             "JOIN vehicles v ON v.id=r.vehicle_id ORDER BY r.sort_order").fetchall()
 
 
-def seed_existing(args, row, *, parse_error: str = "") -> tuple[Path, bytes]:
+def seed_existing(args, row, *, source: ScriptedSource, parse_error: str = "") -> tuple[Path, bytes]:
     with closing(sqlite3.connect(args.site_db)) as conn:
         seed.ensure_schema(conn)
         vid = seed.upsert_vehicle(conn, {"model_code": row["clxh"], "catalog": "原始目录", "batch": "30",
@@ -88,7 +90,7 @@ def seed_existing(args, row, *, parse_error: str = "") -> tuple[Path, bytes]:
                                          "seq": "123", "company": "原始企业"})
         seed.store_announcement(conn, row=row, vehicle_id=vid, market_name="原始车名",
                                 download_root=args.pdf_root / "downloads" / "announcement_site",
-                                pdf_root=args.pdf_root, catalog_db=args.catalog_db)
+                                pdf_root=args.pdf_root, catalog_db=args.catalog_db, source=source)
         if parse_error:
             conn.execute("UPDATE announcement_fields SET parse_error=?", (parse_error,))
         conn.commit()
@@ -97,6 +99,7 @@ def seed_existing(args, row, *, parse_error: str = "") -> tuple[Path, bytes]:
 
 
 def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatch):
+    source = ScriptedSource()
     from miit_gonggao import images
 
     args, payload = setup(tmp_path)
@@ -110,8 +113,8 @@ def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatc
         images.atomic_write(images.image_folder(row, folder) / 'manifest.json', json.dumps(result).encode())
         return seed.core.ParameterPageDownload(path, True, path.stat().st_size, result)
 
-    monkeypatch.setattr(seed.core, 'download_param_page', download)
-    assert cached.collect(args, payload) == 2
+    source.on_download = download
+    assert cached.collect(args, payload, source=source) == 2
     assert progress(args)['results']['image_failed'] == 1
     assert models(args) == [('ABC6500EV', 'partial')]
     with sqlite3.connect(args.site_db) as conn:
@@ -126,18 +129,19 @@ def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatc
 
     monkeypatch.setattr(images, 'download_product_images', retry)
     args.resume_run = 1
-    assert cached.collect(args, payload) == 2
+    assert cached.collect(args, payload, source=source) == 2
     assert calls == ['p1']  # 保留有效 PDF，不为图片异常重复下载 PDF。
     assert retries == ['p1']  # 只重取图片
     assert progress(args)['results']['image_failed'] == 1
 
     monkeypatch.setattr(images, 'download_product_images', lambda row, folder: retry(row, folder, 'ok'))
-    assert cached.collect(args, payload) == 0
+    assert cached.collect(args, payload, source=source) == 0
     assert calls == ['p1'] and retries == ['p1', 'p1']
     assert progress(args)['results'] == {'skipped_existing': 1}
 
 
 def test_no_images_run_neither_checks_nor_retries_images(tmp_path, monkeypatch):
+    source = ScriptedSource()
     from miit_gonggao import images
 
     args, payload = setup(tmp_path)
@@ -150,11 +154,11 @@ def test_no_images_run_neither_checks_nor_retries_images(tmp_path, monkeypatch):
         images.write_result(result, images.image_folder(row, folder))
         return seed.core.ParameterPageDownload(path, True, path.stat().st_size, result)
 
-    monkeypatch.setattr(seed.core, 'download_param_page', download)
-    assert cached.collect(args, payload) == 2
+    source.on_download = download
+    assert cached.collect(args, payload, source=source) == 2
     monkeypatch.setattr(images, 'download_product_images', lambda *a: pytest.fail('--no-images 不应重取图片'))
     args.no_images, args.resume_run = True, 1
-    assert cached.collect(args, payload) == 0
+    assert cached.collect(args, payload, source=source) == 0
     assert progress(args)['results'] == {'skipped_existing': 1}
     assert seed.core.DOWNLOAD_IMAGES  # 只在本进程本次采集内关闭
 
@@ -162,11 +166,11 @@ def test_no_images_run_neither_checks_nor_retries_images(tmp_path, monkeypatch):
 def test_exact_ids_and_model_aggregation_and_dry_run(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path, [product("p2"), product("p1"), product("p3", "DEF6500EV")])
     calls: list[str] = []
-    fake_download(monkeypatch, calls)
+    source = fake_download(calls)
     assert cached.main(["--manifest", str(args.manifest), "--manifest-sha256", args.manifest_sha256,
-                        "--run-dir", str(args.run_dir), "--site-db", str(args.site_db)]) == 0
+                        "--run-dir", str(args.run_dir), "--site-db", str(args.site_db)], source=source) == 0
     assert not args.site_db.exists() and not args.run_dir.exists() and not calls
-    assert cached.collect(args, cached.load_manifest(args.manifest, args.manifest_sha256)) == 0
+    assert cached.collect(args, cached.load_manifest(args.manifest, args.manifest_sha256), source=source) == 0
     assert calls == ["p2", "p1", "p3"]
     assert models(args) == [("ABC6500EV", "done"), ("DEF6500EV", "done")]
     assert progress(args)["status"] == "complete" and progress(args)["remaining"] == 0
@@ -199,17 +203,17 @@ def test_existing_nev_scopes_do_not_inherit_general_batch_allowance(tmp_path, sc
     assert not args.site_db.exists()
 
 
-@pytest.mark.parametrize("batch", [408, 409])
+@pytest.mark.parametrize("batch", [408, 409, 410])
 @pytest.mark.parametrize("name", ["客车", "混合动力客车", "柴油客车"])
 def test_automotive_scope_accepts_recent_unknown_hybrid_and_fuel_without_catalog(tmp_path, batch, name):
     args, manifest = setup(tmp_path, [product(clmc=name, gppc=str(batch), pc=str(batch))],
                            scope=cached.AUTOMOTIVE_SCOPE)
-    # No catalogue is necessary to authorize those two complete-vehicle batches.
+    # No catalogue is necessary to authorize complete vehicles from batch 408 onward.
     assert cached.load_manifest(args.manifest, args.manifest_sha256, args.catalog_db) == manifest
     assert not args.catalog_db.exists() and not args.site_db.exists()
 
 
-@pytest.mark.parametrize("batch", [407, 410])
+@pytest.mark.parametrize("batch", [284, 407])
 @pytest.mark.parametrize("name", ["客车", "混合动力客车", "柴油客车"])
 def test_automotive_scope_does_not_trust_claimed_energy_outside_recent_batches(tmp_path, batch, name):
     row = product(clmc=name, gppc=str(batch), pc=str(batch), group="nev", energy_type="纯电动",
@@ -252,11 +256,11 @@ def test_automotive_scope_reuses_exact_id_collection_and_same_scope_resume(tmp_p
     args, _ = setup(tmp_path, rows, scope=cached.AUTOMOTIVE_SCOPE)
     loaded = cached.load_manifest(args.manifest, args.manifest_sha256)
     calls = []
-    fake_download(monkeypatch, calls)
-    assert cached.collect(args, loaded) == 0
+    source = fake_download(calls)
+    assert cached.collect(args, loaded, source=source) == 0
     assert calls == ["fuel", "unknown"]
     args.resume_run = progress(args)["run_id"]
-    assert cached.collect(args, loaded) == 0
+    assert cached.collect(args, loaded, source=source) == 0
     assert calls == ["fuel", "unknown"]  # Registered valid PDFs are not downloaded twice.
     assert progress(args)["results"] == {"skipped_existing": 2}
     with closing(sqlite3.connect(args.site_db)) as conn:
@@ -267,7 +271,9 @@ def test_automotive_scope_reuses_exact_id_collection_and_same_scope_resume(tmp_p
             ("fuel", "408"), ("unknown", "409")]
         # Scope is checked independently of the manifest hash when claiming a resume.
         with pytest.raises(RuntimeError, match="SHA256/scope 不匹配"):
-            cached.claim_run(conn, args, {**loaded, "scope": cached.SCOPE})
+            run = cached.CollectionRun(conn, catalog_db=args.catalog_db, pdf_root=args.pdf_root,
+                                       reason="manifest_collection")
+            cached.claim_run(run, args, {**loaded, "scope": cached.SCOPE})
 
 
 def make_energy_catalog(path: Path, rows: list[tuple[str, str]]) -> None:
@@ -374,10 +380,10 @@ def test_manifest_rejects_hash_counts_scope_and_duplicate(tmp_path, change):
 def test_existing_success_skip_and_vehicle_metadata_preserved(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path)
     calls: list[str] = []
-    fake_download(monkeypatch, calls)
-    old_path, old_content = seed_existing(args, product())
+    source = fake_download(calls)
+    old_path, old_content = seed_existing(args, product(), source=source)
     calls.clear()
-    assert cached.collect(args, manifest) == 0
+    assert cached.collect(args, manifest, source=source) == 0
     assert not calls and old_path.read_bytes() == old_content
     assert progress(args)["results"] == {"skipped_existing": 1}
     with closing(sqlite3.connect(args.site_db)) as conn:
@@ -390,10 +396,10 @@ def test_existing_success_skip_and_vehicle_metadata_preserved(tmp_path, monkeypa
 def test_existing_parse_problem_is_reported_without_download(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path)
     calls: list[str] = []
-    fake_download(monkeypatch, calls)
-    seed_existing(args, product(), parse_error="既有版式异常")
+    source = fake_download(calls)
+    seed_existing(args, product(), source=source, parse_error="既有版式异常")
     calls.clear()
-    assert cached.collect(args, manifest) == 2
+    assert cached.collect(args, manifest, source=source) == 2
     assert not calls and progress(args)["results"] == {"parse_failed": 1}
     assert models(args) == [("ABC6500EV", "partial")]
 
@@ -401,16 +407,16 @@ def test_existing_parse_problem_is_reported_without_download(tmp_path, monkeypat
 def test_failed_retry_preserves_old_file_and_database(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path)
     calls: list[str] = []
-    fake_download(monkeypatch, calls)
-    old_path, old_content = seed_existing(args, product())
+    source = fake_download(calls)
+    old_path, old_content = seed_existing(args, product(), source=source)
     with closing(sqlite3.connect(args.site_db)) as conn:
         conn.execute("UPDATE documents SET sha256='bad-old-digest'")
         conn.commit()
         previous = conn.execute("SELECT * FROM documents").fetchone()
     def failed(_row):
         raise TimeoutError("offline timeout")
-    fake_download(monkeypatch, calls, failed)
-    assert cached.collect(args, manifest) == 2
+    source = fake_download(calls, failed)
+    assert cached.collect(args, manifest, source=source) == 2
     assert old_path.read_bytes() == old_content
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("SELECT * FROM documents").fetchone() == previous
@@ -422,8 +428,8 @@ def test_multiple_ids_partial_not_done(tmp_path, monkeypatch):
     def fail_second(row):
         if row["cpid"] == "p2":
             raise TimeoutError("offline")
-    fake_download(monkeypatch, [], fail_second)
-    assert cached.collect(args, manifest) == 2
+    source = fake_download([], fail_second)
+    assert cached.collect(args, manifest, source=source) == 2
     assert models(args) == [("ABC6500EV", "partial")]
     assert progress(args)["processed"] == 2
 
@@ -432,16 +438,16 @@ def test_signal_interrupt_and_resume_skips_committed_success(tmp_path, monkeypat
     args, manifest = setup(tmp_path, [product("p1"), product("p2"), product("p3", "DEF6500EV")])
     stop = cached.StopFlag()
     calls: list[str] = []
-    fake_download(monkeypatch, calls, lambda row: stop.request(signal.SIGTERM, None) if row["cpid"] == "p1" else None)
-    assert cached.collect(args, manifest, stop) == 130
+    source = fake_download(calls, lambda row: stop.request(signal.SIGTERM, None) if row["cpid"] == "p1" else None)
+    assert cached.collect(args, manifest, stop, source=source) == 130
     assert calls == ["p1"]
     assert progress(args)["status"] == "interrupted" and progress(args)["remaining"] == 2
     assert models(args) == [("ABC6500EV", "interrupted")]
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("SELECT completed_at FROM ingestion_runs").fetchone()[0]
     args.resume_run = progress(args)["run_id"]
-    fake_download(monkeypatch, calls)
-    assert cached.collect(args, manifest) == 0
+    source = fake_download(calls)
+    assert cached.collect(args, manifest, source=source) == 0
     assert calls == ["p1", "p2", "p3"]
     assert progress(args)["results"] == {"skipped_existing": 1, "downloaded": 2}
     assert models(args) == [("ABC6500EV", "done"), ("DEF6500EV", "done")]
@@ -454,8 +460,8 @@ def test_three_consecutive_download_failures_stop_without_touching_rest(tmp_path
     calls: list[str] = []
     def fail(_row):
         raise TimeoutError("offline")
-    fake_download(monkeypatch, calls, fail)
-    assert cached.collect(args, manifest) == 130
+    source = fake_download(calls, fail)
+    assert cached.collect(args, manifest, source=source) == 130
     assert calls == ["p0", "p1", "p2"]
     assert len(models(args)) == 3 and progress(args)["remaining"] == 2
     assert progress(args)["results"] == {"download_failed": 3}
@@ -464,34 +470,35 @@ def test_three_consecutive_download_failures_stop_without_touching_rest(tmp_path
 def test_other_unfinished_run_and_lock_prevent_start(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path)
     calls: list[str] = []
-    fake_download(monkeypatch, calls)
+    source = fake_download(calls)
     with closing(sqlite3.connect(args.site_db)) as conn:
         seed.ensure_schema(conn)
         conn.execute("INSERT INTO ingestion_runs(started_at,selector_json,selected_models) VALUES ('now','{}',1)")
         conn.commit()
     with pytest.raises(RuntimeError, match="未结束"):
-        cached.collect(args, manifest)
+        cached.collect(args, manifest, source=source)
     assert not calls
     with cached.database_lock(args.site_db), pytest.raises(RuntimeError, match="持有锁"):
-        cached.collect(args, manifest)
+        cached.collect(args, manifest, source=source)
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()[0] == 1
 
 
 def test_resume_rejects_other_manifest(tmp_path, monkeypatch):
     args, manifest = setup(tmp_path)
-    fake_download(monkeypatch, [])
-    assert cached.collect(args, manifest) == 0
+    source = fake_download([])
+    assert cached.collect(args, manifest, source=source) == 0
     args.resume_run = progress(args)["run_id"]
     args.manifest_sha256 = "0" * 64
     with pytest.raises(RuntimeError, match="清单"):
-        cached.collect(args, manifest)
+        cached.collect(args, manifest, source=source)
     args.run_dir = tmp_path / "different-run-dir"
     with pytest.raises(RuntimeError, match="不匹配"):
-        cached.collect(args, manifest)
+        cached.collect(args, manifest, source=source)
 
 
 def test_non_pdf_and_new_parse_failure_remain_distinct(tmp_path, monkeypatch):
+    source = ScriptedSource()
     args, manifest = setup(tmp_path, [product("html", "ABC6500EV"), product("parse", "DEF6500EV")])
     def download(row, target):
         is_pdf = row["cpid"] == "parse"
@@ -499,9 +506,9 @@ def test_non_pdf_and_new_parse_failure_remain_distinct(tmp_path, monkeypatch):
         content = b"%PDF-1.4\n%%EOF" if is_pdf else b"<html>not a PDF</html>"
         path.write_bytes(content)
         return path, is_pdf, len(content)
-    monkeypatch.setattr(seed.core, "download_param_page", download)
+    source.on_download = download
     monkeypatch.setattr(seed, "parse_pdf", lambda *_args: ({}, "unsupported layout"))
-    assert cached.collect(args, manifest) == 2
+    assert cached.collect(args, manifest, source=source) == 2
     assert progress(args)["results"] == {"non_pdf": 1, "parse_failed": 1}
     with closing(sqlite3.connect(args.site_db)) as conn:
         counts = conn.execute(
@@ -543,6 +550,7 @@ def test_dry_run_reports_interval_without_changing_core(tmp_path, capsys):
 
 @pytest.mark.parametrize("failure", ["download_failed", "non_pdf", "parse_failed"])
 def test_remote_error_restores_default_but_parse_error_does_not(tmp_path, monkeypatch, failure):
+    source = ScriptedSource()
     args, manifest = setup(tmp_path, [product("p1"), product("p2")])
     args.min_interval, args.max_interval = 0.12, 0.25
     monkeypatch.setattr(seed.core, "REQUEST_MIN_INTERVAL", (0.8, 1.8))
@@ -556,10 +564,10 @@ def test_remote_error_restores_default_but_parse_error_does_not(tmp_path, monkey
         content = b"%PDF-1.4\n%%EOF" if is_pdf else b"<html>not a PDF</html>"
         path.write_bytes(content)
         return path, is_pdf, len(content)
-    monkeypatch.setattr(seed.core, "download_param_page", download)
+    source.on_download = download
     if failure == "parse_failed":
         monkeypatch.setattr(seed, "parse_pdf", lambda *_args: ({}, "offline parsing error"))
-    assert cached.collect(args, manifest) == 2
+    assert cached.collect(args, manifest, source=source) == 2
     expected = (0.12, 0.25) if failure == "parse_failed" else (0.8, 1.8)
     assert intervals == [(0.12, 0.25), expected]
     assert progress(args)["request_interval"] == list(expected)
@@ -576,6 +584,7 @@ def test_remote_error_restores_default_but_parse_error_does_not(tmp_path, monkey
     ("Unknown error", "Byte data not found at location : /example/pic.jpg", False),
 ])
 def test_only_verified_source_generation_html_keeps_fast_pace(tmp_path, monkeypatch, title, detail, known):
+    source = ScriptedSource()
     args, manifest = setup(tmp_path, [product("p1"), product("p2")])
     args.min_interval, args.max_interval = 0.12, 0.25
     monkeypatch.setattr(seed.core, "REQUEST_MIN_INTERVAL", (0.8, 1.8))
@@ -587,8 +596,8 @@ def test_only_verified_source_generation_html_keeps_fast_pace(tmp_path, monkeypa
         content = b"%PDF-1.4\n%%EOF" if is_pdf else f"<title>{title}</title><body>{detail}</body>".encode()
         path.write_bytes(content)
         return path, is_pdf, len(content)
-    monkeypatch.setattr(seed.core, "download_param_page", download)
-    assert cached.collect(args, manifest) == 2
+    source.on_download = download
+    assert cached.collect(args, manifest, source=source) == 2
     assert intervals == [(0.12, 0.25), (0.12, 0.25) if known else (0.8, 1.8)]
     assert progress(args)["results"] == {"non_pdf": 1, "downloaded": 1}
     assert progress(args)["source_generation_errors"] == int(known)

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from miit_gonggao import collection as seed
+from miit_gonggao.announcement_source import ScriptedSource
 
 
 @pytest.fixture(autouse=True)
@@ -49,8 +50,8 @@ def test_unified_cli_routes_manifest_and_catalog_without_network(monkeypatch):
     from miit_gonggao import collection_manifest, core
 
     calls = []
-    monkeypatch.setattr(collection_manifest, "main", lambda args: calls.append(("manifest", args)) or 7)
-    monkeypatch.setattr(seed, "catalog_main", lambda args: calls.append(("catalog", args)) or 8)
+    monkeypatch.setattr(collection_manifest, "main", lambda args, **_source: calls.append(("manifest", args)) or 7)
+    monkeypatch.setattr(seed, "catalog_main", lambda args, **_source: calls.append(("catalog", args)) or 8)
     assert core.main(["collect", "--manifest=approved.json"]) == 7
     assert core.main(["collect", "-f", "models.txt"]) == 8
     assert calls == [("manifest", ["--manifest=approved.json"]), ("catalog", ["-f", "models.txt"])]
@@ -137,6 +138,7 @@ def run_republished_ingestion(
     parse=None,
     extra_args: tuple[str, ...] = (),
 ) -> tuple[int, Path, Path]:
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -144,10 +146,7 @@ def run_republished_ingestion(
     monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
     seed_local_announcement(site_db, upstream_root)
     write_batch_cache(upstream_root / "downloads" / "announcement_batches", recorded_batch)
-    monkeypatch.setattr(
-        seed.core,
-        "query_all_pages",
-        lambda **_kwargs: [
+    source.on_query = (lambda **_kwargs: [
             {
                 "clxh": "ABC6500EV",
                 "clmc": "多用途乘用车",
@@ -158,10 +157,9 @@ def run_republished_ingestion(
                 "cpid": "product-407",
                 "dataTag": "Z",
             }
-        ],
-    )
+        ])
     if download is not None:
-        monkeypatch.setattr(seed.core, "download_param_page", download)
+        source.on_download = download
         monkeypatch.setattr(
             seed, "parse_pdf", parse or (lambda _path, _catalog: ({"model_code": "ABC6500EV"}, ""))
         )
@@ -183,7 +181,7 @@ def run_republished_ingestion(
             *extra_args,
         ],
     )
-    return seed.main(), site_db, upstream_root
+    return seed.main(source=source), site_db, upstream_root
 
 
 def test_relative_pdf_path_is_always_based_on_upstream_root(tmp_path: Path):
@@ -231,6 +229,7 @@ def test_republished_refresh_stops_when_the_interface_batch_is_lower(monkeypatch
 def test_republished_from_status_only_collects_the_selected_product_id(
     monkeypatch, tmp_path: Path, candidate_batch: str | None
 ):
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -248,17 +247,17 @@ def test_republished_from_status_only_collects_the_selected_product_id(
     api_rows = [{"clxh": "ABC6500EV", "cpid": "sibling-product", "gppc": "410"}]
     if candidate_batch is not None:
         api_rows.insert(0, {"clxh": "ABC6500EV", "cpid": "product-407", "gppc": candidate_batch})
-    monkeypatch.setattr(seed.core, "query_all_pages", lambda **_kwargs: api_rows)
+    source.on_query = lambda **_kwargs: api_rows
     collected: list[dict] = []
     monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
-                        collected.append(kwargs["row"]) or (True, ""))
+                        collected.append(kwargs["row"]) or seed.StoreOutcome(True, ""))
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-from-status", "--no-images", "--no-report",
         "--catalog-db", str(catalog_db), "--site-db", str(site_db),
         "--download-root", str(download_root),
     ])
 
-    assert seed.main() == (0 if candidate_batch == "409" else 2)
+    assert seed.main(source=source) == (0 if candidate_batch == "409" else 2)
     assert [row["cpid"] for row in collected] == (["product-407"] if candidate_batch == "409" else [])
     if collected:
         assert collected[0]["_republished"]["product_id"] == "product-407"
@@ -273,6 +272,7 @@ def test_republished_from_status_only_collects_the_selected_product_id(
 
 def test_republished_from_status_queries_the_recorded_batch(monkeypatch, tmp_path: Path):
     """无批次型号查询只给旧版时，仍要取得清单所指的正式重发批次。"""
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -299,22 +299,23 @@ def test_republished_from_status_queries_the_recorded_batch(monkeypatch, tmp_pat
             {"clxh": model_code, "cpid": "sibling", "gppc": "382"},
         ]
 
-    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    source.on_query = query
     collected: list[dict] = []
     monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
-                        collected.append(kwargs["row"]) or (True, ""))
+                        collected.append(kwargs["row"]) or seed.StoreOutcome(True, ""))
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-from-status", "--no-images", "--no-report",
         "--catalog-db", str(catalog_db), "--site-db", str(site_db),
         "--download-root", str(upstream_root / "downloads" / "announcement_site"),
     ])
 
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     assert calls == ["382"]
     assert [(row["cpid"], row["gppc"]) for row in collected] == [("selected", "382")]
 
 
 def test_republished_batch_queries_union_and_dedupe_rows(monkeypatch):
+    source = ScriptedSource()
     calls: list[str] = []
 
     def query(*, model_code: str, pc: str, page_size: int) -> list[dict]:
@@ -323,10 +324,10 @@ def test_republished_batch_queries_union_and_dedupe_rows(monkeypatch):
         repeated = {"clxh": model_code, "cpid": "selected-a", "gppc": "382"}
         return [repeated] if pc == "382" else [repeated, {"clxh": model_code, "cpid": "selected-b", "gppc": "383"}]
 
-    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    source.on_query = query
     rows = seed.query_republished_candidate_batches("ABC6500EV", [
         {"republished_batch": 383}, {"republished_batch": 382}, {"republished_batch": 382},
-    ])
+    ], source=source)
     assert calls == ["382", "383"]
     assert [(row["cpid"], row["gppc"]) for row in rows] == [
         ("selected-a", "382"), ("selected-b", "383")
@@ -334,21 +335,54 @@ def test_republished_batch_queries_union_and_dedupe_rows(monkeypatch):
 
 
 def test_model_list_collection_keeps_the_unscoped_batch_query(monkeypatch, tmp_path: Path):
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     monkeypatch.setattr(seed, "UPSTREAM_ROOT", tmp_path)
     models = tmp_path / "models.txt"
     models.write_text("ABC6500EV\n", encoding="utf-8")
     calls: list[dict] = []
-    monkeypatch.setattr(seed.core, "query_all_pages", lambda **kwargs:
-                        calls.append(kwargs) or [])
+    source.on_query = lambda **kwargs: calls.append(kwargs) or []
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "-f", str(models), "--no-report",
         "--catalog-db", str(catalog_db), "--site-db", str(tmp_path / "site.sqlite"),
         "--download-root", str(tmp_path / "downloads"),
     ])
 
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     assert calls == [{"model_code": "ABC6500EV", "page_size": 50}]
+
+
+def test_failed_catalog_backfill_leaves_no_unfinished_run(monkeypatch, tmp_path: Path):
+    """回填在认领轮次之前：回填出错时不能留下未完成轮次，挡住之后的采集。"""
+    catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
+    site_db = tmp_path / "site.sqlite"
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", tmp_path)
+    models = tmp_path / "models.txt"
+    models.write_text("ABC6500EV\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "-f", str(models), "--no-report",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(tmp_path / "downloads"),
+    ])
+
+    def broken_backfill(*_args):
+        raise sqlite3.OperationalError("catalog unavailable")
+
+    monkeypatch.setattr(seed, "backfill_catalog_fields", broken_backfill)
+    with pytest.raises(sqlite3.OperationalError):
+        seed.main(source=ScriptedSource(on_query=lambda **_kwargs: []))
+    with closing(sqlite3.connect(site_db)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs WHERE completed_at IS NULL").fetchone()[0] == 0
+
+    monkeypatch.undo()
+    monkeypatch.setattr(seed, "UPSTREAM_ROOT", tmp_path)
+    monkeypatch.setattr(seed, "refresh_collection_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sys, "argv", [
+        "seed_announcement_site.py", "-f", str(models), "--no-report",
+        "--catalog-db", str(catalog_db), "--site-db", str(site_db),
+        "--download-root", str(tmp_path / "downloads"),
+    ])
+    assert seed.main(source=ScriptedSource(on_query=lambda **_kwargs: [])) == 0
 
 
 def test_republished_rows_for_one_model_keep_each_selected_product_id():
@@ -441,8 +475,8 @@ def test_download_failure_drops_the_run_back_to_the_default_interval(monkeypatch
 
 def test_partial_interval_is_rejected_before_any_collection(monkeypatch, tmp_path: Path):
     """只给一半区间是配置错误，必须在采集开始前拒绝。"""
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口"))
+    source = ScriptedSource()
+    source.on_query = lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口")
     with pytest.raises(SystemExit) as exc:
         run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="409",
                                   extra_args=("--min-interval", "0.2"))
@@ -450,22 +484,21 @@ def test_partial_interval_is_rejected_before_any_collection(monkeypatch, tmp_pat
 
 
 def test_republished_dry_run_lists_candidates_without_touching_the_network_or_db(monkeypatch, tmp_path: Path):
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
     monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
     seed_local_announcement(site_db, upstream_root)
     write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: pytest.fail("预演不得查询官方接口"))
-    monkeypatch.setattr(seed.core, "download_param_page",
-                        lambda *_args, **_kwargs: pytest.fail("预演不得下载 PDF"))
+    source.on_query = lambda **_kwargs: pytest.fail("预演不得查询官方接口")
+    source.on_download = lambda *_args, **_kwargs: pytest.fail("预演不得下载 PDF")
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-batch", "409", "--dry-run",
         "--catalog-db", str(catalog_db), "--site-db", str(site_db),
         "--download-root", str(upstream_root / "downloads" / "announcement_site"),
     ])
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     snapshots = list((upstream_root / "downloads" / "announcement_site" /
                       seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
     assert len(snapshots) == 1
@@ -479,6 +512,7 @@ def test_republished_dry_run_lists_candidates_without_touching_the_network_or_db
 
 def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkeypatch, tmp_path: Path, capsys):
     """--limit 截断后，预演统计和快照都必须描述本轮实际处理范围。"""
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -487,14 +521,13 @@ def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkey
     seed_local_announcement(site_db, upstream_root, product_id="product-407b", model_code="ABC6500EV2")
     write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409,
                       extra=(("product-407b", "ABC6500EV2"),))
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: pytest.fail("预演不得查询官方接口"))
+    source.on_query = lambda **_kwargs: pytest.fail("预演不得查询官方接口")
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-batch", "409", "--dry-run", "--limit", "1",
         "--catalog-db", str(catalog_db), "--site-db", str(site_db),
         "--download-root", str(upstream_root / "downloads" / "announcement_site"),
     ])
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     printed = capsys.readouterr().out
     assert "本轮清单 1 个产品（候选共 2 个）" in printed
     assert "覆盖 1 个型号" in printed
@@ -513,6 +546,7 @@ def test_republished_limit_reports_the_round_not_the_whole_candidate_list(monkey
 def test_republished_offset_selects_exact_later_product_and_audits_it(
     monkeypatch, tmp_path: Path, dry_run: bool
 ):
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -529,10 +563,10 @@ def test_republished_offset_selects_exact_later_product_and_audits_it(
             pytest.fail("预演不得查询官方接口")
         return [{"clxh": "ABC6500EV2", "cpid": "product-407b", "gppc": "409"}]
 
-    monkeypatch.setattr(seed.core, "query_all_pages", query)
+    source.on_query = query
     collected: list[str] = []
     monkeypatch.setattr(seed, "store_announcement", lambda _conn, **kwargs:
-                        collected.append(kwargs["row"]["cpid"]) or (True, ""))
+                        collected.append(kwargs["row"]["cpid"]) or seed.StoreOutcome(True, ""))
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-batch", "409", "--offset", "1",
         "--limit", "1", "--no-report", *(["--dry-run"] if dry_run else []),
@@ -540,7 +574,7 @@ def test_republished_offset_selects_exact_later_product_and_audits_it(
         "--download-root", str(upstream_root / "downloads" / "announcement_site"),
     ])
 
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     snapshots = list((upstream_root / "downloads" / "announcement_site" /
                       seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
     assert len(snapshots) == 1
@@ -565,14 +599,14 @@ def test_republished_offset_selects_exact_later_product_and_audits_it(
 
 
 def test_republished_offset_past_the_candidate_pool_stops_before_snapshot(monkeypatch, tmp_path: Path):
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
     monkeypatch.setattr(seed, "UPSTREAM_ROOT", upstream_root)
     seed_local_announcement(site_db, upstream_root)
     write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: pytest.fail("越界 offset 不得查询官方接口"))
+    source.on_query = lambda **_kwargs: pytest.fail("越界 offset 不得查询官方接口")
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-batch", "409", "--offset", "1",
         "--limit", "1", "--dry-run", "--catalog-db", str(catalog_db),
@@ -581,7 +615,7 @@ def test_republished_offset_past_the_candidate_pool_stops_before_snapshot(monkey
     ])
 
     with pytest.raises(SystemExit, match="2"):
-        seed.main()
+        seed.main(source=source)
     assert not list((upstream_root / "downloads" / "announcement_site" /
                      seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
 
@@ -640,7 +674,7 @@ def test_verify_separates_real_republication_from_cache_noise():
             return [{"clxh": "CC3-L", "gppc": "409"}]
         raise RuntimeError("接口超时")
 
-    result = seed.republished.verify_against_api(rows, query=fake_query)
+    result = seed.republished.verify_against_api(rows, source=ScriptedSource(on_query=fake_query))
     assert [row["model_code"] for row in result["confirmed"]] == ["AA1"]
     assert [row["model_code"] for row in result["stale_record"]] == ["BB2"]
     assert [row["model_code"] for row in result["missing"]] == ["CC3"]
@@ -655,8 +689,8 @@ def test_verify_separates_real_republication_from_cache_noise():
 
 def test_verify_needs_dry_run_because_collection_already_checks(monkeypatch, tmp_path: Path):
     """实际采集本身逐条核实接口批次，再单独查一遍只是重复请求。"""
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口"))
+    source = ScriptedSource()
+    source.on_query = lambda **_kwargs: pytest.fail("参数错误时不得查询官方接口")
     with pytest.raises(SystemExit) as exc:
         run_republished_ingestion(monkeypatch, tmp_path, announcement_batch="409",
                                   extra_args=("--verify",))
@@ -665,6 +699,7 @@ def test_verify_needs_dry_run_because_collection_already_checks(monkeypatch, tmp
 
 def test_dry_run_verify_records_the_api_check_in_one_snapshot(monkeypatch, tmp_path: Path):
     """核实结果与清单写在同一份快照里，且全程不下载。"""
+    source = ScriptedSource()
     catalog_db = make_catalog_db(tmp_path / "catalog.sqlite")
     site_db = tmp_path / "site.sqlite"
     upstream_root = tmp_path / "vehicle-data-hub"
@@ -672,16 +707,14 @@ def test_dry_run_verify_records_the_api_check_in_one_snapshot(monkeypatch, tmp_p
     seed_local_announcement(site_db, upstream_root)
     write_batch_cache(upstream_root / "downloads" / "announcement_batches", 409)
     # 缓存说第 409 批重发，接口最高只到 407：这条是枚举缓存的假阳性
-    monkeypatch.setattr(seed.core, "query_all_pages",
-                        lambda **_kwargs: [{"clxh": "ABC6500EV", "gppc": "407"}])
-    monkeypatch.setattr(seed.core, "download_param_page",
-                        lambda *_args, **_kwargs: pytest.fail("核实不得下载 PDF"))
+    source.on_query = lambda **_kwargs: [{"clxh": "ABC6500EV", "gppc": "407"}]
+    source.on_download = lambda *_args, **_kwargs: pytest.fail("核实不得下载 PDF")
     monkeypatch.setattr(sys, "argv", [
         "seed_announcement_site.py", "--republished-batch", "409", "--dry-run", "--verify",
         "--catalog-db", str(catalog_db), "--site-db", str(site_db),
         "--download-root", str(upstream_root / "downloads" / "announcement_site"),
     ])
-    assert seed.main() == 0
+    assert seed.main(source=source) == 0
     snapshots = list((upstream_root / "downloads" / "announcement_site" /
                       seed.core.ANNOUNCEMENT_SNAPSHOT_DIRNAME).glob("republished_seed_*.json"))
     assert len(snapshots) == 1  # 核实不另起一份快照
@@ -748,6 +781,7 @@ def test_candidate_lookup_does_not_leak_sqlite_connections(tmp_path):
 
 @pytest.mark.parametrize('failure', ['network', 'html', 'parse', 'publish'])
 def test_failed_refresh_preserves_complete_previous_version(monkeypatch, tmp_path, failure):
+    source = ScriptedSource()
     conn = sqlite3.connect(tmp_path / 'source.sqlite')
     seed.ensure_schema(conn)
     vehicle = seed.upsert_vehicle(conn, dict(common_name='demo', model_code='ABC6500EV',
@@ -762,9 +796,9 @@ def test_failed_refresh_preserves_complete_previous_version(monkeypatch, tmp_pat
         path.write_bytes(b'%PDF old')
         return path, True, path.stat().st_size
 
-    monkeypatch.setattr(seed.core, 'download_param_page', download)
+    source.on_download = download
     monkeypatch.setattr(seed, 'parse_pdf', lambda *_: ({'batch': '408', 'gross_mass': '3000'}, ''))
-    assert seed.store_announcement(row=row, **kwargs) == (True, '')
+    assert seed.store_announcement(row=row, **kwargs, source=source) == (True, '')
     conn.commit()
     old_path = tmp_path / conn.execute('SELECT relative_path FROM documents').fetchone()[0]
     old_state = [conn.execute(f'SELECT * FROM {table}').fetchall()
@@ -777,14 +811,14 @@ def test_failed_refresh_preserves_complete_previous_version(monkeypatch, tmp_pat
         path.write_bytes(b'%PDF new' if failure in ('parse', 'publish') else b'<html>unavailable</html>')
         return path, failure in ('parse', 'publish'), path.stat().st_size
 
-    monkeypatch.setattr(seed.core, 'download_param_page', failed_download)
+    source.on_download = failed_download
     monkeypatch.setattr(seed, 'parse_pdf', lambda *_: ({}, 'invalid layout'))
     if failure == 'publish':
         def fail_link(*_):
             raise OSError('publish blocked')
 
         monkeypatch.setattr(seed.os, 'link', fail_link)
-    assert not seed.store_announcement(row={**row, 'gppc': '409', 'clmc': 'new'}, **kwargs)[0]
+    assert not seed.store_announcement(row={**row, 'gppc': '409', 'clmc': 'new'}, **kwargs, source=source)[0]
     conn.commit()
     assert old_state == [conn.execute(f'SELECT * FROM {table}').fetchall()
                          for table in ['announcements', 'documents', 'announcement_fields']]
@@ -793,6 +827,7 @@ def test_failed_refresh_preserves_complete_previous_version(monkeypatch, tmp_pat
 
 
 def test_successful_same_path_refresh_preserves_old_pdf(monkeypatch, tmp_path):
+    source = ScriptedSource()
     conn = sqlite3.connect(tmp_path / 'source.sqlite')
     seed.ensure_schema(conn)
     vehicle = seed.upsert_vehicle(conn, dict(common_name='demo', model_code='ABC6500EV',
@@ -805,14 +840,14 @@ def test_successful_same_path_refresh_preserves_old_pdf(monkeypatch, tmp_path):
         path.write_bytes(content)
         return path, True, len(content)
 
-    monkeypatch.setattr(seed.core, 'download_param_page', download)
+    source.on_download = download
     monkeypatch.setattr(seed, 'parse_pdf', lambda *_: ({'gross_mass': str(len(content))}, ''))
     kwargs = dict(conn=conn, row=row, vehicle_id=vehicle, market_name='demo',
                   download_root=tmp_path / 'downloads', pdf_root=tmp_path, catalog_db=tmp_path / 'cat.sqlite')
-    assert seed.store_announcement(**kwargs)[0]
+    assert seed.store_announcement(**kwargs, source=source)[0]
     old_path = tmp_path / conn.execute('SELECT relative_path FROM documents').fetchone()[0]
     content = b'%PDF new revision'
-    assert seed.store_announcement(**kwargs)[0]
+    assert seed.store_announcement(**kwargs, source=source)[0]
     new_path = tmp_path / conn.execute('SELECT relative_path FROM documents').fetchone()[0]
     assert old_path != new_path
     assert old_path.read_bytes() == b'%PDF old'
@@ -827,7 +862,7 @@ def test_successful_same_path_refresh_preserves_old_pdf(monkeypatch, tmp_path):
     kwargs['row'] = {**row, 'gppc': '409'}
     content = b'%PDF next revision'
     with pytest.raises(sqlite3.IntegrityError, match='simulated storage failure'):
-        seed.store_announcement(**kwargs)
+        seed.store_announcement(**kwargs, source=source)
     conn.commit()
     assert saved == [conn.execute(f'SELECT * FROM {table}').fetchall()
                      for table in ['announcements', 'documents', 'announcement_fields']]
@@ -838,6 +873,7 @@ def test_successful_same_path_refresh_preserves_old_pdf(monkeypatch, tmp_path):
 
 @pytest.fixture
 def stored_document(monkeypatch, tmp_path):
+    source = ScriptedSource()
     with closing(sqlite3.connect(tmp_path / 'source.sqlite')) as conn:
         seed.ensure_schema(conn)
         vid = seed.upsert_vehicle(conn, dict(common_name='demo', model_code='ABC6500EV',
@@ -845,14 +881,15 @@ def stored_document(monkeypatch, tmp_path):
         conn.commit()
         kwargs = dict(conn=conn, vehicle_id=vid, market_name='demo',
             row=dict(cpid='P1', clxh='ABC6500EV', cpsb='brand', gppc='409'),
-            download_root=tmp_path / 'downloads', pdf_root=tmp_path, catalog_db=tmp_path / 'catalog.sqlite')
+            download_root=tmp_path / 'downloads', pdf_root=tmp_path, catalog_db=tmp_path / 'catalog.sqlite',
+            source=source)
 
         def download(_row, folder):
             path = folder / 'brand_ABC6500EV_409_P1.pdf'
             path.write_bytes(b'%PDF original')
             return path, True, path.stat().st_size
 
-        monkeypatch.setattr(seed.core, 'download_param_page', download)
+        source.on_download = download
         monkeypatch.setattr(seed, 'parse_pdf', lambda *_: ({'model_code': 'ABC6500EV'}, ''))
         yield conn, kwargs
 
@@ -875,6 +912,7 @@ def test_publication_failure_preserves_raw_file_without_false_document(monkeypat
 @pytest.mark.parametrize('document_type', ['pdf', 'html'])
 def test_unparsed_downloads_use_durable_paths_and_clean_staging(monkeypatch, stored_document, document_type):
     conn, kwargs = stored_document
+    source = kwargs['source']
     content = b'%PDF unparsed' if document_type == 'pdf' else b'<html>response</html>'
 
     def download(_row, folder):
@@ -882,7 +920,7 @@ def test_unparsed_downloads_use_durable_paths_and_clean_staging(monkeypatch, sto
         path.write_bytes(content)
         return path, document_type == 'pdf', len(content)
 
-    monkeypatch.setattr(seed.core, 'download_param_page', download)
+    source.on_download = download
     monkeypatch.setattr(seed, 'parse_pdf', lambda *_: ({}, 'unsupported layout'))
     assert not seed.store_announcement(**kwargs)[0]
     path, is_pdf = conn.execute('SELECT relative_path,is_pdf FROM documents').fetchone()
@@ -898,6 +936,7 @@ def test_unparsed_downloads_use_durable_paths_and_clean_staging(monkeypatch, sto
 @pytest.mark.parametrize('previous', ['html', 'fields_only'])
 def test_failed_retry_preserves_non_pdf_evidence(monkeypatch, stored_document, previous):
     conn, kwargs = stored_document
+    source = kwargs['source']
     seed.store_announcement(**kwargs)
     conn.execute("UPDATE documents SET relative_path='old.html',is_pdf=0,bytes=?",
                  (12034 if previous == 'html' else 0,))
@@ -909,7 +948,7 @@ def test_failed_retry_preserves_non_pdf_evidence(monkeypatch, stored_document, p
     def fail_download(*_):
         raise OSError('offline')
 
-    monkeypatch.setattr(seed.core, 'download_param_page', fail_download)
+    source.on_download = fail_download
     ok, error = seed.store_announcement(**{**kwargs, 'row': {**kwargs['row'], 'gppc': '410'}})
     assert not ok and error.startswith('下载失败')
     assert before == [conn.execute(f'SELECT * FROM {table}').fetchall() for table in tables]
@@ -965,11 +1004,12 @@ def test_run_reports_failure_phases_separately(monkeypatch, tmp_path, failure):
 
 def test_empty_failed_record_can_be_upgraded_to_html(monkeypatch, stored_document):
     conn, kwargs = stored_document
+    source = kwargs['source']
 
     def fail(*_):
         raise OSError('offline')
 
-    monkeypatch.setattr(seed.core, 'download_param_page', fail)
+    source.on_download = fail
     seed.store_announcement(**kwargs)
     assert conn.execute('SELECT bytes FROM documents').fetchone()[0] == 0
 
@@ -978,7 +1018,7 @@ def test_empty_failed_record_can_be_upgraded_to_html(monkeypatch, stored_documen
         path.write_bytes(b'<html>response</html>')
         return path, False, path.stat().st_size
 
-    monkeypatch.setattr(seed.core, 'download_param_page', html)
+    source.on_download = html
     seed.store_announcement(**kwargs)
     path, size = conn.execute('SELECT relative_path,bytes FROM documents').fetchone()
     assert path.endswith('.html') and size > 0

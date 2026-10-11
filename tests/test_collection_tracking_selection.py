@@ -113,7 +113,7 @@ def test_nev_only_checks_actual_product_and_catalog_before_store(
 
     def store(_conn, **kwargs):
         stored.append(kwargs['row']['cpid'])
-        return True, ''
+        return seed.StoreOutcome(True, '')
 
     monkeypatch.setattr(seed, 'store_announcement', store)
     with sqlite3.connect(data.db) as conn:

@@ -426,7 +426,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 任务 | 复用方式 | 边界 |
 | --- | --- | --- |
 | 目录或型号名单采集 | `gonggao collect` 的目录参数或 `-f` | 会查询同型号所有正式批次；不是固定批次下载 |
-| 已核验汽车整车产品 ID | `gonggao collect --manifest ...` | 只处理冻结清单；新能源 scope 仅收新能源，通用 scope 的非新能源/未知仅 408/409 批 |
+| 已核验汽车整车产品 ID | `gonggao collect --manifest ...` | 只处理冻结清单；新能源 scope 仅收新能源，通用 scope 的非新能源/未知限第 408 批及以后 |
 | 近期正式公告 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
 | 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 按候选正式批次查询，只下载清单产品 ID；`--offset` 后接 `--limit` 可抽取候选产品，快照记录实际 ID；公示不作为来源；`--dry-run` 只出清单不下载 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
@@ -437,7 +437,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
 
 Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整车可收录历史正式公告，
-非新能源仅第 408、409 批；范围待核验不冒充符合。网站公开范围与本轮下载授权分别核实。
+非新能源收录第 408 批及以后；范围待核验不冒充符合。网站公开范围与本轮下载授权分别核实。
 已有模式不能精确表达本轮范围时，先扩展既有参数/内部选择策略，不能扩大下载范围凑合执行。
 
 ### 能力扩展规则
@@ -484,7 +484,7 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 解析问题保留记录。经用户明确要求可传 `--min-interval/--max-interval`，仅改变本轮节流；
 下载异常恢复默认间隔，连续三次下载失败停止。该模式不会重新按型号搜索或增加其他批次。
 固定清单使用 schema_version=1。`nev_complete_manifest_v1`（及兼容旧 scope）仅接受新能源；
-`automotive_complete_manifest_v1` 在第 408、409 批接受燃油、普通混动与动力未知整车，其他批次仍须新能源。
+`automotive_complete_manifest_v1` 在第 408 批及以后接受燃油、普通混动与动力未知整车，更早批次仍须新能源。
 各 scope 均执行整车判定，不依赖清单自报能源；恢复时 scope 与清单哈希必须一致。
 需要核验新能源范围时优先按官方产品名判断；产品名只写混合动力等无法确认类型时，只读查询
 `--catalog-db`（默认 `data/jianmian_catalog.sqlite`）中精确同型号的具体能源证据。
@@ -492,7 +492,12 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 不采用清单自报的 `catalog_energy`，不改写官方产品名；整车范围、清单哈希和数量校验仍须通过。
 
 目录模式、固定清单模式与近期事件模式保留各自的候选选择逻辑，统一复用
-`collection.store_announcement` 的下载、参数解析和发布事务，以及数据库锁和逐型号状态收尾。
+`collection.store_announcement` 的下载、参数解析和发布事务，以及数据库锁。
+轮次认领、型号结局、单产品结局计数、失败降速和收尾统计统一由 `collection_run.CollectionRun` 处理；
+`store_announcement` 返回带 `status` 的结局，入口按结局分类，不解析报错文案。
+提速后遇到查询失败、下载失败、图片异常或未核验为源站生成异常的非 PDF，三个入口都恢复默认间隔。
+三个入口和 `store_announcement` 经 `announcement_source` 访问工信部公告接口：生产用 `OfficialSource`
+（委托 `core` 的查询、节流、重试与原图下载），测试注入 `ScriptedSource`，不再替换 `core` 的模块函数。
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 
@@ -534,7 +539,7 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 每代记录位于 `snapshots/<generation>/`，包含 `summary.json`、`candidates.json`、
 `report.md`。文件全部生成后才原子更新 `latest.json`；刷新失败保留旧最新记录，并写
 `last-error.json`，不能把旧汇总当成已更新。候选按产品 ID 保留，去重型号数另列；
-统计范围为汽车整车的新能源历史记录，以及第 408、409 批非新能源和动力未知候选。
+统计范围为汽车整车的新能源历史记录，以及第 408 批及以后的非新能源和动力未知候选。
 动力未知独立列示，不计入已确认能源类别；候选不扩大本轮下载授权。
 目录型号六桶、事件状态及 Website 公开库占位各有口径，不能与产品缺口相加或互相替代。
 

@@ -139,7 +139,7 @@ def test_pdf_path_cannot_escape_the_root_or_follow_external_symlink(data, tmp_pa
         assert I.document_state(relative, len(PDF), 1, {'fuel_type': '电'}, '', '', data.pdf_root) == 'pdf_invalid'
 
 
-def test_fuel_and_unknown_keep_authorized_batch_when_same_product_appears_in_410(data):
+def test_fuel_and_unknown_follow_new_batches_from_408_onward(data):
     older = [product('fuel', name='混合动力载货汽车'), product('unknown', name='载货汽车'), product('nev')]
     newer = [{**row, 'gppc': '410', 'clxh': row['clxh'] + 'NEW'} for row in older]
     data.cache_batch(409, older)
@@ -147,13 +147,19 @@ def test_fuel_and_unknown_keep_authorized_batch_when_same_product_appears_in_410
     summary, candidates = data.compute()
     rows = {row['product_id']: row for row in candidates['missing']}
     assert summary['inputs']['batch_caches']['unique_product_ids'] == 3
-    for pid, group in [('fuel', 'fuel_408_409'), ('unknown', 'unknown_408_409')]:
+    for pid, group in [('fuel', 'fuel_authorized'), ('unknown', 'unknown_authorized'), ('nev', 'nev')]:
         assert rows[pid]['group'] == group
-        assert rows[pid]['batch'] == 409
-        assert rows[pid]['cached_latest_batch'] == 410
-        assert rows[pid]['model_code'] == f'TEST1000{pid}'
-    assert rows['nev']['batch'] == 410
-    assert rows['nev']['batches'] == [409, 410]
+        assert rows[pid]['batch'] == 410
+        assert rows[pid]['batches'] == [409, 410]
+        assert rows[pid]['model_code'] == f'TEST1000{pid}NEW'
+
+
+def test_fuel_before_408_stays_outside_even_if_seen_again_later(data):
+    data.cache_batch(407, [product('fuel', name='混合动力载货汽车', batch=407)])
+    summary, candidates = data.compute()
+    assert 'fuel' not in {row['product_id'] for row in candidates['missing']}
+    assert summary['outside_scope_missing_not_counted'] == [
+        {'group': 'fuel_outside', 'channel': 'truck', 'n': 1}]
 
 
 def test_scope_and_energy_use_shared_rules_without_model_suffix_guessing(data):
@@ -169,7 +175,7 @@ def test_scope_and_energy_use_shared_rules_without_model_suffix_guessing(data):
     assert set(rows) == {'unknown', 'catalog'}
     assert rows['catalog']['energy_type'] == '插电式混合动力'
     assert rows['catalog']['group'] == 'nev'
-    assert rows['unknown']['group'] == 'unknown_408_409'
+    assert rows['unknown']['group'] == 'unknown_authorized'
     assert [row['product_id'] for row in candidates['scope_review']] == ['punctuation']
     assert summary['unknown_energy_outside_with_ev_model_code_not_counted'] == {'truck': 1}
 

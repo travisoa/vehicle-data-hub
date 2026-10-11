@@ -1,6 +1,6 @@
 import pytest
 
-from miit_gonggao.vehicle_classification import classify_vehicle
+from miit_gonggao.vehicle_classification import classify_vehicle, energy_group, energy_scope
 
 
 @pytest.mark.parametrize('model,name', [
@@ -67,3 +67,25 @@ def test_chassis_identity_is_distinct_from_a_complete_vehicle_using_chassis():
         'chassis': '载货汽车底盘', 'chassis_references': '[{"model_code":"ZZ1040"}]',
         'other': '上装由某厂制造，采用载货汽车底盘',
     })['inclusion_gate'] == 'accepted'
+
+
+@pytest.mark.parametrize('energy,batch,expected', [
+    # 新能源不受批次限制，包括没有批次的占位行。
+    ('纯电动', 214, 'nev'), ('插电式混合动力', '410', 'nev'), ('增程式', '', 'nev'), ('燃料电池', None, 'nev'),
+    # 燃油、普通混动和动力未知从第 408 批起放行，此后的新批次一样；批次写成字符串也一样。
+    ('燃油', 408, 'non_nev_batch'), ('混合动力', '409', 'non_nev_batch'), ('未知', 408, 'non_nev_batch'),
+    ('燃油', 410, 'non_nev_batch'), ('未知', '412', 'non_nev_batch'),
+    ('燃油', 407, 'outside'), ('混合动力', '407', 'outside'), ('燃油', '', 'outside'),
+    ('未知', 407, 'needs_nev_evidence'), ('未知', None, 'needs_nev_evidence'),
+    # 无法识别的能源值和非数字批次不能被当成授权。
+    ('新能源', 408, 'non_nev_batch'), ('新能源', 407, 'needs_nev_evidence'), ('燃油', '408批', 'outside'),
+])
+def test_energy_scope_is_one_rule_for_energy_and_batch(energy, batch, expected):
+    assert energy_scope(energy, batch) == expected
+
+
+def test_energy_groups_keep_ordinary_hybrid_and_unknown_out_of_nev():
+    assert energy_group('混合动力') == '燃油'
+    assert energy_group('增程式') == '新能源'
+    assert energy_group('未知') is None
+    assert energy_group('') is None

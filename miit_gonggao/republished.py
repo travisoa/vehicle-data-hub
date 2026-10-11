@@ -260,7 +260,7 @@ def from_status(site_db: Path, *, catalog_db: Path | None = None, pdf_root: Path
                              generation=generation, notes=notes)
 
 
-def verify_against_api(rows: list[dict[str, Any]], *, query: Any = None,
+def verify_against_api(rows: list[dict[str, Any]], *, source: Any = None,
                        on_result: Any = None) -> dict[str, list[dict[str, Any]]]:
     """按型号查正式接口，核实记录批次是否真的取得到。
 
@@ -274,9 +274,9 @@ def verify_against_api(rows: list[dict[str, Any]], *, query: Any = None,
     - ``missing``：接口查不到该精确型号；
     - ``failed``：本次查询失败，未核实，不能据此下结论。
     """
-    from miit_gonggao import core
+    from miit_gonggao.announcement_source import OFFICIAL
 
-    query = query or core.query_all_pages
+    source = source or OFFICIAL
     result: dict[str, list[dict[str, Any]]] = {
         "confirmed": [], "stale_record": [], "missing": [], "failed": []}
     for index, row in enumerate(rows, start=1):
@@ -284,7 +284,7 @@ def verify_against_api(rows: list[dict[str, Any]], *, query: Any = None,
         recorded = row.get("republished_batch")
         outcome = dict(row)
         try:
-            api_rows = query(model_code=model, page_size=50)
+            api_rows = source.query(model)
         except Exception as exc:  # noqa: BLE001 - 单条失败不能中断整批核实
             outcome["verify_error"] = f"{type(exc).__name__}: {exc}"
             bucket = "failed"

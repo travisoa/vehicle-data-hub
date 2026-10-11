@@ -43,6 +43,8 @@ for _path in (UPSTREAM_ROOT, Path(__file__).resolve().parent):
         sys.path.insert(0, str(_path))
 
 from miit_gonggao import core, republished  # noqa: E402
+from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource  # noqa: E402
+from miit_gonggao.collection_run import PRODUCT_OUTCOMES, CollectionRun, unfinished_runs  # noqa: E402
 from miit_gonggao.review_export import lookup_catalog, parse_gonggao_pdf  # noqa: E402
 
 CATALOG_NAME = "减免车辆购置税的新能源汽车车型目录"
@@ -77,36 +79,6 @@ def database_lock(site_db: Path):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def begin_model(conn: sqlite3.Connection, run_id: int, order: int, vehicle_id: int) -> None:
-    conn.execute(
-        "INSERT INTO run_models(run_id,sort_order,vehicle_id,status,error) VALUES (?,?,?,'querying','') "
-        "ON CONFLICT(run_id,vehicle_id) DO UPDATE SET status='querying',error='',sort_order=excluded.sort_order",
-        (run_id, order, vehicle_id),
-    )
-    conn.commit()
-
-
-def finish_model(conn: sqlite3.Connection, run_id: int, vehicle_id: int, status: str, error: str = "") -> None:
-    conn.execute("UPDATE run_models SET status=?,error=? WHERE run_id=? AND vehicle_id=?",
-                 (status, error, run_id, vehicle_id))
-    conn.commit()
-
-
-def finish_run(conn: sqlite3.Connection, run_id: int, counts: dict, reason: str = "") -> int:
-    """统一记录阶段统计与中断结局；完成时间不代表所有产品成功。"""
-    columns = ("query_failures", "download_failures", "non_pdf_documents", "awaiting_effective",
-               "parse_failures", "publish_failures", "image_failures")
-    interrupted = conn.execute(
-        "UPDATE run_models SET status='interrupted',error=COALESCE(NULLIF(error,''),?) "
-        "WHERE run_id=? AND status='querying'",
-        (reason or "本轮采集中断，未完成该型号", run_id),
-    ).rowcount
-    conn.execute("UPDATE ingestion_runs SET completed_at=?, " + ",".join(f"{key}=?" for key in columns)
-                 + " WHERE id=?", [utc_now(), *(counts.get(key, 0) for key in columns), run_id])
-    conn.commit()
-    return interrupted
 
 
 def refresh_collection_status(db_path: Path | None, *, catalog_db: Path, pdf_root: Path,
@@ -522,12 +494,12 @@ def select_republished_product_rows(
 
 
 def query_republished_candidate_batches(
-    model_code: str, candidates: list[dict[str, Any]]
+    model_code: str, candidates: list[dict[str, Any]], source: AnnouncementSource = OFFICIAL
 ) -> list[dict[str, Any]]:
     """按清单的正式批次查询，避免无批次型号查询只返回旧版。"""
     rows_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
     for batch in sorted({int(row["republished_batch"]) for row in candidates}):
-        for row in core.query_all_pages(model_code=model_code, pc=str(batch), page_size=50):
+        for row in source.query(model_code, batch):
             identity = (
                 str(row.get("clxh") or "").strip().upper(),
                 str(row.get("cpid") or "").strip(),
@@ -635,14 +607,33 @@ def relative_pdf_path(path: Path, pdf_root: Path) -> str:
 
 
 class StoreOutcome(tuple):
-    """store_announcement 的 (ok, message) 两项结果；image_failed 单列图片异常，调用方不从文案里查找。"""
+    """store_announcement 的结果，仍可按 (ok, message) 解包。
 
+    status 是单产品结局（见 collection_run.PRODUCT_OUTCOMES），image_failed 单列图片异常；
+    调用方按这两个字段分类，不从文案里查找。成功时 status 默认为 downloaded。
+    """
+
+    status: str
     image_failed: bool
 
-    def __new__(cls, ok: bool, message: str, image_failed: bool = False) -> "StoreOutcome":
+    def __new__(cls, ok: bool, message: str, image_failed: bool = False, *,
+                status: str | None = None) -> "StoreOutcome":
+        status = status or ("downloaded" if ok else "")
+        if status not in PRODUCT_OUTCOMES or (status == "downloaded") != bool(ok):
+            raise ValueError(f"store 结局与 ok 不一致：{ok!r} / {status!r}")
         outcome = super().__new__(cls, (ok, message))
+        outcome.status = status
         outcome.image_failed = image_failed
         return outcome
+
+    @property
+    def message(self) -> str:
+        return self[1]
+
+    @property
+    def has_pdf(self) -> bool:
+        """取得了有效 PDF；解析失败的 PDF 也算，参数问题另行处理。"""
+        return self.status in {"downloaded", "parse_failed"}
 
 
 def store_announcement(
@@ -654,6 +645,7 @@ def store_announcement(
     download_root: Path,
     pdf_root: Path,
     catalog_db: Path,
+    source: AnnouncementSource = OFFICIAL,
 ) -> StoreOutcome:
     from miit_gonggao.images import publish_images, record_image_failure
 
@@ -681,16 +673,17 @@ def store_announcement(
         byte_count = 0
         relative_path = f"failed/{safe_part(product_id)}"
         error = ""
+        status = "downloaded"
         image_error = ""
         try:
-            downloaded = core.download_param_page(row, staging)
+            downloaded = source.download(row, staging)
             path, is_pdf, byte_count = downloaded
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             image_result = getattr(downloaded, "images", None)
             if image_result and image_result["failed"]:
                 image_error = f"图片下载不完整：{image_result['failed']} 项失败；{image_result.get('error', '')}"
         except Exception as exc:
-            error = f"下载失败：{type(exc).__name__}: {exc}"
+            error, status = f"下载失败：{type(exc).__name__}: {exc}", "download_failed"
             is_pdf, byte_count, digest = False, 0, None
         else:
             if is_pdf:
@@ -699,9 +692,9 @@ def store_announcement(
                 except Exception as exc:
                     parse_error = f"{type(exc).__name__}: {exc}"
                 if parse_error:
-                    error = f"解析失败：{parse_error}"
+                    error, status = f"解析失败：{parse_error}", "parse_failed"
             else:
-                error = "接口返回非 PDF，已存为 HTML"
+                error, status = "接口返回非 PDF，已存为 HTML", "non_pdf"
             # 所有完整下载都发布到上游规范目录；解析失败不改变原文件的 PDF 身份。
             try:
                 folder.mkdir(parents=True, exist_ok=True)
@@ -721,7 +714,8 @@ def store_announcement(
                 # 发布失败不能把暂存路径作为正式文档写入；保留原文件供恢复并记录位置。
                 keep_staging = True
                 retained = relative_pdf_path(path, pdf_root)
-                return StoreOutcome(False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}")
+                return StoreOutcome(False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}",
+                                    status="publish_failed")
 
             # 失败重采不改写旧版本：图片与历史索引照常发布，已有的当前图片索引保持不变。
             replace_current = not (previous and error)
@@ -737,7 +731,7 @@ def store_announcement(
         if previous and error:
             # 失败重采不改写任何旧版本，包括 HTML 和仅回填了目录字段的记录。
             return StoreOutcome(False, "; ".join(value for value in (error, image_error) if value),
-                                bool(image_error))
+                                bool(image_error), status=status)
 
         conn.execute("SAVEPOINT store_announcement")
         try:
@@ -784,7 +778,7 @@ def store_announcement(
             conn.execute("RELEASE store_announcement")
         # PDF 状态不因图片失败回滚；上层按 image_failed 单独统计图片异常。
         return StoreOutcome(is_pdf and not error, "; ".join(value for value in (error, image_error) if value),
-                            bool(image_error))
+                            bool(image_error), status=status)
     finally:
         if not keep_staging:
             try:
@@ -816,7 +810,7 @@ def backfill_catalog_fields(conn: sqlite3.Connection, catalog_db: Path) -> int:
     return updated
 
 
-def catalog_main(argv: list[str] | None = None) -> int:
+def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="固定产品清单模式：main.py gonggao collect --manifest <路径> --help。默认校验，--apply 才下载。",
@@ -881,7 +875,8 @@ def catalog_main(argv: list[str] | None = None) -> int:
         help="本进程请求最小间隔（秒），须与最大间隔同时给出；默认沿用 core 的 0.8–1.8",
     )
     parser.add_argument(
-        "--max-interval", type=float, help="本进程请求最大间隔（秒），须与最小间隔同时给出",
+        "--max-interval", type=float,
+        help="本进程请求最大间隔（秒），须与最小间隔同时给出；遇查询/下载失败、图片异常或非 PDF 恢复默认",
     )
     parser.add_argument("--no-images", action="store_true", help="只下载 PDF，不获取详情页原图")
     parser.add_argument("--catalog-db", type=Path, default=DEFAULT_CATALOG_DB)
@@ -911,13 +906,13 @@ def catalog_main(argv: list[str] | None = None) -> int:
     with database_lock(args.site_db):
         if args.site_db.exists():
             with closing(sqlite3.connect(f"file:{args.site_db}?mode=ro", uri=True)) as conn:
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='ingestion_runs'").fetchone():
-                    if conn.execute("SELECT 1 FROM ingestion_runs WHERE completed_at IS NULL").fetchone():
-                        raise RuntimeError("存在未完成采集，不能另起一轮")
-        return _collect_catalog(args, parser)
+                if unfinished_runs(conn):
+                    raise RuntimeError("存在未完成采集，不能另起一轮")
+        return _collect_catalog(args, parser, source)
 
 
-def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
+                     source: AnnouncementSource = OFFICIAL) -> int:
     republish_mode = bool(args.republished_from_status or args.republished_batch)
     if args.republished_from_status and args.republished_batch:
         parser.error("--republished-from-status 与 --republished-batch 只能选一个来源")
@@ -992,7 +987,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
             with request_pace(args):
                 verification = republished.verify_against_api(
-                    republished_source.rows, on_result=_report)
+                    republished_source.rows, source=source, on_result=_report)
             print("核实结果：" + "、".join(
                 f"{name} {len(items)} 条" for name, items in verification.items()), flush=True)
         selection_path = write_republished_snapshot(
@@ -1055,65 +1050,48 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             "selection_snapshot": str(selection_path),
             "selected_product_ids": [row["product_id"] for row in republished_source.rows],
         }
-    cursor = conn.execute(
-        "INSERT INTO ingestion_runs(started_at, selector_json, selected_models, parse_failures, publish_failures) "
-        "VALUES (?, ?, ?, 0, 0)",
-        (utc_now(), json.dumps(selector, ensure_ascii=False, sort_keys=True), len(selected)),
-    )
-    run_id = int(cursor.lastrowid)
+    # 回填可重复执行，放在认领轮次之前：回填失败或被中断时不留下未完成轮次挡住后续采集。
     backfilled = backfill_catalog_fields(conn, args.catalog_db)
     conn.commit()
     if backfilled:
         print(f"已补齐 {backfilled} 份既有公告的目录参数。", flush=True)
+    run = CollectionRun(conn, catalog_db=args.catalog_db, pdf_root=UPSTREAM_ROOT, reason="catalog_collection",
+                        db_path=args.site_db)
+    run_id = run.claim(selector, len(selected))
 
-    query_failures = download_failures = non_pdf = parse_failures = publish_failures = image_failures = 0
-    awaiting_effective = announcement_count = pdf_count = 0
+    announcement_count = pdf_count = 0
     pace_warning = ""
     try:
-        # 提速与 --no-images 只覆盖本进程；下载或查询失败会自动恢复默认间隔。
+        # 提速与 --no-images 只覆盖本进程；查询、下载、图片或非 PDF 异常会自动恢复默认间隔。
         with request_pace(args) as pace, core.image_downloads(not getattr(args, "no_images", False)):
+            run.pace = pace
             for index, item in enumerate(selected, start=1):
                 vehicle_id = upsert_vehicle(conn, item)
-                begin_model(conn, run_id, index, vehicle_id)
+                run.begin_model(index, vehicle_id)
                 print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
                 try:
                     if republish_mode:
                         rows = query_republished_candidate_batches(
-                            item["model_code"], republished_by_model[item["model_code"].upper()]
+                            item["model_code"], republished_by_model[item["model_code"].upper()], source
                         )
                     else:
-                        rows = core.query_all_pages(model_code=item["model_code"], page_size=50)
+                        rows = source.query(item["model_code"])
                     rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
                 except Exception as exc:
-                    query_failures += 1
-                    pace.slow_down("query_failed")
                     message = f"{type(exc).__name__}: {exc}"
-                    conn.execute(
-                        "UPDATE run_models SET status='query_failed', error=? WHERE run_id=? AND vehicle_id=?",
-                        (message, run_id, vehicle_id),
-                    )
-                    conn.commit()
+                    run.query_failed(vehicle_id, message)
                     print(f"  查询失败：{message}", file=sys.stderr, flush=True)
                     continue
                 if not rows:
                     if republish_mode:
-                        awaiting_effective += 1
+                        run.count("awaiting_effective")
                         message = (
                             f"记录第{item['republished_batch']}批重新发布，正式接口现在查不到该精确型号"
                         )
-                        conn.execute(
-                            "UPDATE run_models SET status='awaiting_effective', error=? "
-                            "WHERE run_id=? AND vehicle_id=?",
-                            (message, run_id, vehicle_id),
-                        )
-                        conn.commit()
+                        run.finish_model(vehicle_id, "awaiting_effective", message)
                         print(f"  接口与记录不一致：{message}", flush=True)
                         continue
-                    conn.execute(
-                        "UPDATE run_models SET status='no_match', error='' WHERE run_id=? AND vehicle_id=?",
-                        (run_id, vehicle_id),
-                    )
-                    conn.commit()
+                    run.finish_model(vehicle_id, "no_match")
                     print("  公告接口未找到精确型号。", flush=True)
                     continue
 
@@ -1123,15 +1101,10 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                         rows, republished_by_model[item["model_code"].upper()]
                     )
                     if unresolved:
-                        awaiting_effective += 1
+                        run.count("awaiting_effective")
                         if not rows:
                             message = "; ".join(unresolved)
-                            conn.execute(
-                                "UPDATE run_models SET status='awaiting_effective', error=? "
-                                "WHERE run_id=? AND vehicle_id=?",
-                                (message, run_id, vehicle_id),
-                            )
-                            conn.commit()
+                            run.finish_model(vehicle_id, "awaiting_effective", message)
                             print(f"  接口与记录不一致：{message}", flush=True)
                             continue
 
@@ -1147,30 +1120,15 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                         download_root=args.download_root,
                         pdf_root=UPSTREAM_ROOT,
                         catalog_db=args.catalog_db,
+                        source=source,
                     )
-                    ok_pdf, message = outcome
-                    if ok_pdf or message.startswith("解析失败"):
+                    run.record(outcome)
+                    if outcome.has_pdf:
                         pdf_count += 1
                         model_pdf_count += 1
-                    # 兼容只返回 (ok, message) 的替身，与 download_param_page 的 .images 同一做法
-                    if getattr(outcome, "image_failed", False):
-                        image_failures += 1
-                        pace.slow_down("image_failed")
-                        if ok_pdf:
-                            errors.append(message)
-                    if not ok_pdf:
-                        if message.startswith("下载失败"):
-                            download_failures += 1
-                            pace.slow_down("download_failed")
-                        elif message.startswith("解析失败"):
-                            parse_failures += 1
-                        elif message.startswith("发布失败"):
-                            publish_failures += 1
-                        else:
-                            non_pdf += 1
-                        errors.append(message)
-                status = "done" if not errors else "partial"
-                finish_model(conn, run_id, vehicle_id, status, "; ".join(errors))
+                    if outcome.image_failed or not outcome[0]:
+                        errors.append(outcome.message)
+                run.finish_model(vehicle_id, "done" if not errors else "partial", "; ".join(errors))
                 print(
                     f"  公告 {len(rows)} 条；PDF {model_pdf_count} 条；"
                     f"异常 {len(errors)} 条",
@@ -1179,24 +1137,19 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     finally:
         pace_warning = pace.warning
         try:
-            interrupted = finish_run(conn, run_id, {
-                "query_failures": query_failures, "download_failures": download_failures,
-                "non_pdf_documents": non_pdf, "awaiting_effective": awaiting_effective,
-                "parse_failures": parse_failures, "publish_failures": publish_failures,
-                "image_failures": image_failures,
-            })
+            interrupted = run.finish()
         finally:
             conn.close()
-            refresh_collection_status(args.site_db, catalog_db=args.catalog_db,
-                                      pdf_root=UPSTREAM_ROOT, run_id=run_id, reason="catalog_collection")
         if interrupted:
             print(f"本轮有 {interrupted} 个型号因中断未完成，已标记 interrupted。", file=sys.stderr, flush=True)
 
+    counts = run.counts
     print(
         f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
-        f"接口与记录不一致 {awaiting_effective}，查询失败 {query_failures}，"
-        f"下载失败 {download_failures}，解析失败 {parse_failures}，发布失败 {publish_failures}，"
-        f"图片异常产品 {image_failures}，非 PDF {non_pdf}。"
+        f"接口与记录不一致 {counts['awaiting_effective']}，查询失败 {counts['query_failures']}，"
+        f"下载失败 {counts['download_failures']}，解析失败 {counts['parse_failures']}，"
+        f"发布失败 {counts['publish_failures']}，"
+        f"图片异常产品 {counts['image_failures']}，非 PDF {counts['non_pdf_documents']}。"
         + (f"\n{pace_warning}" if pace_warning else "")
         + f"\n数据库：{args.site_db}\n目录快照：{selection_path}",
         flush=True,
@@ -1219,16 +1172,15 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         except Exception as exc:  # noqa: BLE001
             print(f"采集报告生成失败（不影响采集结果）：{type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
-    return 2 if any((awaiting_effective, query_failures, download_failures,
-                     parse_failures, publish_failures, non_pdf, image_failures)) else 0
+    return 2 if any(counts.values()) else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--manifest" in argv or any(arg.startswith("--manifest=") for arg in argv):
         from .collection_manifest import main as manifest_main
-        return manifest_main(argv)
-    return catalog_main(argv)
+        return manifest_main(argv, source=source)
+    return catalog_main(argv, source=source)
 
 
 if __name__ == "__main__":

@@ -20,18 +20,18 @@ from miit_gonggao import collection_tracking as T
 from miit_gonggao.collection_coverage import best_model_outcomes, coverage_buckets
 from miit_gonggao.core import safe_part
 from miit_gonggao.vehicle_categories import _ENERGY_KEYWORDS, derive_channel, normalize_energy
-from miit_gonggao.vehicle_classification import COLLECTION_SCOPE, classify_vehicle
+from miit_gonggao.vehicle_classification import (COLLECTION_SCOPE, NON_NEV_BATCH_LABEL, NON_NEV_FIRST_BATCH,
+                                                 classify_vehicle, energy_group, energy_scope, non_nev_batch)
 
 TZ = ZoneInfo('Asia/Shanghai')
-NEV = {'纯电动', '插电式混合动力', '增程式', '燃料电池'}
-FUEL = {'燃油', '混合动力'}
-FUEL_BATCHES = {408, 409}
+# 分组键不带批次号：授权批次只在 vehicle_classification 定义，标签随它生成。
 IN_SCOPE_GROUPS = {
     'nev': '新能源（历史及近期）',
-    'fuel_408_409': '第408/409批燃油或普通混动',
-    'unknown_408_409': '第408/409批能源未确认候选',
+    'fuel_authorized': f'{NON_NEV_BATCH_LABEL}燃油或普通混动',
+    'unknown_authorized': f'{NON_NEV_BATCH_LABEL}能源未确认候选',
 }
-BANDS = ((173, 299), (300, 349), (350, 399), (400, 407), (408, 409))
+GROUP_BY_ENERGY_SCOPE = {'nev': 'nev', 'outside': 'fuel_outside', 'needs_nev_evidence': 'unknown_energy_outside'}
+BANDS = ((173, 299), (300, 349), (350, 399), (400, NON_NEV_FIRST_BATCH - 1), (NON_NEV_FIRST_BATCH, None))
 VALID_PDF_STATES = {'parsed', 'pdf_unparsed'}
 EV_MODEL_CODE = re.compile(r'(BEV|PHEV|FCEV|REEV|EREV)')
 REQUIRED_TABLES = {'ingestion_runs', 'vehicles', 'batches', 'announcements', 'documents',
@@ -42,8 +42,8 @@ NON_PDF_RESPONSE = re.compile(
 
 def band(batch: int | None) -> str:
     for low, high in BANDS:
-        if batch is not None and low <= batch <= high:
-            return f'{low}-{high}'
+        if batch is not None and low <= batch and (high is None or batch <= high):
+            return f'{low}+' if high is None else f'{low}-{high}'
     return 'other'
 
 
@@ -158,7 +158,7 @@ def load_caches(cache_dir: Path, observed_at: datetime):
             entry['model_batches'].add((model, batch))
             # Only authorized fuel occurrences need an extra full product row;
             # preserve historical identity pairs without retaining every JSON copy.
-            if batch in FUEL_BATCHES:
+            if non_nev_batch(batch):
                 entry['records_by_batch'][batch] = item
             if batch >= entry['batch']:
                 entry['batch'], entry['rec'] = batch, item
@@ -459,9 +459,9 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
                                                found['fields'].get('model_full', ''), cat_energy)
         else:
             energy, esource = normalize_energy('', name, '', cat_energy)
-        # A later out-of-scope fuel batch must not hide an authorized 408/409 occurrence.
-        authorized = entry['batches'] & FUEL_BATCHES
-        if energy not in NEV and authorized:
+        # A later out-of-scope fuel batch must not hide an authorized non-NEV occurrence.
+        authorized = {value for value in entry['batches'] if non_nev_batch(value)}
+        if energy_group(energy) != '新能源' and authorized:
             batch = max(authorized)
             rec = entry['records_by_batch'][batch]
             model, name = str(rec.get('clxh') or '').strip(), str(rec.get('clmc') or '').strip()
@@ -471,12 +471,12 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
             group = 'excluded'
         elif gate == 'pending_review':
             group = 'scope_review'
-        elif energy in NEV:
-            group = 'nev'
-        elif batch in FUEL_BATCHES:
-            group = 'fuel_408_409' if energy in FUEL else 'unknown_408_409'
         else:
-            group = 'fuel_outside_408_409' if energy in FUEL else 'unknown_energy_outside_408_409'
+            energy_gate = energy_scope(energy, batch)
+            if energy_gate == 'non_nev_batch':
+                group = 'fuel_authorized' if energy_group(energy) == '燃油' else 'unknown_authorized'
+            else:
+                group = GROUP_BY_ENERGY_SCOPE[energy_gate]
         state = found['state'] if found else 'missing'
         universe[(group, state)] += 1
         product_group_state[pid] = (group, state)
@@ -493,7 +493,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         if group not in IN_SCOPE_GROUPS:
             if state == 'missing' and group != 'excluded':
                 outside_missing[(group, channel)] += 1
-                if group == 'unknown_energy_outside_408_409' and EV_MODEL_CODE.search(model.upper()):
+                if group == 'unknown_energy_outside' and EV_MODEL_CODE.search(model.upper()):
                     outside_ev_code[channel] += 1
             continue
         by_group_channel[(group, channel, state)] += 1
@@ -573,7 +573,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         'collection_scope': COLLECTION_SCOPE,
         'method': [
             '证据范围仅为通过完整性校验的本地批次缓存，不声明覆盖官方实时全集；过期缓存保留并单独标记。',
-            '产品按产品ID去重；新能源取最大批次；燃油及能源未确认取已出现的408/409批中的最大批次。',
+            f'产品按产品ID去重；新能源取最大批次；燃油及能源未确认取已出现的{NON_NEV_BATCH_LABEL}批次中的最大批次。',
             '范围和能源复用classify_vehicle/normalize_energy；能源未确认保留为候选，不等于已确认符合收录条件。',
             '文档检查路径边界、实际大小、%PDF文件头和解析状态；不重算PDF SHA-256，不证明文件完整哈希一致。',
             '目录六桶复用collection_coverage，为独立型号维度和业务记录结局，不与产品ID、事件计数相加。',

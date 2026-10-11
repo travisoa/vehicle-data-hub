@@ -2,7 +2,8 @@
 """按 SHA256 冻结的汽车整车产品 ID 清单补采，默认只校验、预览。
 
 复用 seed 的下载、解析、规范目录和逐份发布逻辑；不查询其他型号或公告批次。
-新能源 scope 保持历史整车范围；通用 scope 另允许第 408、409 批的非新能源或能源待确认整车。
+新能源 scope 保持历史整车范围；通用 scope 另按 vehicle_classification.energy_scope 允许
+第 408 批及以后的非新能源或能源待确认整车。
 每份提交后记录 results.jsonl 和原子 progress.json；可用原清单恢复同一 run。
 """
 from __future__ import annotations
@@ -25,18 +26,20 @@ if __package__:
     from . import collection as seed
     from .vehicle_categories import CHANNEL_LABELS, derive_channel, normalize_energy
     from .collection_report import write_report
-    from .vehicle_classification import classify_vehicle
+    from .announcement_source import OFFICIAL, AnnouncementSource
+    from .collection_run import CollectionRun
+    from .vehicle_classification import classify_vehicle, energy_group, energy_scope
 else:
     from miit_gonggao import collection as seed
     from miit_gonggao.vehicle_categories import CHANNEL_LABELS, derive_channel, normalize_energy
     from miit_gonggao.collection_report import write_report
-    from miit_gonggao.vehicle_classification import classify_vehicle
+    from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource
+    from miit_gonggao.collection_run import CollectionRun
+    from miit_gonggao.vehicle_classification import classify_vehicle, energy_group, energy_scope
 
 SCOPE = "nev_complete_manifest_v1"
 LEGACY_SCOPE = "uncollected_nev_complete_20260912"
 AUTOMOTIVE_SCOPE = "automotive_complete_manifest_v1"
-NON_NEV_BATCHES = frozenset({408, 409})
-NEV_TYPES = {"纯电动", "插电式混合动力", "增程式", "燃料电池"}
 SUCCESS = {"downloaded", "skipped_existing"}
 
 
@@ -64,7 +67,7 @@ def validate_catalog_energy(rows: list[tuple[str, str, str]], catalog_db: Path |
                 } - {"", "新能源", "新能源汽车"}
             labels = catalog_by_model[model]
             energies = {normalize_energy("", "", "", label)[0] for label in labels}
-            if len(energies) != 1 or not energies <= NEV_TYPES:
+            if len(energies) != 1 or energy_group(next(iter(energies))) != "新能源":
                 raise ValueError(f"目录缺少唯一明确新能源证据或存在能源冲突：{product_id} ({model})")
             # 目录也不能把明确的普通混动产品名直接覆盖成纯电动等不相容能源。
             if any(normalize_energy("", name, "", label)[0] not in energies for label in labels):
@@ -98,8 +101,8 @@ def load_manifest(path: Path, expected_hash: str, catalog_db: Path | None = None
             raise ValueError(f"产品 ID 和型号必须为无首尾空白的字符串：{product_id!r}")
         if classify_vehicle(model, name, row)["inclusion_gate"] != "accepted":
             raise ValueError(f"清单含非汽车整车或范围待确认产品：{product_id}")
-        needs_nev = scope != AUTOMOTIVE_SCOPE or int(batch) not in NON_NEV_BATCHES
-        if needs_nev and normalize_energy("", name, "", "")[0] not in NEV_TYPES:
+        energy = energy_scope(normalize_energy("", name, "", "")[0], batch)
+        if energy != "nev" and not (scope == AUTOMOTIVE_SCOPE and energy == "non_nev_batch"):
             needs_catalog.append((product_id, model, name))
         ids.add(product_id)
         models.add(model)
@@ -197,41 +200,19 @@ def vehicle_id(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
     })
 
 
-def claim_run(conn: sqlite3.Connection, args: argparse.Namespace, manifest: dict[str, Any]) -> int:
-    seed.ensure_schema(conn)
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        unfinished = [r[0] for r in conn.execute("SELECT id FROM ingestion_runs WHERE completed_at IS NULL")]
-        if any(run_id != args.resume_run for run_id in unfinished):
-            raise RuntimeError(f"存在其他未结束采集轮次，拒绝启动：{unfinished}")
-        if args.resume_run is not None:
-            row = conn.execute("SELECT selector_json FROM ingestion_runs WHERE id=?", (args.resume_run,)).fetchone()
-            selector = json.loads(row[0]) if row else {}
-            if (selector.get("manifest_sha256") != args.manifest_sha256.lower()
-                    or selector.get("scope") != manifest['scope']
-                    or selector.get("mode") != "cached_product_manifest"):
-                raise RuntimeError("恢复轮次不存在或 manifest SHA256/scope 不匹配")
-            run_id = args.resume_run
-            conn.execute("UPDATE ingestion_runs SET completed_at=NULL WHERE id=?", (run_id,))
-            conn.execute("UPDATE run_models SET status='interrupted', error='上次进程未完成该型号' "
-                         "WHERE run_id=? AND status='querying'", (run_id,))
-        else:
-            selector = {"mode": "cached_product_manifest", "scope": manifest['scope'],
-                        "manifest_sha256": args.manifest_sha256.lower(), "manifest": str(args.manifest.resolve()),
-                        "expected_products": manifest["expected_products"], "run_dir": str(args.run_dir.resolve()),
-                        "source_boundary": manifest.get("source_boundary")}
-            cursor = conn.execute(
-                "INSERT INTO ingestion_runs(started_at,selector_json,selected_models,parse_failures,publish_failures) "
-                "VALUES (?,?,?,0,0)", (seed.utc_now(), json.dumps(selector, ensure_ascii=False),
-                                      manifest["expected_models"]),
-            )
-            run_id = int(cursor.lastrowid)
-        conn.commit()
-        return run_id
-    except BaseException:
-        conn.rollback()
-        raise
+def claim_run(run: CollectionRun, args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    seed.ensure_schema(run.conn)
+    sha256 = args.manifest_sha256.lower()
+    selector = {"mode": "cached_product_manifest", "scope": manifest['scope'],
+                "manifest_sha256": sha256, "manifest": str(args.manifest.resolve()),
+                "expected_products": manifest["expected_products"], "run_dir": str(args.run_dir.resolve()),
+                "source_boundary": manifest.get("source_boundary")}
+    return run.claim(
+        selector, manifest["expected_models"], resume_run=args.resume_run,
+        resume_matches=lambda old: (old.get("manifest_sha256") == sha256 and old.get("scope") == manifest['scope']
+                                    and old.get("mode") == "cached_product_manifest"),
+        mismatch_message="恢复轮次不存在或 manifest SHA256/scope 不匹配",
+    )
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -244,34 +225,8 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def failure_status(message: str) -> str:
-    for prefix, status in (("下载失败", "download_failed"), ("解析失败", "parse_failed"),
-                           ("发布失败", "publish_failed"), ("接口返回非 PDF", "non_pdf")):
-        if message.startswith(prefix):
-            return status
-    return "storage_failed"
-
-
-def is_source_generation_error(message: str, pdf_root: Path) -> bool:
-    """仅识别已核验的单产品参数页缺失/生成异常；未知 HTML 仍执行降速保护。"""
-    if not message.startswith("接口返回非 PDF"):
-        return False
-    _prefix, separator, relative = message.partition("；原文件：")
-    if not separator or not relative:
-        return False
-    path = (pdf_root / relative).resolve()
-    if not path.is_relative_to(pdf_root.resolve()):
-        return False
-    try:
-        content = path.read_bytes()
-    except OSError:
-        return False
-    return ("获取参数页发生错误".encode() in content
-            and (b"Byte data not found at location" in content
-                 or "没有找到参数页".encode() in content))
-
-
-def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag | None = None) -> int:
+def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag | None = None, *,
+            source: AnnouncementSource = OFFICIAL) -> int:
     stop = stop or StopFlag()
     args.site_db.parent.mkdir(parents=True, exist_ok=True)
     args.run_dir.mkdir(parents=True, exist_ok=True)
@@ -289,8 +244,10 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
     with (request_pace(args) as pace, seed.core.image_downloads(not getattr(args, "no_images", False)),
           database_lock(args.site_db),
           closing(sqlite3.connect(args.site_db, timeout=5)) as conn):
+        run = CollectionRun(conn, catalog_db=args.catalog_db, pdf_root=args.pdf_root,
+                            reason="manifest_collection", db_path=args.site_db, pace=pace)
         try:
-            run_id = claim_run(conn, args, manifest)
+            run_id = claim_run(run, args, manifest)
             started = time.monotonic()
             counters: Counter[str] = Counter()
             processed = pdf_bytes = downloaded_bytes = attempts = source_errors = 0
@@ -319,7 +276,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                         if stop.reason:
                             break
                         vid = vehicle_id(conn, rows[0])
-                        seed.begin_model(conn, run_id, order, vid)
+                        run.begin_model(order, vid)
                         errors: list[str] = []
                         model_processed = 0
                         for row in rows:
@@ -341,11 +298,11 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                     outcome = seed.store_announcement(
                                         conn, row=row, vehicle_id=vid, market_name=model,
                                         download_root=args.pdf_root / "downloads" / "announcement_site",
-                                        pdf_root=args.pdf_root, catalog_db=args.catalog_db,
+                                        pdf_root=args.pdf_root, catalog_db=args.catalog_db, source=source,
                                     )
                                     ok, message = outcome
-                                    stored_image_failed = getattr(outcome, "image_failed", False)
-                                    status = "downloaded" if ok else failure_status(message)
+                                    stored_image_failed = outcome.image_failed
+                                    status = outcome.status
                                     current = local_document(conn, row["cpid"], args.pdf_root)
                                     byte_count = current[2] if current else 0
                                     if ok and (not current or current[0] not in {"skipped_existing", "image_failed"}):
@@ -362,12 +319,12 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             model_processed += 1
                             counters[status] += 1
                             image_failed = status == "image_failed" or stored_image_failed
-                            if image_failed:
-                                if status != "image_failed":
-                                    counters["image_failed"] += 1
-                                if attempted or image_retried:
-                                    # 只有本轮实际请求失败才降速，历史记录里的图片异常不影响请求节奏
-                                    pace.slow_down("image_failed")
+                            if image_failed and status != "image_failed":
+                                counters["image_failed"] += 1
+                            # 只有本轮实际请求过源站才降速，历史记录里的图片异常不影响请求节奏
+                            source_error = run.record_product(status, image_failed=image_failed,
+                                                              live=attempted or image_retried, message=message)
+                            source_errors += int(source_error)
                             pdf_bytes += byte_count if status in SUCCESS else 0
                             downloaded_bytes += byte_count if status == "downloaded" else 0
                             if status not in SUCCESS or image_failed:
@@ -375,10 +332,6 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                 print(f"[{processed}/{manifest['expected_products']}] {model} "
                                       f"{row['cpid']} {status}: {message}",
                                       file=sys.stderr, flush=True)
-                            source_error = status == "non_pdf" and is_source_generation_error(message, args.pdf_root)
-                            source_errors += int(source_error)
-                            if status == "download_failed" or (status == "non_pdf" and not source_error):
-                                pace.slow_down(status)
                             consecutive_failures = consecutive_failures + 1 if status == "download_failed" else 0
                             if consecutive_failures >= 3:
                                 stop.reason = "连续 3 次下载失败，停止本次采集"
@@ -395,7 +348,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             if processed % 50 == 0:
                                 print(json.dumps(progress("running"), ensure_ascii=False), flush=True)
                         if model_processed == len(rows):
-                            seed.finish_model(conn, run_id, vid, "partial" if errors else "done", "; ".join(errors))
+                            run.finish_model(vid, "partial" if errors else "done", "; ".join(errors))
             except (KeyboardInterrupt, InterruptedError) as exc:
                 conn.rollback()
                 stop.reason = stop.reason or f"进程中断：{type(exc).__name__}"
@@ -404,20 +357,11 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 stop.reason = f"运行中断：{type(exc).__name__}: {exc}"
                 print(stop.reason, file=sys.stderr, flush=True)
             finally:
-                try:
-                    seed.finish_run(conn, run_id, {
-                        "download_failures": counters["download_failed"], "non_pdf_documents": counters["non_pdf"],
-                        "parse_failures": counters["parse_failed"], "publish_failures": counters["publish_failed"],
-                        "image_failures": counters["image_failed"],
-                    }, stop.reason)
-                    all_successful = (sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
-                                      and not counters["image_failed"])
-                    state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
-                    atomic_json(progress_path, progress(state))
-                finally:
-                    seed.refresh_collection_status(args.site_db, catalog_db=args.catalog_db,
-                                                   pdf_root=args.pdf_root, run_id=run_id,
-                                                   reason="manifest_collection")
+                run.finish(stop.reason)
+                all_successful = (sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
+                                  and not counters["image_failed"])
+                state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
+                atomic_json(progress_path, progress(state))
             try:
                 write_report(args.site_db, run_id, args.run_dir, args.catalog_db)
             except Exception as exc:
@@ -428,7 +372,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
             conn.close()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
@@ -455,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
                              ensure_ascii=False))
             return 0
         with signal_handlers(stop := StopFlag()):
-            return collect(args, manifest, stop)
+            return collect(args, manifest, stop, source=source)
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
         print(f"拒绝采集：{exc}", file=sys.stderr, flush=True)
         return 1

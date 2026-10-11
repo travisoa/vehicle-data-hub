@@ -5,7 +5,9 @@ from .vehicle_classification import normalize_catalog_category
 
 # ---------------------------------------------------------------- 频道归类
 
-_CODE_RE = re.compile(r"^[A-Za-z]+(\d)")
+# GB 9417 产品型号：企业名称代号（大写拼音字母）后接一位车辆类别代号。进口车在目录里登记厂家型号
+# （如「i5 M60 xDrive 41FK」「Taycan 4 D131」），不带类别代号，不能从中取数字。
+_CODE_RE = re.compile(r"^[A-Z]+(\d)")
 
 CHANNEL_LABELS = {
     "passenger": "乘用车",
@@ -17,22 +19,26 @@ CHANNEL_LABELS = {
 CHANNEL_BY_LABEL = {label: channel for channel, label in CHANNEL_LABELS.items()}
 
 
-def derive_channel(model_code: str, product_name: str, *, catalog_category: str = ""
-                   ) -> tuple[str, str | None]:
+def derive_channel(model_code: str, product_name: str, *, catalog_category: str = "",
+                   catalog_hint: str = "") -> tuple[str, str | None]:
     """为已通过整车范围判断的产品映射频道，返回 (channel, 类别码)。
 
     范围由调用方携带完整证据统一判断，此处不重复推断。若范围依赖官方目录类别
     才能确认，调用方通过 catalog_category 传入该类别；其他情况按名称与型号映射。
+    catalog_hint 是同型号的官方目录类别，只在型号没有国标类别代号（进口车）且产品名
+    也判不出频道时采用。
     """
     match = _CODE_RE.match(model_code or "")
     code = match.group(1) if match else None
     catalog_channel = CHANNEL_BY_LABEL.get(normalize_catalog_category(catalog_category))
     if catalog_channel:
         return catalog_channel, code
-    if code == "5":
-        return "special", code
+    # 产品名写明乘用车时不看类别代号：国产专用汽车不以乘用车命名，类别代号同为 5 的
+    # 乘用车只见于进口车厂家型号（如玛莎拉蒂 MD54BEV1）。专用货车仍按类别代号 5 归专用车。
     if any(term in product_name for term in ("乘用车", "轿车")):
         return "passenger", code
+    if code == "5":
+        return "special", code
     if "客车" in product_name:
         return "bus", code
     if any(term in product_name for term in ("货车", "载货汽车", "自卸汽车", "牵引车")):
@@ -43,6 +49,9 @@ def derive_channel(model_code: str, product_name: str, *, catalog_category: str 
         return ("bus" if "客车" in (product_name or "") else "passenger"), code
     if code in ("1", "3", "4"):
         return "truck", code
+    hinted = CHANNEL_BY_LABEL.get(normalize_catalog_category(catalog_hint)) if code is None else None
+    if hinted:
+        return hinted, code
     return "special", code  # 已确认整车但没有通用车型名称时，按专用汽车业务入口展示。
 
 

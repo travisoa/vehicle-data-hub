@@ -16,9 +16,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 if __package__:
-    from .vehicle_classification import classify_vehicle, is_non_automotive
+    from .announcement_source import OFFICIAL, AnnouncementSource
+    from .collection_run import CollectionRun
+    from .vehicle_classification import classify_vehicle, energy_group, is_non_automotive
 else:
-    from miit_gonggao.vehicle_classification import classify_vehicle, is_non_automotive
+    from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource
+    from miit_gonggao.collection_run import CollectionRun
+    from miit_gonggao.vehicle_classification import classify_vehicle, energy_group, is_non_automotive
 
 DAYS = 60
 BATCHES = 2
@@ -375,7 +379,7 @@ def public_fingerprint(conn: sqlite3.Connection) -> str:
 
 
 def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root: Path,
-            nev_only: bool = False) -> dict:
+            nev_only: bool = False, source: AnnouncementSource = OFFICIAL) -> dict:
     # 手动下载也不能绕过整车边界；在产生运行记录或网络请求之前拒绝失效/外部拼装的计划。
     evidence = plan.scope_evidence(conn) if isinstance(plan, RetryPlan) else scope_evidence(conn)
     if any(event_scope(e, evidence)['inclusion_gate'] != 'accepted' for e in plan['pending']):
@@ -386,13 +390,11 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         from miit_gonggao import collection as seed
     nev_only = nev_only or bool(plan.get('nev_only'))
     if nev_only:
-        from miit_gonggao.collection_manifest import NEV_TYPES, validate_catalog_energy
+        from miit_gonggao.collection_manifest import validate_catalog_energy
         from miit_gonggao.vehicle_categories import normalize_energy
     seed.ensure_schema(conn)
-    db_path = next((Path(row[2]) for row in conn.execute('pragma database_list')
-                    if row[1] == 'main' and row[2]), None)
-    if conn.execute('select 1 from ingestion_runs where completed_at is null').fetchone():
-        raise RuntimeError('存在未完成采集，不能另起一轮')
+    run = CollectionRun(conn, catalog_db=catalog_db, pdf_root=pdf_root, reason='tracking_collection')
+    run.ensure_idle()
     resolved_image_failures = 0
     resolved_events = {event['event_id']: event for event in events(conn)} if plan['resolved'] else {}
     for event_id in plan['resolved']:
@@ -406,23 +408,15 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
     if not grouped:
         conn.commit()
         if plan['resolved']:
-            seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
-                                           reason="tracking_resolved")
+            run.refresh_status('tracking_resolved')
         result = {'queries': 0, 'errors': resolved_image_failures}
         if resolved_image_failures:
             result['image_failures'] = resolved_image_failures
         return result
-    run_id = conn.execute(
-        'insert into ingestion_runs(started_at,selector_json,selected_models,parse_failures,publish_failures) '
-        'values (?,?,?,0,0)', (utc_now(), json.dumps({'mode': 'recent_events', 'days': DAYS,
-                                                   'batches': BATCHES,
-                                                   'selected_batch': plan.get('selected_batch'),
-                                                   'selected_event_ids': plan.get('selected_event_ids'),
-                                                   'nev_only': nev_only}),
-                                  len({key[0] for key in grouped})),
-    ).lastrowid
-    counts = dict(query_failures=0, download_failures=0, non_pdf_documents=0,
-                  parse_failures=0, publish_failures=0, awaiting_effective=0, image_failures=0)
+    run_id = run.claim({'mode': 'recent_events', 'days': DAYS, 'batches': BATCHES,
+                        'selected_batch': plan.get('selected_batch'),
+                        'selected_event_ids': plan.get('selected_event_ids'), 'nev_only': nev_only},
+                       len({key[0] for key in grouped}))
     scope_counts = dict(scope_excluded=0, scope_review=0)
     if nev_only:
         scope_counts['energy_scope_rejected'] = 0
@@ -441,22 +435,22 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                         for e in group if json.loads(e['metadata_json']).get('category')), ''),
                     'seq': '', 'company': meta.get('company') or meta.get('qymc') or '',
                 })
-            seed.begin_model(conn, run_id, index, vehicle_id)
+            run.begin_model(index, vehicle_id)
             status, error = 'done', ''
             try:
                 # 事件只来自正式发布，登记本身就把该批次纳入最高正式批次，不存在"尚未生效"的等待。
-                rows = seed.core.query_all_pages(model_code=model, pc=str(batch), page_size=50)
+                rows = source.query(model, batch)
                 rows = [r for r in rows if str(r.get('clxh') or '').strip().upper() == model
                         and str(r.get('gppc') or r.get('pc') or '') == str(batch)]
             except Exception as exc:
                 rows = []
                 status, error = 'query_failed', str(exc)
-                counts['query_failures'] += 1
+                run.count('query_failures')
             needed = {e['product_id'] for e in group if e['product_id']}
             if rows and all(e['product_id'] for e in group):
                 rows = [r for r in rows if str(r.get('cpid')) in needed]
-            # 产品 ID -> (PDF 是否可用, 说明, 图片是否异常)
-            results: dict[str, tuple[bool, str, bool]] = {}
+            # 产品 ID -> (PDF 是否可用, 说明, 图片是否异常, 单产品结局)
+            results: dict[str, tuple[bool, str, bool, str]] = {}
             for row in rows:
                 scope = classify_vehicle(model, row.get('clmc') or '', row)
                 if scope['inclusion_gate'] != 'accepted':
@@ -465,7 +459,7 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     results[str(row.get('cpid') or '')] = (
                         False, f"官方返回产品范围校验未通过: {model} / {row.get('cpid') or '缺少产品 ID'} / "
                         f"{row.get('clmc') or '缺少产品名称 clmc'} "
-                        f"({scope['inclusion_gate']}: {scope['scope_reason']})", False,
+                        f"({scope['inclusion_gate']}: {scope['scope_reason']})", False, 'out_of_scope',
                     )
                     continue
                 if nev_only:
@@ -473,35 +467,28 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     try:
                         if any(term in name for term in ('普通混合动力', '非插电', '不可外接充电')):
                             raise ValueError('公告产品名已明确非新能源，目录能源不能覆盖该证据')
-                        if normalize_energy('', name, '', '')[0] not in NEV_TYPES:
+                        if energy_group(normalize_energy('', name, '', '')[0]) != '新能源':
                             validate_catalog_energy([(str(row.get('cpid') or ''), model, name)], catalog_db)
                     except ValueError as exc:
                         scope_counts['energy_scope_rejected'] += 1
                         results[str(row.get('cpid') or '')] = (
                             False, f'新能源范围校验未通过: {model} / {row.get("cpid") or "缺少产品 ID"} / '
-                            f'{name or "缺少产品名称 clmc"} ({exc})', False,
+                            f'{name or "缺少产品名称 clmc"} ({exc})', False, 'out_of_scope',
                         )
                         continue
                 probe = {**group[0], 'product_id': str(row['cpid'])}
                 if has_valid_documents(conn, probe, pdf_root):
                     image_error = document_image_error(conn, probe, pdf_root)
-                    counts['image_failures'] += bool(image_error)
-                    results[str(row['cpid'])] = (True, image_error, bool(image_error))
+                    run.record_product('skipped_existing', image_failed=bool(image_error), live=False)
+                    results[str(row['cpid'])] = (True, image_error, bool(image_error), 'skipped_existing')
                     continue
                 outcome = seed.store_announcement(
                     conn, row=row, vehicle_id=vehicle_id, market_name=model,
                     download_root=pdf_root / 'downloads/announcement_site',
-                    pdf_root=pdf_root, catalog_db=catalog_db,
+                    pdf_root=pdf_root, catalog_db=catalog_db, source=source,
                 )
-                ok, message = outcome
-                image_failed = getattr(outcome, 'image_failed', False)
-                results[str(row['cpid'])] = (ok or message.startswith('解析失败'), message, image_failed)
-                counts['image_failures'] += image_failed
-                if not ok:
-                    key = ('parse_failures' if message.startswith('解析失败') else
-                           'download_failures' if message.startswith('下载失败') else
-                           'publish_failures' if message.startswith('发布失败') else 'non_pdf_documents')
-                    counts[key] += 1
+                run.record(outcome)
+                results[str(row['cpid'])] = (outcome.has_pdf, outcome.message, outcome.image_failed, outcome.status)
             for event in group:
                 selected = ([results[event['product_id']]] if event['product_id'] in results else [])
                 if not event['product_id']:
@@ -510,14 +497,14 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                 if status != 'query_failed':
                     if not selected:
                         event_status = 'no_match'
-                    elif all(ok and not image_failed for ok, _, image_failed in selected):
+                    elif all(ok and not image_failed for ok, _, image_failed, _ in selected):
                         event_status = 'done'
-                    elif any(not ok for ok, _, _ in selected) and all(
-                            msg.startswith('接口返回非 PDF') for ok, msg, _ in selected if not ok):
+                    elif any(not ok for ok, _, _, _ in selected) and all(
+                            outcome == 'non_pdf' for ok, _, _, outcome in selected if not ok):
                         event_status = 'no_document'
                     else:
                         event_status = 'partial'
-                    event_error = '; '.join(msg for _, msg, _ in selected if msg)
+                    event_error = '; '.join(msg for _, msg, _, _ in selected if msg)
                 conn.execute(
                     'update tracking_events set status=?,last_checked_at=?,next_check_at=?, '
                     'attempts=attempts+1,last_error=? where event_id=?',
@@ -536,15 +523,12 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                             if 'awaiting_effective' in event_states else 'no_match'
                             if all(s == 'no_match' for s in event_states) else 'partial')
             if model_status == 'awaiting_effective':
-                counts['awaiting_effective'] += 1
-            seed.finish_model(conn, run_id, vehicle_id, model_status, model_error)
+                run.count('awaiting_effective')
+            run.finish_model(vehicle_id, model_status, model_error)
             checked += 1
     finally:
-        try:
-            seed.finish_run(conn, run_id, counts)
-        finally:
-            seed.refresh_collection_status(db_path, catalog_db=catalog_db, pdf_root=pdf_root,
-                                           run_id=run_id, reason="tracking_collection")
+        run.finish()
+    counts = run.counts
     errors = (sum(counts[k] for k in ('query_failures', 'download_failures', 'publish_failures', 'image_failures'))
               + sum(scope_counts.values()) + resolved_image_failures)
     return {'run_id': run_id, 'queries': checked, 'errors': errors, **counts, **scope_counts}
