@@ -91,7 +91,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   历代 `snapshots/<generation>/{summary.json,candidates.json,report.md}` 保留；刷新失败读
   `last-error.json`，旧 latest 不能当作本次结果。批次收尾统一更新，不在每条 PDF 后全量计算。
   产品候选、目录型号六桶、事件和公开库占位分开使用；过期完整缓存只作历史基线，窗口日期及
-  PDF 文件校验边界见 README。独立文件导出不回写业务库，不改变收录状态。
+  PDF 文件校验边界见 README。刷新候选与已尝试非 PDF 的统计和重试边界见 README
+  “下载记录与数据目录”，汇报不能把历史来源异常重新称为未处理刷新。独立文件导出不回写业务库，不改变收录状态。
 - 完整批次减少先恢复合格缓存；确需调整来源基线使用 `status --refresh --rebase-cache`，
   同时给出当前 `--expect-generation`、精确 `--removed-batches` 和 `--rebase-reason`。
   保留历史与范围变化证据，不删除 latest 或让普通刷新绕过保护；自动收尾不使用基线调整选项。

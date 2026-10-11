@@ -12,12 +12,13 @@ import sqlite3
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo
 
 from scripts import announcement_catalog_gap as G
 from miit_gonggao import collection_tracking as T
 from miit_gonggao.collection_coverage import best_model_outcomes, coverage_buckets
+from miit_gonggao.core import safe_part
 from miit_gonggao.vehicle_categories import _ENERGY_KEYWORDS, derive_channel, normalize_energy
 from miit_gonggao.vehicle_classification import COLLECTION_SCOPE, classify_vehicle
 
@@ -35,6 +36,8 @@ VALID_PDF_STATES = {'parsed', 'pdf_unparsed'}
 EV_MODEL_CODE = re.compile(r'(BEV|PHEV|FCEV|REEV|EREV)')
 REQUIRED_TABLES = {'ingestion_runs', 'vehicles', 'batches', 'announcements', 'documents',
                    'announcement_fields', 'run_models', 'tracking_events', 'tracking_attempts'}
+NON_PDF_RESPONSE = re.compile(
+    r'(?:^|; )接口返回非 PDF，已存为 HTML；原文件：([^;\r\n]+?\.html)(?=; |$)')
 
 
 def band(batch: int | None) -> str:
@@ -292,6 +295,47 @@ def document_state(relative, size, is_pdf, fields: dict, parse_error, download_e
     return 'pdf_unparsed' if str(parse_error or '').strip() or not fields else 'parsed'
 
 
+def refresh_non_pdf_attempts(con: sqlite3.Connection) -> dict[tuple[str, int, str], dict]:
+    """Recover precise historical response identities without rewriting old runs.
+
+    Failed refreshes preserve the current PDF, so documents alone cannot describe
+    their outcome. Only the saved non-PDF response path establishes which product
+    and target batch was actually attempted; model-level partial/failure is not
+    enough. This also supports older runs without selected_product_ids.
+    """
+    attempts = {}
+    for run_id, completed_at, model, error in con.execute(
+            "select r.id,r.completed_at,v.announcement_model_code,rm.error "
+            "from run_models rm join ingestion_runs r on r.id=rm.run_id "
+            "join vehicles v on v.id=rm.vehicle_id "
+            "where r.completed_at is not null and r.completed_at<>'' and rm.status='partial' "
+            "and rm.error like '%接口返回非 PDF，已存为 HTML；原文件：%' order by r.id"):
+        model = (model or '').strip()
+        if not model:
+            continue
+        for match in NON_PDF_RESPONSE.finditer(error):
+            relative = match[1].replace('\\', '/')
+            path = PurePosixPath(relative)
+            if path.is_absolute() or '..' in path.parts or re.match(r'^[A-Za-z]:', relative):
+                continue
+            parts = path.stem.rsplit('_', 2)
+            if len(parts) != 3:
+                continue
+            prefix, batch_text, pid = parts
+            if not pid or not batch_text.isascii() or not batch_text.isdecimal():
+                continue
+            batch = int(batch_text)
+            if (path.parent.name != f'第{batch}批' or batch < 173
+                    or not prefix.endswith('_' + safe_part(model))):
+                continue
+            attempts[(pid, batch, model.upper())] = {
+                'run_id': run_id, 'checked_at': completed_at, 'product_id': pid,
+                'batch': batch, 'model_code': model, 'evidence_path': relative,
+                'status': 'non_pdf',
+            }
+    return attempts
+
+
 def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root: Path,
                       *, today: date | None = None) -> tuple[dict, dict]:
     """Return summary/candidates without side effects; supplied dates use end-of-day freshness.
@@ -343,6 +387,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         vehicles = {code.strip().upper(): vid for vid, code in con.execute(
             'select id, announcement_model_code from vehicles')}
         outcomes = best_model_outcomes(con)
+        non_pdf_attempts = refresh_non_pdf_attempts(con)
         events = T.events(con)
         evidence = T.scope_evidence(con)
         latest_batch = T.latest_formal_batch(con)
@@ -399,6 +444,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
     outside_ev_code: Counter = Counter()
     product_group_state: dict[str, tuple[str, str]] = {}
     missing, non_pdf, unparsed, invalid, refresh, scope_review, download_failed = [], [], [], [], [], [], []
+    refresh_source_unavailable = []
     for pid, entry in products.items():
         rec, batch = entry['rec'], entry['batch']
         model = str(rec.get('clxh') or '').strip()
@@ -483,7 +529,15 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         elif state in {'pdf_invalid', 'no_document'}:
             invalid.append({**row, 'db_batch': db_batch, 'state': state, 'relative_path': db_path_rel})
         elif state == 'parsed' and db_batch is not None and db_batch < batch:
-            refresh.append({**row, 'db_batch': db_batch, 'relative_path': db_path_rel})
+            candidate = {**row, 'db_batch': db_batch, 'relative_path': db_path_rel}
+            attempt = non_pdf_attempts.get((pid, batch, model.upper()))
+            if attempt:
+                refresh_source_unavailable.append({
+                    **candidate, 'last_non_pdf_attempt': attempt,
+                    'reason': '已尝试目标批次，源站返回非 PDF，保留旧版',
+                })
+            else:
+                refresh.append(candidate)
 
     db_only: Counter = Counter()
     for pid, item in ann.items():
@@ -569,6 +623,11 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         'non_pdf': len(non_pdf), 'download_failed': len(download_failed), 'pdf_unparsed': len(unparsed),
         'pdf_invalid_or_no_document': len(invalid),
         'refresh_candidates': {'total': len(refresh), 'by_group': dict(Counter(row['group'] for row in refresh))},
+        'refresh_source_unavailable': {
+            'total': len(refresh_source_unavailable),
+            'by_group': dict(Counter(row['group'] for row in refresh_source_unavailable)),
+            'by_batch': rows(Counter((row['batch'],) for row in refresh_source_unavailable), ('batch',)),
+        },
         'scope_review': {'total': len(scope_review), 'by_state': dict(Counter(row['state'] for row in scope_review))},
         'outside_scope_missing_not_counted': rows(outside_missing, ('group', 'channel')),
         'unknown_energy_outside_with_ev_model_code_not_counted': dict(outside_ev_code),
@@ -591,6 +650,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         'missing': sorted(missing, key=sort_key), 'non_pdf': sorted(non_pdf, key=sort_key),
         'download_failed': sorted(download_failed, key=sort_key), 'pdf_unparsed': sorted(unparsed, key=sort_key),
         'pdf_invalid_or_no_document': sorted(invalid, key=sort_key), 'refresh': sorted(refresh, key=sort_key),
+        'refresh_source_unavailable': sorted(refresh_source_unavailable, key=sort_key),
         'scope_review': sorted(scope_review, key=sort_key), 'catalog_no_match_absent_from_caches': no_match_absent,
     }
     return summary, candidates

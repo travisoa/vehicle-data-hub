@@ -250,6 +250,10 @@ def from_status(site_db: Path, *, catalog_db: Path | None = None, pdf_root: Path
     batches = sorted({row["republished_batch"] for row in rows})
     notes = [f"清单取自收录统计记录 {generation} 的 refresh 候选，未重算。",
              "统计口径为本地已下载并解析、且官方在更高正式批次重新发布的产品。"]
+    unavailable = snapshot['summary'].get('refresh_source_unavailable', {}).get('total', 0)
+    if unavailable:
+        notes.append(f"另有 {unavailable} 个产品已尝试目标批次但返回非 PDF，保留旧版，未混入本清单；"
+                     "需重试时明确使用 --republished-batch 并先预览。")
     if state["status"] != "ready":
         notes.append("统计记录当前为 " + state["status"] + "，本轮按显式允许过期执行。")
     return RepublishedSource(origin="status", rows=rows, batches=batches,

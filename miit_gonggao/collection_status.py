@@ -27,6 +27,7 @@ TZ = ZoneInfo('Asia/Shanghai')
 LOGIC_FILES = (
     'miit_gonggao/collection_status.py', 'miit_gonggao/collection_inventory.py',
     'miit_gonggao/collection_coverage.py', 'miit_gonggao/collection_tracking.py',
+    'miit_gonggao/core.py',
     'miit_gonggao/vehicle_categories.py', 'miit_gonggao/vehicle_classification.py',
     'scripts/announcement_catalog_gap.py',
 )
@@ -225,7 +226,7 @@ def _lock(output: Path):
 
 def _totals(summary: dict) -> dict[str, int]:
     states = summary.get('documents', {}).get('states', {})
-    return {'business_announcements': sum(states.values()),
+    result = {'business_announcements': sum(states.values()),
             'parsed': states.get('parsed', 0),
             'missing_products': summary.get('missing', {}).get('total', 0),
             'non_pdf': summary.get('non_pdf', 0),
@@ -233,6 +234,9 @@ def _totals(summary: dict) -> dict[str, int]:
             'pdf_invalid_or_no_document': summary.get('pdf_invalid_or_no_document', 0),
             'download_failed': summary.get('download_failed', 0),
             'refresh_candidates': summary.get('refresh_candidates', {}).get('total', 0)}
+    if 'refresh_source_unavailable' in summary:
+        result['refresh_source_unavailable'] = summary['refresh_source_unavailable']['total']
+    return result
 
 
 def _parse_removed_batches(value: str) -> list[int]:
@@ -325,7 +329,11 @@ def render_report(snapshot: dict) -> str:
     labels = {'business_announcements': '业务库公告数', 'parsed': '有效文件且已解析',
               'missing_products': '缓存范围内未下载产品 ID', 'non_pdf': '源站返回非 PDF',
               'pdf_unparsed': '有效 PDF 待解析', 'pdf_invalid_or_no_document': '文件异常或文档缺失',
-              'download_failed': '下载失败', 'refresh_candidates': '已有 PDF 但缓存批次较新'}
+              'download_failed': '下载失败',
+              'refresh_candidates': ('待核实的刷新候选（不含已尝试非 PDF）'
+                                     if 'refresh_source_unavailable' in summary
+                                     else '已有 PDF 但缓存批次较新（旧记录未区分尝试结局）'),
+              'refresh_source_unavailable': '已尝试刷新但源站返回非 PDF（保留旧版）'}
     for key, value in totals.items():
         delta = snapshot.get('delta', {}).get(key)
         lines.append(f"| {labels[key]} | {value:,} | {'首次记录' if delta is None else f'{delta:+,}'} |")
@@ -335,6 +343,9 @@ def render_report(snapshot: dict) -> str:
               '- 日常使用 `main.py gonggao status` 读取记录，不运行全库 SQL、不解析批次缓存、不遍历 PDF。',
               '- 采集批次提交后自动更新；`--refresh` 用于首次建立、输入变化后补记或人工复核。',
               '- 每次生成保留 summary/candidates/本报告；`--history` 查看历次记录。',
+              '- 刷新候选与已尝试非 PDF 按产品 ID、目标批次和型号分开；后者保留上次非 PDF 响应的轮次、时间和路径，不算未处理刷新。',
+              '- 已尝试非 PDF 只说明当次未取得有效参数页，不证明永久无源；同产品更高批次仍单独核实。',
+              '- `--republished-from-status` 只选普通刷新候选；需重新尝试历史来源异常时，明确指定 `--republished-batch` 并先预览清单。',
               '- 文件状态只包含本次路径、大小、PDF 文件头及解析字段检查，不含 SHA-256 全库复验。',
               '- 完整但过期的批次缓存保留基线并标记过期；部分缓存不能用于断言官方无源。',
               '- 业务库/目录库/WAL、批次文件或统计规则变化时，查询显示过期原因；不自动重算。',
