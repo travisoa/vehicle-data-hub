@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts import announcement_catalog_gap as G
 from miit_gonggao import collection_tracking as T
 from miit_gonggao.collection_coverage import best_model_outcomes, coverage_buckets
+from miit_gonggao.collection_recovery import recovery_summary
 from miit_gonggao.core import safe_part
 from miit_gonggao.vehicle_categories import _ENERGY_KEYWORDS, derive_channel, normalize_energy
 from miit_gonggao.vehicle_classification import (COLLECTION_SCOPE, NON_NEV_BATCH_LABEL, NON_NEV_FIRST_BATCH,
@@ -353,6 +354,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if missing_tables := REQUIRED_TABLES - tables:
             raise ValueError(f'business database missing required tables: {sorted(missing_tables)}')
+        recovery = recovery_summary(con)
         unfinished_runs = con.execute(
             "select count(*) from ingestion_runs where completed_at is null or completed_at=''").fetchone()[0]
         last_run = con.execute(
@@ -580,6 +582,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
             '事件复用event_scope和in_window；历史型号别名只关联其真实出现批次，不作别名与批次的交叉组合。',
         ],
         'inputs': {
+            'site_recovery': recovery,
             'business_db': {'path': str(db_path), 'unfinished_runs': unfinished_runs,
                             'last_run': dict(zip(('id', 'started_at', 'completed_at'), last_run, strict=True))
                             if last_run else None},

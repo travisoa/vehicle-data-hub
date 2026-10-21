@@ -27,6 +27,9 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 历史 CLI 查询的 `manifest_*.json` 保持原始证据，不改写成网站采集轮次。
 覆盖率统计和修订归档现在可读取本项目权威业务库；归档仍默认预览，`--apply` 须用户确认。
 `core.build_announcement_download_dir` 是所有下载入口共用的目录结构契约。
+灾难恢复显式使用 `main.py gonggao restore-site --snapshot <封存站点库>`，默认预览，已授权后加
+`--apply`；仅恢复到空环境。它是离线资产恢复，不是采集入口或 Website 运行时依赖：保留快照哈希、
+恢复副本和未知项，不伪造原始响应、官方目录、查询轮次或事件；后续采集仍走既有 collect/tracking。
 - **竞品对标**（`benchmark/`）：抓汽车之家口碑 + 懂车帝销量榜，生成对标分析 HTML 报告到 `output/`
 
 这是通用工具，不要把它当成只服务少数硬编码车型的脚本；车型相关条件一律走 `data/vehicle_profiles.json` 档案或 CLI 参数。

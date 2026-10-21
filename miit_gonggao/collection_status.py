@@ -27,6 +27,7 @@ TZ = ZoneInfo('Asia/Shanghai')
 LOGIC_FILES = (
     'miit_gonggao/collection_status.py', 'miit_gonggao/collection_inventory.py',
     'miit_gonggao/collection_coverage.py', 'miit_gonggao/collection_tracking.py',
+    'miit_gonggao/collection_recovery.py',
     'miit_gonggao/core.py',
     'miit_gonggao/vehicle_categories.py', 'miit_gonggao/vehicle_classification.py',
     'scripts/announcement_catalog_gap.py',
@@ -171,6 +172,8 @@ def read_status(db_path: Path = ROOT / 'data/announcement_site.sqlite', *, catal
     if cache_expired or caches.get('stale_files_allowed'):
         warnings.append('批次缓存已过期，保留历史基线，不代表官方当前全集')
     warnings.extend(cache_warnings)
+    if summary.get('inputs', {}).get('site_recovery'):
+        warnings.append('业务数据由站点快照恢复；完整目录、批次全集及历史采集轮次未恢复，不能据此判定全量缺口为零')
     if tracking_stale:
         warnings.append('事件检查窗口截至记录生成日；时间变化未触发查询时重算')
     last_error = _read_json(output / 'last-error.json') if (output / 'last-error.json').is_file() else None
@@ -311,6 +314,8 @@ def render_report(snapshot: dict) -> str:
         lines.append(f"| {item.get('label', key)} | {item.get('total', 0):,} | {item.get('parsed', 0):,} | "
                      f"{item.get('missing', 0):,} | {item.get('non_pdf', 0):,} |")
     cache_warnings, notices, _ = cache_messages(summary.get('inputs', {}).get('batch_caches', {}))
+    if summary.get('inputs', {}).get('site_recovery'):
+        cache_warnings.append('站点快照恢复不包含完整目录、批次全集和历史采集轮次；缺口统计范围不完整')
     if notices or cache_warnings:
         lines += ['', '## 来源说明与缓存诊断', '']
         lines += ['- 说明：' + message for message in notices]

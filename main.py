@@ -10,6 +10,7 @@
     python3 main.py gonggao collect --manifest <清单> --help  # 固定产品清单模式
     python3 main.py gonggao status                  # 读取持久收录统计；--refresh 显式更新
     python3 main.py gonggao reparse                 # 解析器升级后刷新存量解析字段；默认预览，--apply 写入
+    python3 main.py gonggao restore-site --snapshot <站点库>  # 离线灾难恢复到空环境；默认预览
     python3 main.py gonggao query <车型> --download  # 工信部公告查询完整 CLI
     python3 main.py gonggao collect --republished-from-status  # 正式发布重发 -> 刷新已有参数页
     python3 main.py gonggao changes --model-code <型号>  # 变更扩展公示只读查询（提前了解，不下载）
@@ -420,6 +421,10 @@ def main(argv: list[str] | None = None) -> int:
     if command == "fetch":
         return command_fetch(rest)
     if command == "gonggao":
+        if rest and rest[0] == "restore-site":
+            from miit_gonggao import collection_recovery
+
+            return collection_recovery.main(rest[1:])
         if rest and rest[0] == "status":
             from miit_gonggao import collection_status
 

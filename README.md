@@ -530,6 +530,24 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 | 采集报告 | `var/reports/` |
 | 持久收录统计与候选清单 | `var/reports/collection-status/` |
 
+原采集设备不可用、仅有已发布站点快照时，可显式进行离线灾难恢复：
+
+```bash
+.venv/bin/python main.py gonggao restore-site --snapshot /path/to/site.sqlite
+.venv/bin/python main.py gonggao restore-site --snapshot /path/to/site.sqlite --apply
+```
+
+默认只核验并预览；`--apply` 只允许业务库、目录库和车型档案均不存在的空环境，使用既有采集锁。
+先逐份核验本地 PDF、照片及内嵌照片的大小和 SHA-256，再恢复到本项目标准数据路径；
+不访问源站，不覆盖原件或既有数据库。`var/runs/<时间>-site-recovery/` 保留独立恢复副本和来源摘要。
+实际产品恢复到标准业务表，网站待来源行另存为带快照哈希的恢复证据，不伪造产品 ID、官方事件或历史查询结局。
+`raw_json` 明确带 `_site_snapshot_recovery` 标记，表示由快照已知字段投影，**不是原始接口响应**；
+原始下载/首次发现时间留空，恢复时间单独记录。目录库仅建立空的正式结构，不能从公告参数编造目录附件及全文；
+档案只恢复网站明确标记为人工档案的车系，查询前缀限已知完整型号，不猜原来的短前缀。
+恢复车系的构库归属按已知产品 ID 限定；输出车系聚合过的别名只保留为观察证据，不冒充原人工查询别名。
+完整批次缓存及历史采集轮次仍不可还原，收录统计持续提示范围不完整，零缓存缺口不能解读为全量无缺口。
+Website 构库在原始字段尚未被重新采集或解析替换时，可消费这些带来源的恢复信息；新正式数据优先。
+
 日常查询“已收录多少、还缺多少”先执行 `main.py gonggao status`，或读取
 `var/reports/collection-status/latest.json`。默认只读最新汇总，并比较业务库、目录库
 （含 WAL/journal）、批次缓存文件元数据及统计规则代码哈希；不扫描业务表、解析批次缓存或
