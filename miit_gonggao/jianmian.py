@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -386,6 +387,29 @@ def is_valid_docx(path: Path) -> bool:
         return False
 
 
+def run_soffice(command: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """运行 LibreOffice，超时时连同它派生的进程一起结束。
+
+    Homebrew 等装的 soffice 是 shell 包装脚本，subprocess.run 超时只杀包装脚本，
+    真正的 soffice 留成孤儿继续运行，后续每次转换都要等满超时才失败。"""
+    posix = os.name == "posix"
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=posix)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if posix:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def doc_to_docx_via_soffice(doc_path: Path) -> Path | None:
     """用 LibreOffice headless 把 .doc 转成 .docx（保留真实表格结构，无窗口无授权框）。"""
     docx_path = doc_path.with_suffix(".lo.docx")
@@ -395,11 +419,13 @@ def doc_to_docx_via_soffice(doc_path: Path) -> Path | None:
     if not soffice:
         return None
     with tempfile.TemporaryDirectory(prefix="jianmian-lo-") as tmp_dir:
+        # 每次转换用独立配置目录：默认配置被已打开或残留的 LibreOffice 占用时，新实例会一直等它。
+        profile = (Path(tmp_dir) / "profile").as_uri()
         try:
-            result = subprocess.run(
-                [soffice, "--headless", "--convert-to", "docx", "--outdir", tmp_dir, str(doc_path)],
-                capture_output=True,
-                timeout=SOFFICE_TIMEOUT,
+            result = run_soffice(
+                [soffice, f"-env:UserInstallation={profile}", "--headless", "--convert-to", "docx",
+                 "--outdir", tmp_dir, str(doc_path)],
+                SOFFICE_TIMEOUT,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             print(f"[警告] LibreOffice 转换失败: {doc_path.name} {exc}", file=sys.stderr)

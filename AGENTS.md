@@ -193,6 +193,9 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 3. **转换产物必须过 `is_valid_docx()`**（非空 + 含 `word/document.xml`）才落缓存，避免把垃圾
    产物缓存下来导致后续解析恒为 0 行。
 4. **`SOFFICE_TIMEOUT` 可配**（环境变量，默认 300s）。无 Word 兜底的平台遇到大合刊附件需要调大。
+   LibreOffice 一律经 `run_soffice` 调用：POSIX 下放进独立进程组，超时整组结束，Windows 用 `taskkill /T`；
+   每次转换另配 `-env:UserInstallation` 临时配置目录。Homebrew 的 `soffice` 是包装脚本，只杀包装脚本会
+   留下占着默认配置的孤儿进程，之后每个附件都要等满超时才失败。
 5. **`textutil` 是 macOS 可选加速，不是必需品**。`doc_to_html` 在缺失时返回 `None`（不得改回
    `raise SystemExit`），调用方改用 `peek_catalog_info_docx` 嗅探。已有 `.html` 缓存在任何平台都复用。
 6. **Word AppleScript 通道有 `sys.platform != "darwin"` 守卫**，其他平台不得调用 `osascript`。

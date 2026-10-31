@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from miit_gonggao import jianmian
 
@@ -357,14 +362,58 @@ def test_soffice_rejects_invalid_product(tmp_path, monkeypatch):
     doc.write_bytes(b"stub")
     monkeypatch.setattr(jianmian, "find_soffice", lambda: "/fake/soffice")
 
-    def fake_run(cmd, **kwargs):
+    def fake_run(cmd, timeout):
         outdir = Path(cmd[cmd.index("--outdir") + 1])
         (outdir / f"{doc.stem}.docx").write_bytes(b"not a zip")
         return SimpleNamespace(returncode=0, stderr=b"")
 
-    monkeypatch.setattr(jianmian.subprocess, "run", fake_run)
+    monkeypatch.setattr(jianmian, "run_soffice", fake_run)
     assert jianmian.doc_to_docx_via_soffice(doc) is None
     assert not doc.with_suffix(".lo.docx").exists()
+
+
+def test_soffice_uses_private_profile_per_conversion(tmp_path, monkeypatch):
+    """已打开或残留的 LibreOffice 占着默认配置时，新转换不能排队等它。"""
+    doc = tmp_path / "购置税目录第31批.doc"
+    doc.write_bytes(b"stub")
+    monkeypatch.setattr(jianmian, "find_soffice", lambda: "/fake/soffice")
+    profiles = []
+
+    def fake_run(cmd, timeout):
+        outdir = Path(cmd[cmd.index("--outdir") + 1])
+        option = next(arg for arg in cmd if arg.startswith("-env:UserInstallation="))
+        profile = option.split("=", 1)[1]
+        assert profile.startswith(outdir.as_uri())
+        profiles.append(profile)
+        _make_docx(outdir / f"{doc.stem}.docx")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(jianmian, "run_soffice", fake_run)
+    assert jianmian.doc_to_docx_via_soffice(doc) == doc.with_suffix(".lo.docx")
+    doc.with_suffix(".lo.docx").unlink()
+    assert jianmian.doc_to_docx_via_soffice(doc) == doc.with_suffix(".lo.docx")
+    assert len(set(profiles)) == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="进程组只在 POSIX 上可用")
+def test_soffice_timeout_kills_wrapped_process(tmp_path):
+    """包装脚本派生的真正 soffice 不能在超时后留成孤儿。"""
+    pid_file = tmp_path / "child.pid"
+    wrapper = ["sh", "-c", f'sleep 30 & echo $! > "{pid_file}"; wait']
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        jianmian.run_soffice(wrapper, timeout=1)
+
+    child = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"超时后子进程 {child} 仍在运行")
 
 
 def test_soffice_timeout_configurable(monkeypatch):
