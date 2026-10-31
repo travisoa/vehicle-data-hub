@@ -126,6 +126,64 @@ def test_base_layout_parse_can_explicitly_disable_converted_dispatch():
     assert 'pdf_layout' not in fields
 
 
+# 发动机块的真实版式坐标（东风 EQ7000AC2BBEV 第 232 批等参数页实测）：各列独立排版、行距约 11.6pt，
+# 右栏「其他:」标签与左中栏第 7 行同高，左中栏一直排到「轴荷」行之前。
+_ENGINE_ROWS = [595.7, 607.3, 619.0, 630.6, 642.2, 653.9, 665.5, 677.1, 688.8]
+
+
+def _engine_block(power=(), model=(), maker=(), reflective=(), other=()):
+    def column(cells, x0):
+        return [{'text': text, 'x0': x0, 'x1': x1, 'top': top}
+                for (text, x1), top in zip(cells, _ENGINE_ROWS) if text]
+
+    words = [{'text': text, 'x0': x0, 'x1': x1, 'top': 575.7} for text, x0, x1 in [
+        ('发动机型号:', 39, 91.4), ('发动机生产企业:', 131, 203.4), ('排量(ml):', 268, 308.1),
+        ('功率(kw):', 312, 353.3), ('油耗:', 360, 382.4), ('车身反光标识说明:', 398, 480.4)]]
+    words += column(model, 39) + column(maker, 134) + column(power, 312) + column(reflective, 398)
+    words += [{'text': '其他:', 'x0': 398, 'x1': 420.4, 'top': 653.7},
+              *[{'text': text, 'x0': 398, 'x1': 571.3, 'top': top} for text, top in zip(other, (673.7, 685.3))],
+              {'text': '轴荷:', 'x0': 39, 'x1': 61.4, 'top': 699.7},
+              {'text': '440/565', 'x0': 68, 'x1': 99.1, 'top': 699.7}]
+    return words
+
+
+def test_engine_columns_run_past_the_other_label_until_axle_load():
+    # 三台电机各占三行，第二台起排到「其他:」标签以下；PDF 原件第三台本身在「轴荷」前被裁掉。
+    power = [('10.5(电', 342.0), ('动机额', 342.0), ('定功率)', 345.7)] * 2 + [
+        ('10.5(电', 342.0), ('动机额', 342.0), ('定功', 332.0)]
+    fields = parse_words(_engine_block(
+        power=power,
+        maker=[('东风汽车公司', 194.0), ('湖北天运汽车电器系统有限公', 264.0), ('司', 144.0),
+               ('上海泰锋电机有限公司', 234.0), ('', 134.0), ('', 134.0), ('浙江示例电机有限公司', 234.0)],
+        reflective=[('企业:示例反光材料公司', 520.0)],
+        other=['技术阶段为发展期阶段。'],
+    ))
+    assert fields['engine_power'] == '10.5(电动机额定功率);10.5(电动机额定功率);10.5(电动机额定功'
+    assert fields['engine_maker'].endswith('上海泰锋电机有限公司浙江示例电机有限公司')
+    # 右栏仍止于「其他:」，「其他」正文和轴荷都不混进发动机块。
+    assert fields['reflective_marking'] == '企业:示例反光材料公司'
+    assert fields['other'] == '技术阶段为发展期阶段。'
+    assert fields['axle_load'] == '440/565'
+
+
+@pytest.mark.parametrize(('lines', 'expected'), [
+    # 每台电机/发动机的功率各起一行，行尾留有余量。
+    ([('90', 321.2), ('90(峰值', 345.0), ('功率)', 335.7)], '90;90(峰值功率)'),
+    ([('90(电机', 342.0), ('峰值功', 342.0), ('率)', 327.0), ('90', 321.2)], '90(电机峰值功率);90'),
+    ([('85', 321.2), ('110', 325.8)], '85;110'),
+    ([('280/280', 343.1), ('260/260', 343.1)], '280/280;260/260'),
+    # 同一项在栏内折行：括号未闭合、末尾不是数值，或整行排满后数字被拆开。
+    ([('驱动电', 342.0), ('机:前', 334.4), (':160/后', 341.6), (':227', 328.2)], '驱动电机:前:160/后:227'),
+    ([('前160/后', 341.6), ('110', 325.8)], '前160/后110'),
+    ([('240;185;1', 349.5), ('80', 321.2)], '240;185;180'),
+    ([('120/78/7', 346.0), ('8', 316.6)], '120/78/78'),
+    # 企业自己用分号分隔的多值保持原样。
+    ([('163/300;', 346.0), ('163/300', 343.1)], '163/300;163/300'),
+])
+def test_engine_power_separates_each_motor_but_keeps_wrapped_values(lines, expected):
+    assert parse_words(_engine_block(power=lines))['engine_power'] == expected
+
+
 def test_export_review_excel(tmp_path):
     fields = _load_fields()
     fields["source_file"] = "demo.pdf"

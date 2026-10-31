@@ -5,6 +5,10 @@
 横向底盘引用表被当成「底盘名称」，底盘 ID 与底盘型号混进了 VIN。本命令重新解析本地 PDF，
 只挑出新解析确认属于指定版式、而库里仍是旧结果的记录。
 
+``engine_columns`` 不按版式挑选，只刷新发动机块各列：2026-11-01 以前的解析器把多台发动机/电机的
+功率直接连写（85、110 存成 85110），左中栏又止于右栏「其他:」标签，后几台被截掉。
+版式前后不一致的记录归版式刷新处理，这里跳过；其余 PDF 解析键不动。
+
 默认只读预览；``--apply`` 才在采集排他锁内写入业务库。写入规则：
 
 - 只改 ``announcement_fields``：PDF 解析键整体换成新结果，目录补充等非 PDF 键原样保留；
@@ -34,7 +38,8 @@ from typing import Any, Callable
 from miit_gonggao import collection as seed
 from miit_gonggao import review_export
 
-LAYOUTS = ("converted_vehicle",)
+ENGINE_TARGET = "engine_columns"
+LAYOUTS = ("converted_vehicle", ENGINE_TARGET)
 DEFAULT_RUNS_DIR = seed.UPSTREAM_ROOT / "var" / "runs"
 
 # 解析器可能产出的全部键。刷新时这些键整体换成新结果（新结果没有的旧键即旧版误解析，一并去掉）；
@@ -46,6 +51,8 @@ PARSER_KEYS = frozenset(
     | {"batch", "model_code", "product_name", "other", "vin", "chassis", "chassis_references",
        "pdf_layout", "cargo_dims", "source_file"}
 )
+
+ENGINE_KEYS = frozenset(key for _, key in review_export.ENGINE_COLUMNS)
 
 Parser = Callable[[Path], dict[str, str]]
 
@@ -78,6 +85,13 @@ def merge_fields(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     """PDF 解析键取新结果，其他来源的键保留。"""
     merged = {key: value for key, value in old.items() if key not in PARSER_KEYS}
     merged.update(new)
+    return merged
+
+
+def merge_engine_fields(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """只换发动机块各列（新结果没有的列一并去掉），其余键原样保留。"""
+    merged = {key: value for key, value in old.items() if key not in ENGINE_KEYS}
+    merged.update({key: new[key] for key in ENGINE_KEYS if key in new})
     return merged
 
 
@@ -118,7 +132,7 @@ def _sha256(path: Path) -> str:
 
 def build_plan(conn: sqlite3.Connection, pdf_root: Path, layout: str, *, workers: int = 1,
                limit: int | None = None, parser: Parser | None = None) -> Plan:
-    """只读计算：哪些记录的库存字段不是该版式的当前解析结果，刷新后各键怎样变化。"""
+    """只读计算：哪些记录的库存字段（或发动机块）不是当前解析结果，刷新后各键怎样变化。"""
     rows = conn.execute(
         "SELECT a.id, a.source_product_id, a.model_code, d.relative_path, d.sha256, f.fields_json, f.parse_error "
         "FROM announcement_fields f JOIN announcements a ON a.id = f.announcement_id "
@@ -128,8 +142,10 @@ def build_plan(conn: sqlite3.Connection, pdf_root: Path, layout: str, *, workers
     candidates = []
     for announcement_id, product_id, model_code, relative_path, registered, fields_json, parse_error in rows:
         old = json.loads(fields_json or "{}")
-        if old.get("pdf_layout") == layout:
+        if layout != ENGINE_TARGET and old.get("pdf_layout") == layout:
             continue  # 已是当前版式的解析结果
+        if layout == ENGINE_TARGET and parse_error:
+            continue  # 原先整份解析失败的记录不能只补发动机块
         candidates.append((announcement_id, product_id, model_code, relative_path, registered,
                            fields_json, old, parse_error))
     plan.scanned = len(candidates)
@@ -142,8 +158,16 @@ def build_plan(conn: sqlite3.Connection, pdf_root: Path, layout: str, *, workers
             if error:
                 plan.skipped.append({**base, "reason": "parse_error", "error": error})
             continue
-        if new.get("pdf_layout") != layout:
+        if layout == ENGINE_TARGET:
+            if new.get("pdf_layout") != old.get("pdf_layout"):
+                continue  # 版式本身变了，归版式刷新处理
+            merged = merge_engine_fields(old, new)
+            if merged == old:
+                continue  # 发动机块已是当前解析结果
+        elif new.get("pdf_layout") != layout:
             continue  # 不是本次要刷新的版式
+        else:
+            merged = merge_fields(old, new)
         if limit is not None and len(plan.changes) >= limit:
             break
         plan.stale += 1
@@ -155,7 +179,6 @@ def build_plan(conn: sqlite3.Connection, pdf_root: Path, layout: str, *, workers
             # 本地文件与登记版本不同（例如被人工替换），不能拿它的解析结果改写登记记录。
             plan.skipped.append({**base, "reason": "hash_mismatch"})
             continue
-        merged = merge_fields(old, new)
         changed = sorted(key for key in set(old) | set(merged) if old.get(key) != merged.get(key))
         if not changed:
             plan.unchanged += 1
@@ -264,7 +287,8 @@ def run(db: Path, *, layout: str, apply: bool, pdf_root: Path, catalog_db: Path,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="用当前解析器刷新存量公告参数页的解析字段（默认只预览）")
     parser.add_argument("--layout", choices=LAYOUTS, default=LAYOUTS[0],
-                        help="只刷新新解析确认属于该版式、而库存仍是旧结果的记录")
+                        help="converted_vehicle：只刷新新解析确认属于该版式、而库存仍是旧结果的记录；"
+                             f"{ENGINE_TARGET}：只刷新发动机块各列与当前解析结果不同的记录")
     parser.add_argument("--apply", action="store_true", help="写入业务库；省略时只输出候选统计和差异清单")
     parser.add_argument("--limit", type=int, help="最多刷新前 N 条记录（按公告顺序），用于分段核对")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="本地解析进程数")
@@ -283,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
                  catalog_db=args.catalog_db.expanduser().resolve(), runs_dir=args.runs_dir.expanduser().resolve(),
                  workers=max(1, args.workers), limit=args.limit)
     summary = result["plan"].summary()
-    print(f"扫描未标记该版式的解析记录 {summary['scanned']} 条；待刷新 {summary['changed']} 条，"
+    scope = "全部 PDF 解析记录" if args.layout == ENGINE_TARGET else "未标记该版式的解析记录"
+    print(f"扫描{scope} {summary['scanned']} 条；待刷新 {summary['changed']} 条，"
           f"已是新结果 {summary['unchanged']} 条，跳过 {summary['skipped'] or 0}。")
     if summary["changed_keys"]:
         print("字段变化：" + "、".join(f"{key} {count}" for key, count in summary["changed_keys"].items()))

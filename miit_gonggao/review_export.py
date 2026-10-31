@@ -102,6 +102,40 @@ _LEFT_COL_MAX = 145.0
 _MID_COL_MAX = 350.0
 _RIGHT_COL_MIN = 380.0
 
+# 功率栏一行排满约 37pt；行宽超过这个值时已放不下下一个数字（约 4.6pt），换行是栏宽所致。
+# 实测 3.6 万份参数页：数值被拆到两行时上一行都在 33pt 以上，各台电机分行时都不超过 31pt。
+_POWER_WRAP_WIDTH = 32.5
+
+
+def _power_item_complete(text: str) -> bool:
+    """功率栏当前这一项是否已写完：括号成对，且以数值、右括号或 kW 结尾。"""
+    if text.count("(") + text.count("（") != text.count(")") + text.count("）"):
+        return False
+    return bool(re.search(r"(?:[0-9)）]|kw)$", text, re.IGNORECASE))
+
+
+def _join_power_lines(lines: list[list[dict[str, Any]]], column_x: float) -> str:
+    """功率栏逐行拼接，多台发动机/电机之间补分号。
+
+    参数页每台发动机/电机的功率各起一行，长值又会在栏内折行，原件没有分隔符。
+    上一项已写完、上一行没排满、下一行以数字开头，才是另一台的功率；
+    否则是同一项折行（「前160/后」+「110」、「240;185;1」+「80」），直接接上。
+    """
+    items: list[str] = []
+    width = 0.0
+    for words in lines:
+        text = "".join(str(w["text"]) for w in words)
+        current = items[-1] if items else ""
+        if (current and text[:1].isdigit() and _power_item_complete(current)
+                and (current[-1] in ")）" or width <= _POWER_WRAP_WIDTH)):
+            items.append(text)
+        elif items:
+            items[-1] += text
+        else:
+            items.append(text)
+        width = float(words[-1]["x1"]) - column_x
+    return ";".join(items)
+
 
 def _group_lines(words: list[dict[str, Any]], tolerance: float = 3.0) -> list[list[dict[str, Any]]]:
     lines: list[list[dict[str, Any]]] = []
@@ -199,7 +233,9 @@ def parse_words(
     fields["product_name"] = split.group(2).strip() if split else ""
 
     # 4) 底部多栏交错区：按坐标定位
-    # 4a) 发动机块：表头行的各标签 x 坐标定列，下方到「其他」之前的词按最近列归属
+    # 4a) 发动机块：表头行的各标签 x 坐标定列，下方的词按最近列归属。
+    # 右栏的反光标识说明止于「其他」；左中栏各列一直排到「轴荷」行之前——发动机/电机多时
+    # 会排到「其他:」标签以下，以「其他」为界会截掉后几台。
     engine_header = find_word("发动机型号")
     if engine_header is not None:
         header_top = float(engine_header["top"])
@@ -214,22 +250,34 @@ def parse_words(
                     column_x.append((float(word["x0"]), key))
                     break
         column_x.sort()
-        buckets: dict[str, list[str]] = {key: [] for _, key in column_x}
+        axle_label = next((w for w in words if str(w["text"]).startswith("轴荷")
+                           and float(w["x0"]) < _LEFT_COL_MAX and float(w["top"]) > header_top + 2), None)
+        left_bottom = float(axle_label["top"]) if axle_label else other_top
+        buckets: dict[str, list[list[dict[str, Any]]]] = {key: [] for _, key in column_x}
         for line in lines:
             top = float(line[0]["top"])
-            if not (header_top + 2 < top < other_top - 1):
+            if top <= header_top + 2:
                 continue
+            row: dict[str, list[dict[str, Any]]] = {}
             for word in line:
                 x0 = float(word["x0"])
                 owner = None
                 for col_x, key in column_x:
                     if x0 >= col_x - 10:
-                        owner = key
+                        owner = (col_x, key)
                 if owner:
-                    buckets[owner].append(str(word["text"]))
-        for key, parts in buckets.items():
-            if parts:
-                fields[key] = "".join(parts)
+                    row.setdefault(owner, []).append(word)
+            for (col_x, key), cell in row.items():
+                if top < (other_top if col_x >= _RIGHT_COL_MIN else left_bottom) - 1:
+                    buckets[key].append(cell)
+        for col_x, key in column_x:
+            cells = buckets[key]
+            if not cells:
+                continue
+            if key == "engine_power":
+                fields[key] = _join_power_lines(cells, col_x)
+            else:
+                fields[key] = "".join(str(w["text"]) for cell in cells for w in cell)
 
     # 4b) 「其他」右栏整段
     if other_label is not None:

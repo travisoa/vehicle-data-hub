@@ -220,6 +220,32 @@ def test_later_conflict_rolls_back_earlier_field_updates(env):
     assert fields(env["db"])["PLAIN1"] == {}
 
 
+def test_engine_target_refreshes_only_the_engine_block(env):
+    glued = {"model_code": "HFC6511REV5C7J", "engine_power": "85110", "engine_model": "TZ180XS018BYY35TZ180B01",
+             "chassis": "承载式车身", "range_km": "400"}
+    with closing(sqlite3.connect(env["db"])) as conn:
+        add(conn, env["root"], "GLUED", glued, content=b"%PDF glued")
+        conn.commit()
+
+    def parser(path: Path):
+        if path.stem == "GLUED":  # 其他解析键与库存不同也不动，只换发动机块
+            return {"model_code": "HFC6511REV5C7J", "engine_power": "85;110", "chassis": "新解析的底盘",
+                    "source_file": "GLUED.pdf"}
+        return env["parser"](path)
+
+    result = reparse.run(env["db"], layout="engine_columns", apply=True, pdf_root=env["root"],
+                         catalog_db=env["root"] / "catalog.sqlite", runs_dir=env["root"] / "runs",
+                         parser=parser, now=lambda: datetime(2026, 11, 1, tzinfo=timezone.utc))
+    assert result["applied"] == 1
+    assert result["summary"].parent.name.endswith("reparse-engine_columns")
+    assert result["plan"].summary()["changed_keys"] == {"engine_model": 1, "engine_power": 1}
+    stored = fields(env["db"])
+    assert stored["GLUED"] == {"model_code": "HFC6511REV5C7J", "engine_power": "85;110",
+                               "chassis": "承载式车身", "range_km": "400"}
+    # 新解析换了版式的记录归版式刷新，这里不动。
+    assert stored["STALE1"] == STALE
+
+
 def test_parser_keys_cover_every_parsed_field():
     words = []  # 空页面也会产出的派生键
     produced = set(reparse.review_export.parse_words(words))
