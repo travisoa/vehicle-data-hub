@@ -105,6 +105,19 @@ def test_genuine_official_replacement_stops_using_recovered_metadata(snapshot):
         assert set(recovery.recovered_records(con)) == {'tracking:E1'}
 
 
+def test_engine_block_refresh_keeps_recovered_metadata(snapshot):
+    database, root, _ = snapshot
+    recovery.restore(database, root, apply=True)
+    with sqlite3.connect(root / 'data/announcement_site.sqlite') as con:
+        fields = json.loads(con.execute('select fields_json from announcement_fields').fetchone()[0])
+        con.execute('update announcement_fields set fields_json=?',
+                    (json.dumps({**fields, 'engine_power': '85;110', 'engine_model': 'TZ180XS018B'}),))
+        assert 'P1' in recovery.recovered_records(con)
+        con.execute('update announcement_fields set fields_json=?',
+                    (json.dumps({**fields, 'engine_power': '85;110', 'fuel_type': '汽油'}),))
+        assert 'P1' not in recovery.recovered_records(con)
+
+
 def test_partial_publication_failure_rolls_back_only_new_targets(snapshot, monkeypatch):
     database, root, pdf = snapshot
     link = recovery.os.link

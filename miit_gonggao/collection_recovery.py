@@ -15,8 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from miit_gonggao import collection, collection_tracking, core, images, jianmian
+from miit_gonggao.review_export import ENGINE_COLUMNS
 
 MARKER = '_site_snapshot_recovery'
+# 发动机块可由 reparse --layout engine_columns 单独刷新（2026-11-01 修正多台功率连写与截断）。
+# 构库沿用的恢复证据——能源、底盘商标、购置税批次、照片状态——都不取自这几列，判断是否被替换时不计。
+ENGINE_KEYS = frozenset(key for _, key in ENGINE_COLUMNS)
 
 
 def encode(value) -> str:
@@ -46,8 +50,12 @@ def recovery_summary(conn: sqlite3.Connection) -> dict:
     return json.loads(row[0]) if row else {}
 
 
+def _evidence_fields(fields: dict) -> dict:
+    return {key: value for key, value in fields.items() if key not in ENGINE_KEYS}
+
+
 def recovered_records(conn: sqlite3.Connection) -> dict[str, dict]:
-    """只向构库提供尚未被正式采集/重新解析替换的恢复证据。"""
+    """只向构库提供尚未被正式采集/重新解析替换的恢复证据（只刷新发动机块不算替换）。"""
     if not recovery_summary(conn):
         return {}
     active = {}
@@ -55,7 +63,7 @@ def recovered_records(conn: sqlite3.Connection) -> dict[str, dict]:
         'select a.source_product_id,a.raw_json,f.fields_json from announcements a '
         'left join announcement_fields f on f.announcement_id=a.id'
     ):
-        active[pid] = (json.loads(raw).get(MARKER), json.loads(fields or '{}'))
+        active[pid] = (json.loads(raw).get(MARKER), _evidence_fields(json.loads(fields or '{}')))
     result = {}
     for pid, snapshot, payload in conn.execute(
         'select source_product_id,snapshot_sha256,row_json from site_recovery_records'
@@ -63,7 +71,7 @@ def recovered_records(conn: sqlite3.Connection) -> dict[str, dict]:
         row = json.loads(payload)
         if row['availability'] in {'pending_source', 'fetch_failed'}:
             result[pid] = row
-        elif pid in active and active[pid] == (snapshot, json.loads(row['fields_json'] or '{}')):
+        elif pid in active and active[pid] == (snapshot, _evidence_fields(json.loads(row['fields_json'] or '{}'))):
             result[pid] = row
     return result
 
