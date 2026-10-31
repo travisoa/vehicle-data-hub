@@ -157,3 +157,66 @@ def test_cli_accepts_repeated_event_ids_and_nev_only(data, monkeypatch, capsys, 
             assert {row[0] for row in conn.execute('SELECT event_id FROM tracking_attempts')} == set(chosen)
             assert conn.execute('SELECT attempts FROM tracking_events WHERE event_id=?',
                                 (untouched,)).fetchone() == (0,)
+
+
+def run_cli(data, monkeypatch, *extra):
+    monkeypatch.setattr(sys, 'argv', [
+        'tracking', '--site-db', str(data.db), '--catalog-db', str(data.catalog),
+        '--pdf-root', str(data.pdf_root), 'collect', '--batch', '410', *extra,
+    ])
+    return tracking.main()
+
+
+def test_cli_collect_runs_at_requested_pace_and_restores_default(data, monkeypatch, capsys):
+    event(data, 'TEST1000PACED')
+    monkeypatch.setattr(seed.core, 'REQUEST_MIN_INTERVAL', (0.8, 1.8))
+    during = []
+
+    def query(**_kwargs):
+        during.append(seed.core.REQUEST_MIN_INTERVAL)
+        return []
+
+    monkeypatch.setattr(seed.core, 'query_all_pages', query)
+
+    assert run_cli(data, monkeypatch, '--min-interval', '0.2', '--max-interval', '0.4') == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert during == [(0.2, 0.4)]
+    assert seed.core.REQUEST_MIN_INTERVAL == (0.8, 1.8)
+    assert 'pace_warning' not in result
+    with sqlite3.connect(data.db) as conn:
+        selector = json.loads(conn.execute('SELECT selector_json FROM ingestion_runs WHERE id=?',
+                                           (result['run_id'],)).fetchone()[0])
+    assert selector['request_interval'] == [0.2, 0.4]
+
+
+def test_query_failure_drops_paced_collect_back_to_default(data, monkeypatch, capsys):
+    """查询失败是服务端压力信号：本轮后续请求退回默认节奏，结果里说明原因。"""
+    event(data, 'TEST1000FIRST')
+    event(data, 'TEST1000SECOND')
+    monkeypatch.setattr(seed.core, 'REQUEST_MIN_INTERVAL', (0.8, 1.8))
+    during = []
+
+    def query(**_kwargs):
+        during.append(seed.core.REQUEST_MIN_INTERVAL)
+        if len(during) == 1:
+            raise OSError('connection reset')
+        return []
+
+    monkeypatch.setattr(seed.core, 'query_all_pages', query)
+
+    assert run_cli(data, monkeypatch, '--min-interval', '0.2', '--max-interval', '0.4') == 2
+    result = json.loads(capsys.readouterr().out)
+
+    assert during == [(0.2, 0.4), (0.8, 1.8)]
+    assert result['query_failures'] == 1
+    assert '恢复默认间隔' in result['pace_warning']
+    assert seed.core.REQUEST_MIN_INTERVAL == (0.8, 1.8)
+
+
+def test_cli_collect_rejects_half_given_pace(data, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        run_cli(data, monkeypatch, '--min-interval', '0.2')
+    assert '必须同时提供' in capsys.readouterr().err
+    with sqlite3.connect(data.db) as conn:
+        assert conn.execute('SELECT count(*) FROM ingestion_runs').fetchone() == (0,)

@@ -430,7 +430,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 近期正式公告 | `collection_tracking` 的登记、`plan`、`collect` | `plan` 只读；`collect` 会下载，受当前授权约束 |
 | 正式发布重发刷新 | `gonggao collect --republished-from-status` 或 `--republished-batch` | 按候选正式批次查询，只下载清单产品 ID；`--offset` 后接 `--limit` 可抽取候选产品，快照记录实际 ID；公示不作为来源；`--dry-run` 只出清单不下载 |
 | 中断恢复 | 固定清单原文、哈希、目录与 `--resume-run` | 不能另建脚本或新台账掩盖未完成轮次 |
-| 提速 | `gonggao collect` 各模式与固定清单共用 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
+| 提速 | `gonggao collect` 各模式、固定清单与近期事件 `collect` 共用 `--min-interval/--max-interval` | 不改全局默认，不绕过错误降速及互斥锁 |
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
 | 本地 PDF 旧解析结果修复 | `gonggao reparse --layout converted_vehicle` | 默认只读预览；`--apply` 写回解析字段，不下载、不改 PDF 或文档登记 |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |

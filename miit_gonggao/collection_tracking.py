@@ -17,11 +17,11 @@ from urllib.parse import urlparse
 
 if __package__:
     from .announcement_source import OFFICIAL, AnnouncementSource
-    from .collection_run import CollectionRun
+    from .collection_run import CollectionRun, Pace
     from .vehicle_classification import classify_vehicle, energy_group, is_non_automotive
 else:
     from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource
-    from miit_gonggao.collection_run import CollectionRun
+    from miit_gonggao.collection_run import CollectionRun, Pace
     from miit_gonggao.vehicle_classification import classify_vehicle, energy_group, is_non_automotive
 
 DAYS = 60
@@ -379,7 +379,8 @@ def public_fingerprint(conn: sqlite3.Connection) -> str:
 
 
 def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root: Path,
-            nev_only: bool = False, source: AnnouncementSource = OFFICIAL) -> dict:
+            nev_only: bool = False, source: AnnouncementSource = OFFICIAL,
+            pace: Pace | None = None) -> dict:
     # 手动下载也不能绕过整车边界；在产生运行记录或网络请求之前拒绝失效/外部拼装的计划。
     evidence = plan.scope_evidence(conn) if isinstance(plan, RetryPlan) else scope_evidence(conn)
     if any(event_scope(e, evidence)['inclusion_gate'] != 'accepted' for e in plan['pending']):
@@ -393,7 +394,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         from miit_gonggao.collection_manifest import validate_catalog_energy
         from miit_gonggao.vehicle_categories import normalize_energy
     seed.ensure_schema(conn)
-    run = CollectionRun(conn, catalog_db=catalog_db, pdf_root=pdf_root, reason='tracking_collection')
+    run = CollectionRun(conn, catalog_db=catalog_db, pdf_root=pdf_root, reason='tracking_collection',
+                        pace=pace)
     run.ensure_idle()
     resolved_image_failures = 0
     resolved_events = {event['event_id']: event for event in events(conn)} if plan['resolved'] else {}
@@ -415,7 +417,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
         return result
     run_id = run.claim({'mode': 'recent_events', 'days': DAYS, 'batches': BATCHES,
                         'selected_batch': plan.get('selected_batch'),
-                        'selected_event_ids': plan.get('selected_event_ids'), 'nev_only': nev_only},
+                        'selected_event_ids': plan.get('selected_event_ids'), 'nev_only': nev_only,
+                        'request_interval': list(seed.core.REQUEST_MIN_INTERVAL)},
                        len({key[0] for key in grouped}))
     scope_counts = dict(scope_excluded=0, scope_review=0)
     if nev_only:
@@ -445,7 +448,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             except Exception as exc:
                 rows = []
                 status, error = 'query_failed', str(exc)
-                run.count('query_failures')
+                # 查询失败是服务端压力信号：计数并让提速的本轮退回默认间隔。
+                run.query_failed(vehicle_id, error)
             needed = {e['product_id'] for e in group if e['product_id']}
             if rows and all(e['product_id'] for e in group):
                 rows = [r for r in rows if str(r.get('cpid')) in needed]
@@ -531,7 +535,10 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
     counts = run.counts
     errors = (sum(counts[k] for k in ('query_failures', 'download_failures', 'publish_failures', 'image_failures'))
               + sum(scope_counts.values()) + resolved_image_failures)
-    return {'run_id': run_id, 'queries': checked, 'errors': errors, **counts, **scope_counts}
+    result = {'run_id': run_id, 'queries': checked, 'errors': errors, **counts, **scope_counts}
+    if warning := getattr(pace, 'warning', ''):
+        result['pace_warning'] = warning
+    return result
 
 
 def main() -> int:
@@ -556,6 +563,10 @@ def main() -> int:
     collect_parser.add_argument('--limit', type=int, default=400)
     collect_parser.add_argument('--batch', type=int, help='只采集指定正式公告批次')
     collect_parser.add_argument('--no-images', action='store_true', help='只下载 PDF，不获取或重试详情页原图')
+    collect_parser.add_argument('--min-interval', type=float,
+                                help='本进程请求最小间隔（秒），须与最大间隔同时给出；默认沿用 core 的 0.8–1.8')
+    collect_parser.add_argument('--max-interval', type=float,
+                                help='本进程请求最大间隔（秒），须与最小间隔同时给出；遇查询/下载失败、图片异常或非 PDF 恢复默认')
     for command in (plan_parser, collect_parser):
         command.add_argument('--event-id', action='append', dest='event_ids',
                              help='只处理指定正式事件，可重复；未知 ID 或批次不符时拒绝执行')
@@ -568,6 +579,10 @@ def main() -> int:
         parser.error('--batch 必须是有效的正式公告批次')
     if args.pdf_root.resolve() != seed.UPSTREAM_ROOT:
         parser.error('--pdf-root 必须与 VEHICLE_DATA_HUB_ROOT 一致')
+    try:
+        seed.requested_interval(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     read_only = args.command in {'plan', 'fingerprint'}
     uri = f'file:{args.site_db}?mode={"ro" if read_only else "rw"}'
     with (nullcontext() if read_only else seed.database_lock(args.site_db),
@@ -592,10 +607,12 @@ def main() -> int:
                                         event_ids=args.event_ids, nev_only=args.nev_only),
                              ensure_ascii=False, indent=2))
         else:
-            with seed.core.image_downloads(not args.no_images):
+            # 提速与 --no-images 只覆盖本进程；查询、下载、图片或非 PDF 异常会自动恢复默认间隔。
+            with seed.request_pace(args) as pace, seed.core.image_downloads(not args.no_images):
                 result = collect(conn, retry_plan(conn, args.pdf_root, limit=args.limit, batch=args.batch,
                                                   event_ids=args.event_ids, nev_only=args.nev_only),
-                                 catalog_db=args.catalog_db, pdf_root=args.pdf_root, nev_only=args.nev_only)
+                                 catalog_db=args.catalog_db, pdf_root=args.pdf_root, nev_only=args.nev_only,
+                                 pace=pace)
             if result.get('run_id'):
                 try:
                     try:
