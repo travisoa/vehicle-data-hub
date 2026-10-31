@@ -652,8 +652,13 @@ Website 的旧采集脚本仅转发，旧业务库与已迁移运行目录是上
 
 LibreOffice 转换失败或超时（默认 300s，数十 MB 的多目录合刊附件可能超时）后自动回退至 Word。
 实测两者解析行数一致；个别经 Word 转换后解析为 0 行的附件，LibreOffice 反而能够精确解析。
+每次转换使用独立的 LibreOffice 配置目录，超时时连同包装脚本派生的 soffice 一起结束，不会拖住后续附件。
 
-购置税目录第 1~30 批已全量覆盖（历史附件均有 `.word.docx` 缓存，不会再触发转换）。
+Word 通道要在 `~/Library/Group Containers/UBF8T346G9.Office/` 下建临时目录。当前 macOS 不允许其他程序访问该容器
+（报 `Operation not permitted`，也不弹窗），须给运行同步的终端开启“完全磁盘访问权限”并重启终端；Claude Code
+等代理环境内同样无权访问。约 2 万行的整体重列附件（现行购置税目录第 1、26 批，车船税目录第 65、82 批，
+各 26–32 MB）LibreOffice 300 秒内转不完，只能经 Word 转换；没有权限时这些文章记为 `error`，下次 `sync` 重试。
+已有 `.word.docx` 缓存的附件不再需要 Word 或该权限。
 
 `sync` 在 `articles` 表中记录每篇文章的 `status/error/row_count`：目录附件解析出 0 行标记为
 `zero_rows`，异常标记为 `error`，两者均不计为已同步，下次 `sync` 默认重试。解析异常会先回滚
