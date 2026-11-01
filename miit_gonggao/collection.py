@@ -43,7 +43,7 @@ for _path in (UPSTREAM_ROOT, Path(__file__).resolve().parent):
         sys.path.insert(0, str(_path))
 
 from miit_gonggao import core, republished  # noqa: E402
-from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource  # noqa: E402
+from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource, EvidenceOfficialSource  # noqa: E402
 from miit_gonggao.collection_run import PRODUCT_OUTCOMES, CollectionRun, unfinished_runs  # noqa: E402
 from miit_gonggao.review_export import lookup_catalog, parse_gonggao_pdf  # noqa: E402
 
@@ -381,7 +381,7 @@ class RequestPace:
     warning: str = ""
 
     def slow_down(self, status: str) -> None:
-        core.REQUEST_MIN_INTERVAL = self.default
+        core.set_request_interval(self.default)
         self.warning = f"发生 {status}，本次执行后续请求恢复默认间隔 {self.default[0]}–{self.default[1]} 秒"
 
 
@@ -392,10 +392,10 @@ def request_pace(args: argparse.Namespace):
     pace = RequestPace(requested_interval(args), original)
     try:
         if pace.requested is not None:
-            core.REQUEST_MIN_INTERVAL = pace.requested
+            core.set_request_interval(pace.requested)
         yield pace
     finally:
-        core.REQUEST_MIN_INTERVAL = original
+        core.set_request_interval(original)
 
 
 def _existing_vehicle_item(site_db: Path, model_code: str) -> dict[str, str] | None:
@@ -868,6 +868,9 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
     )
     parser.add_argument("--validate-frozen-models", type=Path,
                         help="只校验冻结型号清单及分片，不查询、不下载、不写业务库")
+    parser.add_argument("--query-frozen-models", type=Path,
+                        help="按冻结清单查询一片正式公告，记录证据；不下载参数页")
+    parser.add_argument("--frozen-run-dir", type=Path, help="冻结型号查询证据目录，须为 var/runs 下的新目录")
     parser.add_argument("--frozen-sha256", help="冻结型号清单原始字节的 SHA256")
     parser.add_argument("--all-categories", action="store_true", help="覆盖乘用车、专用车、客车和货车")
     parser.add_argument(
@@ -918,7 +921,7 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
     if args.validate_frozen_models:
         if not args.frozen_sha256:
             parser.error("--validate-frozen-models 需要 --frozen-sha256")
-        if args.from_file or args.republished_from_status or args.republished_batch:
+        if args.query_frozen_models or args.from_file or args.republished_from_status or args.republished_batch:
             parser.error("冻结清单校验不能与采集选择模式同时使用")
         try:
             result = validate_frozen_models(args.validate_frozen_models, args.frozen_sha256,
@@ -927,13 +930,30 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
             parser.error(str(exc))
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    if args.frozen_sha256:
-        parser.error("--frozen-sha256 仅用于 --validate-frozen-models")
+    if args.query_frozen_models:
+        if not args.frozen_sha256 or not args.frozen_run_dir or args.limit is None:
+            parser.error("冻结型号查询必须指定 --frozen-sha256、--frozen-run-dir 和 --limit")
+        if (args.from_file or args.republished_from_status or args.republished_batch or args.catalog_batch
+                or args.through_earlier_batches or args.exclude_existing or args.dry_run or args.verify):
+            parser.error("冻结型号查询不能与其他选择模式同时使用")
+        try:
+            args.frozen_selection = validate_frozen_models(args.query_frozen_models, args.frozen_sha256,
+                                                            offset=args.offset, limit=args.limit)
+        except (OSError, UnicodeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.frozen_run_dir = args.frozen_run_dir.expanduser().resolve()
+        runs_root = (UPSTREAM_ROOT / "var" / "runs").resolve()
+        if not args.frozen_run_dir.is_relative_to(runs_root) or args.frozen_run_dir == runs_root:
+            parser.error("--frozen-run-dir 必须为上游 var/runs 下的新目录")
+        if args.frozen_run_dir.exists():
+            parser.error("冻结型号轮次目录已存在，不能覆盖历史证据")
+    elif args.frozen_sha256 or args.frozen_run_dir:
+        parser.error("--frozen-sha256 或 --frozen-run-dir 需要冻结型号模式")
     try:
         requested_interval(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if not args.catalog_db.exists():
+    if not args.catalog_db.exists() and not args.query_frozen_models:
         parser.error(f"目录数据库不存在：{args.catalog_db}")
     args.catalog_db = args.catalog_db.expanduser().resolve()
     args.site_db = args.site_db.expanduser().resolve()
@@ -1001,6 +1021,11 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
         if not selected:
             parser.error("正式发布重发清单为空：本地没有被更高批次重新发布的产品")
         batch = republished_source.label
+    elif args.query_frozen_models:
+        batch = "冻结型号清单"
+        selected = [{"model_code": model, "catalog": batch, "batch": "", "category": "",
+                     "seq": "", "company": "", "trademark": "", "common_name": ""}
+                    for model in args.frozen_selection["models"]]
     elif args.from_file:
         batch, selected = select_models_from_file(args.catalog_db, args.from_file, args.limit)
     else:
@@ -1015,7 +1040,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
             exclude_existing=args.exclude_existing,
         )
     args.site_db.parent.mkdir(parents=True, exist_ok=True)
-    args.download_root.mkdir(parents=True, exist_ok=True)
+    if not args.query_frozen_models:
+        args.download_root.mkdir(parents=True, exist_ok=True)
     if republished_source is not None:
         verification = None
         if args.verify:
@@ -1048,6 +1074,17 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                   + "、".join(f"第{batch_no}批 {count} 个" for batch_no, count in sorted(by_batch.items()))
                   + f"\n清单快照：{selection_path}\n预演模式：{checked}未下载 PDF，未写业务库。", flush=True)
             return 0
+    elif args.query_frozen_models:
+        raw = args.query_frozen_models.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != args.frozen_selection["sha256"]:
+            raise RuntimeError("冻结清单在校验后发生变化")
+        args.frozen_run_dir.mkdir(parents=True, exist_ok=False)
+        selection_path = args.frozen_run_dir / "models.txt"
+        selection_path.write_bytes(raw)
+        (args.frozen_run_dir / "selection.json").write_text(
+            json.dumps(args.frozen_selection, ensure_ascii=False, indent=2), encoding="utf-8")
+        if source is OFFICIAL:
+            source = EvidenceOfficialSource(args.frozen_run_dir / "query_evidence.jsonl")
     else:
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"batch{batch}".replace("及更早", "_and_earlier"))
         selection_path = args.download_root / f"seed_{scope}_{len(selected)}_offset{args.offset}.json"
@@ -1080,6 +1117,14 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
         "offset": args.offset,
         "request_interval": list(requested_interval(args) or core.REQUEST_MIN_INTERVAL),
     }
+    if args.query_frozen_models:
+        selector.update({"mode": "frozen_query_only", "catalog": "冻结型号清单", "category": "",
+                         "limit": args.limit,
+                         "frozen_sha256": args.frozen_selection["sha256"],
+                         "frozen_total_models": args.frozen_selection["total_models"],
+                         "selection_snapshot": str(selection_path.relative_to(UPSTREAM_ROOT)),
+                         "query_evidence": str((args.frozen_run_dir / "query_evidence.jsonl")
+                                               .relative_to(UPSTREAM_ROOT))})
     if republished_source is not None:
         selector["republished"] = {
             "origin": republished_source.origin,
@@ -1092,7 +1137,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
             "selected_product_ids": [row["product_id"] for row in republished_source.rows],
         }
     # 回填可重复执行，放在认领轮次之前：回填失败或被中断时不留下未完成轮次挡住后续采集。
-    backfilled = backfill_catalog_fields(conn, args.catalog_db)
+    backfilled = 0 if args.query_frozen_models else backfill_catalog_fields(conn, args.catalog_db)
     conn.commit()
     if backfilled:
         print(f"已补齐 {backfilled} 份既有公告的目录参数。", flush=True)
@@ -1101,14 +1146,25 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
     run_id = run.claim(selector, len(selected))
 
     announcement_count = pdf_count = 0
+    consecutive_frozen_failures = 0
+    attempted_models = 0
     pace_warning = ""
     try:
         # 提速与 --no-images 只覆盖本进程；查询、下载、图片或非 PDF 异常会自动恢复默认间隔。
         with request_pace(args) as pace, core.image_downloads(not getattr(args, "no_images", False)):
             run.pace = pace
             for index, item in enumerate(selected, start=1):
-                vehicle_id = upsert_vehicle(conn, item)
+                if args.query_frozen_models:
+                    conn.execute(
+                        "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
+                        "catalog_category, catalog_seq, catalog_company) VALUES ('',?,'冻结型号清单','','','','') "
+                        "ON CONFLICT(announcement_model_code) DO NOTHING", (item["model_code"],))
+                    vehicle_id = int(conn.execute("SELECT id FROM vehicles WHERE announcement_model_code=?",
+                                                  (item["model_code"],)).fetchone()[0])
+                else:
+                    vehicle_id = upsert_vehicle(conn, item)
                 run.begin_model(index, vehicle_id)
+                attempted_models += 1
                 print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
                 try:
                     if republish_mode:
@@ -1117,12 +1173,21 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                         )
                     else:
                         rows = source.query(item["model_code"])
-                    rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
+                    rows = [row for row in rows if (str(row.get("clxh") or "") == item["model_code"]
+                            if args.query_frozen_models else
+                            str(row.get("clxh") or "").upper() == item["model_code"].upper())]
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
                     run.query_failed(vehicle_id, message)
                     print(f"  查询失败：{message}", file=sys.stderr, flush=True)
+                    if args.query_frozen_models:
+                        consecutive_frozen_failures += 1
+                        if consecutive_frozen_failures >= 3:
+                            print("连续 3 个型号查询失败，停止本片；余下型号仍为待查询。", file=sys.stderr,
+                                  flush=True)
+                            break
                     continue
+                consecutive_frozen_failures = 0
                 if not rows:
                     if republish_mode:
                         run.count("awaiting_effective")
@@ -1134,6 +1199,12 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                         continue
                     run.finish_model(vehicle_id, "no_match")
                     print("  公告接口未找到精确型号。", flush=True)
+                    continue
+
+                if args.query_frozen_models:
+                    announcement_count += len(rows)
+                    run.finish_model(vehicle_id, "partial", f"查询精确命中 {len(rows)} 条，参数页待下载和解析")
+                    print(f"  精确命中 {len(rows)} 条；参数页待下载和解析。", flush=True)
                     continue
 
                 unresolved: list[str] = []
@@ -1186,7 +1257,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
 
     counts = run.counts
     print(
-        f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
+        f"完成：选中 {len(selected)} 个{'冻结型号' if args.query_frozen_models else '目录车型'}，"
+        f"已尝试 {attempted_models} 个，公告 {announcement_count} 条，PDF {pdf_count} 份，"
         f"接口与记录不一致 {counts['awaiting_effective']}，查询失败 {counts['query_failures']}，"
         f"下载失败 {counts['download_failures']}，解析失败 {counts['parse_failures']}，"
         f"发布失败 {counts['publish_failures']}，"

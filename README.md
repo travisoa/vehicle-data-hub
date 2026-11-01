@@ -435,6 +435,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 本地 PDF 旧解析结果修复 | `gonggao reparse --layout converted_vehicle` 或 `--layout engine_columns` | 默认只读预览；`--apply` 写回解析字段，不下载、不改 PDF 或文档登记 |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
 | 冻结型号清单校验 | `gonggao collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` | 只校验原文字节、字面值和分片，不查询、不采集；输出 JSON 含全集数量和本片型号 |
+| 冻结型号查询 | `gonggao collect --query-frozen-models <文件> --frozen-sha256 <哈希> --frozen-run-dir var/runs/<新目录> --offset <起点> --limit <数量> --no-images` | 仅查正式接口并保留分页证据；精确命中记为参数页待处理，不下载、不解析 PDF；不能视为采集完成 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
 
 Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整车可收录历史正式公告，
@@ -499,6 +500,9 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 提速后遇到查询失败、下载失败、图片异常或未核验为源站生成异常的非 PDF，三个入口都恢复默认间隔。
 三个入口和 `store_announcement` 经 `announcement_source` 访问工信部公告接口：生产用 `OfficialSource`
 （委托 `core` 的查询、节流、重试与原图下载），测试注入 `ScriptedSource`，不再替换 `core` 的模块函数。
+`EvidenceOfficialSource` 可供采集策略显式启用逐次查询证据：请求和响应原始字节以 base64 追加到 JSONL，
+记录分页、尝试次数、时间及错误，不保存响应头和请求身份凭据；写入失败会使查询失败，不伪报成功。
+同一实例可供多个线程使用，日志追加有锁；统一 HTTP 节流也跨线程共用锁。该类本身不启动采集。
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 

@@ -109,6 +109,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   新建独立批量下载入口，也不得复制已有下载循环。
 - `collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` 只读核验冻结型号清单和
   `--offset`/`--limit` 分片；不依赖目录库，不发请求，也不代表这些型号已被采集。
+- `collect --query-frozen-models <文件> --frozen-sha256 <哈希> --frozen-run-dir var/runs/<新目录>`
+  须显式指定 `--limit`，只查该冻结分片并保存证据；精确命中仍需后续下载和解析。
 - 公示（变更扩展公示、新产品公示）只用于提前了解，不作为任何采集入口：不登记事件、不下载、
   不进业务库。已有参数页被官方变更后要刷新时，用 `collect --republished-from-status`
   （读已落盘统计记录）或 `--republished-batch <批次>`（按批次枚举缓存现算），
@@ -248,6 +250,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   默认间隔并在结尾说明，本轮实际节奏记入 `ingestion_runs.selector_json`。默认不提速，必须显式传参
 - 例外：`scripts/announcement_catalog_gap.py` 的全量批次枚举是一次性只读大作业（约 2.9 万次请求），经项目所有者授权可用 `--fast`（0.2~0.4 秒）或 `--min-interval/--max-interval` 提速。它只覆盖该进程内的 `core.REQUEST_MIN_INTERVAL`，不改 `core.py` 默认值，PDF 下载等其他功能不受影响；仍然串行（同等平均 QPS 下比并发对服务端更平滑），且连续 3 次请求异常会自动降回保守节流。默认不提速，必须显式传参
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
+- 需要逐次查询证据的采集策略可使用 `EvidenceOfficialSource`；它只追加请求/响应正文及尝试状态，
+  不保存会话头，日志写入失败则中断该查询；不得把它当成独立采集入口。
 - `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有 PDF 或图片异常）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
 - 工信部 PDF 接口的 `NECaptchaValidate` 沿用现有随机 token 方式，不要改动

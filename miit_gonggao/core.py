@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import http.client
+import io
 import json
 import os
 import random
@@ -12,11 +14,13 @@ import re
 import string
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib import error, parse, request
 
 
@@ -271,14 +275,38 @@ def image_downloads(enabled: bool):
         DOWNLOAD_IMAGES = original
 
 _last_request_at = 0.0
+_request_pace_lock = threading.Lock()
+
+
+def set_request_interval(interval: tuple[float, float]) -> None:
+    """与节流共用锁，确保工作线程看到一致的请求间隔。"""
+    global REQUEST_MIN_INTERVAL
+    with _request_pace_lock:
+        REQUEST_MIN_INTERVAL = interval
+
+# 捕获调用方显式订阅的逐次请求；ContextVar 使并发任务不会混淆各自的证据。
+_attempt_observer: contextvars.ContextVar[Callable[[dict[str, Any]], None] | None] = (
+    contextvars.ContextVar("http_attempt_observer", default=None)
+)
+
+
+@contextmanager
+def observe_http_attempts(observer: Callable[[dict[str, Any]], None]):
+    """订阅当前上下文的原始 HTTP 尝试。观察器失败会中止请求，不得静默丢证据。"""
+    token = _attempt_observer.set(observer)
+    try:
+        yield
+    finally:
+        _attempt_observer.reset(token)
 
 
 def _throttle() -> None:
     global _last_request_at
-    wait = _last_request_at + random.uniform(*REQUEST_MIN_INTERVAL) - time.monotonic()
-    if wait > 0:
-        time.sleep(wait)
-    _last_request_at = time.monotonic()
+    with _request_pace_lock:
+        wait = _last_request_at + random.uniform(*REQUEST_MIN_INTERVAL) - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
 
 
 def http_request(
@@ -301,6 +329,21 @@ def http_request(
             headers=headers or {},
             method="POST" if body is not None else "GET",
         )
+        observer = _attempt_observer.get()
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        def emit(response_body: bytes | None, status: int | None, failure: str = "") -> None:
+            if observer is not None:
+                observer({
+                    "url": url, "method": req.get_method(), "request_body": body,
+                    # Cookie 和身份凭据不能进入可交付日志。
+                    "request_headers": {k: v for k, v in req.header_items()
+                                        if k.lower() not in {"cookie", "authorization", "proxy-authorization"}},
+                    "attempt": attempt + 1, "started_at": started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "response_status": status, "response_body": response_body, "error": failure,
+                })
+
         try:
             with request.urlopen(req, timeout=timeout) as resp:
                 resp_headers: dict[str, str] = {}
@@ -311,16 +354,32 @@ def http_request(
                         resp_headers[key] += "\n" + value
                     else:
                         resp_headers[key] = value
-                return resp.read(), resp_headers
+                response_body = resp.read()
+                status = getattr(resp, "status", None)
         except error.HTTPError as exc:
+            response_body = None
+            if observer is not None:
+                response_body = exc.fp.read() if exc.fp is not None else b""
+                # 保持 4xx 调用方读取 HTTPError 响应正文的原有能力。
+                exc.file = exc.fp = io.BytesIO(response_body)
+            emit(response_body, exc.code, f"{type(exc).__name__}: {exc}")
             if exc.code < 500:
                 raise
             last_error = exc
         except (error.URLError, TimeoutError, OSError) as exc:
+            emit(None, None, f"{type(exc).__name__}: {exc}")
             last_error = exc
         except http.client.HTTPException as exc:
             # EIDC 偶发 chunked 响应提前结束（IncompleteRead），不属于 OSError，需单独重试
+            partial = exc.partial if isinstance(exc, http.client.IncompleteRead) else None
+            emit(partial, None, f"{type(exc).__name__}: {exc}")
             last_error = exc
+        except Exception as exc:
+            emit(None, None, f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            emit(response_body, status)
+            return response_body, resp_headers
     raise RuntimeError(f"请求失败（已重试 {REQUEST_RETRIES} 次）: {url}") from last_error
 
 

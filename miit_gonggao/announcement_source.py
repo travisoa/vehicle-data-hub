@@ -5,9 +5,16 @@ ScriptedSource 按给定函数返回结果，供测试与离线重放，入口�
 """
 from __future__ import annotations
 
+import base64
+import json
+import os
+import threading
+import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import parse_qs
 
 from miit_gonggao import core
 
@@ -37,6 +44,78 @@ class OfficialSource:
 
     def download(self, row: dict[str, Any], output_dir: Path) -> core.ParameterPageDownload:
         return core.download_param_page(row, output_dir)
+
+
+class EvidenceOfficialSource(OfficialSource):
+    """复用正式接口，将每页每次尝试及查询结局追加到同一证据日志。
+
+    多线程共用同一个实例，锁保护追加；业务数据库仍由调用方单写者管理。
+    正文以 base64 保存原始字节，响应头不保存以免暴露会话 Cookie。
+    """
+
+    def __init__(self, log_path: Path) -> None:
+        self.log_path = log_path
+        self._lock = threading.Lock()
+
+    def _append(self, event: dict[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+        with self._lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as log:
+                log.write(line)
+                log.flush()
+                os.fsync(log.fileno())
+
+    def query(self, model_code: str, batch: int | str | None = None) -> list[dict[str, Any]]:
+        query_id = uuid.uuid4().hex
+        now = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
+        self._append({"type": "query_started", "query_id": query_id, "model_code": model_code,
+                      "batch": batch, "at": now()})
+        attempts = 0
+        pages: list[tuple[int, int, int]] = []
+
+        def record(event: dict[str, Any]) -> None:
+            nonlocal attempts
+            event = dict(event)
+            for field in ("request_body", "response_body"):
+                value = event.pop(field)
+                event[field + "_base64"] = base64.b64encode(value).decode("ascii") if value is not None else None
+            self._append({"type": "http_attempt", "query_id": query_id, **event})
+            attempts += 1
+            if event["response_status"] == 200:
+                try:
+                    payload = json.loads(base64.b64decode(event["response_body_base64"], validate=True))
+                    count = payload["countResult"]
+                    page = int(count["pageNum"])
+                    total = int(count["total"])
+                    total_pages = int(count["totalPage"])
+                    requested = int(parse_qs(base64.b64decode(event["request_body_base64"]).decode())
+                                    ["pageNum"][0])
+                    if (payload["handleResult"]["respCode"] != 200 or not isinstance(payload["cpList"], list)
+                            or total < 0 or total_pages < 0 or page != requested):
+                        raise ValueError("响应状态、列表或分页无效")
+                except (TypeError, ValueError, KeyError, IndexError, UnicodeError) as exc:
+                    raise RuntimeError(f"查询响应缺少可核验的分页证据：{exc}") from exc
+                pages.append((page, total, total_pages))
+
+        try:
+            with core.observe_http_attempts(record):
+                rows = super().query(model_code, batch)
+            if not attempts:
+                raise RuntimeError("查询未产生 HTTP 证据，拒绝记录成功")
+            if not pages:
+                raise RuntimeError("查询未产生成功分页，拒绝记录成功")
+            total, total_pages = pages[0][1:]
+            if (any((t, p) != (total, total_pages) for _, t, p in pages)
+                    or [page for page, _, _ in pages] != list(range(1, max(1, total_pages) + 1))
+                    or len(rows) != total or (total == 0) != (total_pages == 0)):
+                raise RuntimeError("查询分页不完整或总数不一致，拒绝记录成功")
+        except BaseException as exc:
+            self._append({"type": "query_failed", "query_id": query_id, "at": now(),
+                          "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        self._append({"type": "query_succeeded", "query_id": query_id, "at": now(), "rows": len(rows)})
+        return rows
 
 
 class ScriptedSource:
