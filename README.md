@@ -434,6 +434,7 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
 | 本地 PDF 旧解析结果修复 | `gonggao reparse --layout converted_vehicle` 或 `--layout engine_columns` | 默认只读预览；`--apply` 写回解析字段，不下载、不改 PDF 或文档登记 |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
+| 冻结型号清单校验 | `gonggao collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` | 只校验原文字节、字面值和分片，不查询、不采集；输出 JSON 含全集数量和本片型号 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
 
 Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整车可收录历史正式公告，

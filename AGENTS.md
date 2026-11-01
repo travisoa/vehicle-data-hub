@@ -107,6 +107,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
   `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
   新建独立批量下载入口，也不得复制已有下载循环。
+- `collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` 只读核验冻结型号清单和
+  `--offset`/`--limit` 分片；不依赖目录库，不发请求，也不代表这些型号已被采集。
 - 公示（变更扩展公示、新产品公示）只用于提前了解，不作为任何采集入口：不登记事件、不下载、
   不进业务库。已有参数页被官方变更后要刷新时，用 `collect --republished-from-status`
   （读已落盘统计记录）或 `--republished-batch <批次>`（按批次枚举缓存现算），

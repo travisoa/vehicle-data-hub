@@ -306,6 +306,30 @@ def select_models_from_file(
     return f"清单{list_path.name}", selected
 
 
+def validate_frozen_models(path: Path, expected_sha256: str, *, offset: int = 0,
+                           limit: int | None = None) -> dict[str, Any]:
+    """校验原文清单并切片；不改写型号、不查网络、不依赖目录库。"""
+    raw = path.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) or actual != expected_sha256.lower():
+        raise ValueError("冻结型号清单 SHA256 不匹配")
+    if offset < 0 or (limit is not None and limit < 1):
+        raise ValueError("offset 不得小于 0，limit 必须大于 0")
+    models = raw.decode("utf-8").splitlines()
+    if not models or any(not model or model != model.strip() for model in models):
+        raise ValueError("冻结型号清单存在空行或首尾空白")
+    if len(set(models)) != len(models):
+        raise ValueError("冻结型号清单存在重复字面值")
+    # 现有采集器按大写核对接口型号；冲突必须先解决，不能静默合并。
+    if len({model.upper() for model in models}) != len(models):
+        raise ValueError("冻结型号清单存在大小写冲突")
+    if offset >= len(models):
+        raise ValueError("offset 超出冻结清单范围")
+    selected = models[offset:offset + limit if limit is not None else None]
+    return {"sha256": actual, "total_models": len(models), "offset": offset,
+            "limit": limit, "selected_count": len(selected), "models": selected}
+
+
 def derive_catalog_category(model_code: str, product_name: str) -> str:
     """在变更公示型号不属于新能源目录时，用公告型号类别码提供最小分类。"""
     match = re.match(r"^[A-Za-z]+(\d)", model_code or "")
@@ -842,6 +866,9 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
         help="按型号清单采集（一行一个车辆型号，# 开头为注释）；"
              "可直接用 build_site_db.py 产出的 dist/catalog_gap_*.txt",
     )
+    parser.add_argument("--validate-frozen-models", type=Path,
+                        help="只校验冻结型号清单及分片，不查询、不下载、不写业务库")
+    parser.add_argument("--frozen-sha256", help="冻结型号清单原始字节的 SHA256")
     parser.add_argument("--all-categories", action="store_true", help="覆盖乘用车、专用车、客车和货车")
     parser.add_argument(
         "--republished-from-status",
@@ -888,6 +915,20 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
     args = parser.parse_args(argv)
     if (args.limit is not None and args.limit < 1) or args.offset < 0:
         parser.error("--limit 必须大于 0，--offset 不得小于 0")
+    if args.validate_frozen_models:
+        if not args.frozen_sha256:
+            parser.error("--validate-frozen-models 需要 --frozen-sha256")
+        if args.from_file or args.republished_from_status or args.republished_batch:
+            parser.error("冻结清单校验不能与采集选择模式同时使用")
+        try:
+            result = validate_frozen_models(args.validate_frozen_models, args.frozen_sha256,
+                                            offset=args.offset, limit=args.limit)
+        except (OSError, UnicodeError, ValueError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.frozen_sha256:
+        parser.error("--frozen-sha256 仅用于 --validate-frozen-models")
     try:
         requested_interval(args)
     except ValueError as exc:
