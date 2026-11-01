@@ -6,6 +6,7 @@ ScriptedSource 按给定函数返回结果，供测试与离线重放，入口�
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -28,6 +29,9 @@ class AnnouncementSource(Protocol):
     def download(self, row: dict[str, Any], output_dir: Path) -> core.ParameterPageDownload:
         """下载一行产品的参数页到 output_dir；按全局设置同时取原图，原图失败记在结果的 images 里。"""
 
+    def detail(self, row: dict[str, Any], output_dir: Path) -> Path:
+        """下载正式产品详情 HTML；身份由调用方核验。"""
+
 
 def query_arguments(model_code: str, batch: int | str | None) -> dict[str, Any]:
     arguments: dict[str, Any] = {"model_code": model_code, "page_size": PAGE_SIZE}
@@ -44,6 +48,9 @@ class OfficialSource:
 
     def download(self, row: dict[str, Any], output_dir: Path) -> core.ParameterPageDownload:
         return core.download_param_page(row, output_dir)
+
+    def detail(self, row: dict[str, Any], output_dir: Path) -> Path:
+        return core.download_detail_html(row, output_dir)
 
 
 class EvidenceOfficialSource(OfficialSource):
@@ -117,6 +124,65 @@ class EvidenceOfficialSource(OfficialSource):
         self._append({"type": "query_succeeded", "query_id": query_id, "at": now(), "rows": len(rows)})
         return rows
 
+    def download(self, row: dict[str, Any], output_dir: Path) -> core.ParameterPageDownload:
+        """为参数页逐次请求保存原文，正文按 SHA256 存放以避免放大日志。"""
+        return self._recorded_document("download", row, lambda: super(EvidenceOfficialSource, self).download(
+            row, output_dir))
+
+    def detail(self, row: dict[str, Any], output_dir: Path) -> Path:
+        return self._recorded_document("detail", row, lambda: super(EvidenceOfficialSource, self).detail(
+            row, output_dir))
+
+    def _recorded_document(self, kind: str, row: dict[str, Any], action: Callable[[], Any]) -> Any:
+        operation_id = uuid.uuid4().hex
+        now = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
+        self._append({"type": f"{kind}_started", "operation_id": operation_id, "at": now(),
+                      "product_id": row.get("cpid") or row.get("gid"), "model_code": row.get("clxh"),
+                      "batch": str(row.get("gppc") or row.get("pc") or "")})
+        attempts = 0
+
+        def record(event: dict[str, Any]) -> None:
+            nonlocal attempts
+            event = dict(event)
+            request_body = event.pop("request_body")
+            response_body = event.pop("response_body")
+            event["request_body_base64"] = (base64.b64encode(request_body).decode("ascii")
+                                            if request_body is not None else None)
+            event["response_sha256"] = hashlib.sha256(response_body).hexdigest() if response_body is not None else None
+            event["response_bytes"] = len(response_body) if response_body is not None else None
+            event["response_blob"] = None
+            if response_body is not None:
+                relative = Path("http_blobs") / event["response_sha256"]
+                path = self.log_path.parent / relative
+                with self._lock:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        with path.open("xb") as blob:
+                            blob.write(response_body)
+                            blob.flush()
+                            os.fsync(blob.fileno())
+                    except FileExistsError:
+                        if hashlib.sha256(path.read_bytes()).hexdigest() != event["response_sha256"]:
+                            raise RuntimeError("既有 HTTP 证据文件哈希不符")
+                event["response_blob"] = relative.as_posix()
+            self._append({"type": f"{kind}_http_attempt", "operation_id": operation_id, **event})
+            attempts += 1
+
+        try:
+            with core.observe_http_attempts(record):
+                result = action()
+            if not attempts:
+                raise RuntimeError("下载未产生 HTTP 证据，拒绝记录成功")
+        except BaseException as exc:
+            self._append({"type": f"{kind}_failed", "operation_id": operation_id, "at": now(),
+                          "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        completion = {"is_pdf": result.is_pdf, "bytes": result.byte_count} if kind == "download" else {
+            "bytes": result.stat().st_size}
+        self._append({"type": f"{kind}_finished", "operation_id": operation_id, "at": now(),
+                      "http_attempts": attempts, **completion})
+        return result
+
 
 class ScriptedSource:
     """按给定函数应答的公告接口；应答可随时替换，模拟同一轮里先成功、后失败。
@@ -144,6 +210,9 @@ class ScriptedSource:
         if self.on_download is None:
             raise AssertionError(f"未提供下载应答：{row.get('cpid')}")
         return self.on_download(row, output_dir)
+
+    def detail(self, row: dict[str, Any], output_dir: Path) -> Path:
+        raise AssertionError("未提供详情页应答")
 
 
 OFFICIAL = OfficialSource()

@@ -153,3 +153,48 @@ def test_malformed_or_incomplete_result_is_not_no_match(tmp_path, monkeypatch, p
     events = [json.loads(line) for line in path.read_text().splitlines()]
     assert events[-1]["type"] == "query_failed"
     assert events[1]["response_body_base64"]
+
+
+def test_download_evidence_preserves_raw_body_and_retry_attempts(tmp_path, monkeypatch):
+    class Pdf(Response):
+        def read(self):
+            return b"%PDF-1.4\nevidence"
+
+    responses = iter([HTTPError("https://example.test", 503, "retry", {}, io.BytesIO(b"busy")), Pdf()])
+
+    def urlopen(*_args, **_kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(core.request, "urlopen", urlopen)
+    log = tmp_path / "run" / "http_evidence.jsonl"
+    source = EvidenceOfficialSource(log)
+    row = {"cpid": "p1", "clxh": "AAA", "gppc": "408", "cpsb": "brand"}
+    with core.image_downloads(False):
+        result = source.download(row, tmp_path / "staging")
+    assert result.is_pdf
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [event["type"] for event in events] == ["download_started", "download_http_attempt",
+                                                    "download_http_attempt", "download_finished"]
+    assert [event["attempt"] for event in events[1:3]] == [1, 2]
+    assert [(log.parent / event["response_blob"]).read_bytes() for event in events[1:3]] == [
+        b"busy", result.path.read_bytes()]
+    assert events[-1]["http_attempts"] == 2
+
+
+def test_detail_request_is_recorded_without_requesting_images(tmp_path, monkeypatch):
+    class Html(Response):
+        def read(self):
+            return b"<html>official detail</html>"
+
+    calls = []
+    monkeypatch.setattr(core.request, "urlopen", lambda req, **_k: calls.append(req.full_url) or Html())
+    log = tmp_path / "run" / "http_evidence.jsonl"
+    row = {"cpid": "p1", "clxh": "AAA", "gppc": "408", "cpsb": "brand"}
+    path = EvidenceOfficialSource(log).detail(row, tmp_path / "detail")
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert calls == [core.DETAIL_URL]
+    assert [event["type"] for event in events] == ["detail_started", "detail_http_attempt", "detail_finished"]
+    assert (log.parent / events[1]["response_blob"]).read_bytes() == path.read_bytes()

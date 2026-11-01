@@ -503,6 +503,12 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 `EvidenceOfficialSource` 可供采集策略显式启用逐次查询证据：请求和响应原始字节以 base64 追加到 JSONL，
 记录分页、尝试次数、时间及错误，不保存响应头和请求身份凭据；写入失败会使查询失败，不伪报成功。
 同一实例可供多个线程使用，日志追加有锁；统一 HTTP 节流也跨线程共用锁。该类本身不启动采集。
+固定清单采集传 `--http-evidence` 时，参数页每次请求和响应另记轮次日志，响应原文字节按 SHA256
+保存在轮次 `http_blobs/`；下载或证据写入失败分别保留错误。`announcement_observations` 只追加产品和批次的
+每次结果及旧版当前记录快照；现有 `announcements` 仍提供当前视图，历史不依赖该视图。缓存复用时同时核对
+产品 ID、型号、批次、文件大小、魔数与哈希，不用另一公告批次的同 ID 文件冒充本批结果。
+固定清单可同时指定 `--http-evidence --detail-html` 保存正式详情页；先核对产品 ID、型号和批次，
+不下载图片。详情失败单独标记且型号保持部分完成；详情请求与响应同样记录在轮次目录中。
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 

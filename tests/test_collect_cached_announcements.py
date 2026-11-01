@@ -98,6 +98,50 @@ def seed_existing(args, row, *, source: ScriptedSource, parse_error: str = "") -
     return path, path.read_bytes()
 
 
+def test_same_product_id_in_different_batch_does_not_skip_and_history_is_reusable(tmp_path):
+    old = product("p1", gppc="408", pc="408")
+    new = product("p1", gppc="409", pc="409")
+    args, payload = setup(tmp_path, [new])
+    calls = []
+    source = fake_download(calls)
+    old_path, old_bytes = seed_existing(args, old, source=source)
+    assert cached.collect(args, payload, source=source) == 0
+    assert calls == ["p1", "p1"]
+    with closing(sqlite3.connect(args.site_db)) as conn:
+        observations = conn.execute("SELECT batch,relative_path,status FROM announcement_observations "
+                                    "ORDER BY id").fetchall()
+        assert [(r[0], r[2]) for r in observations] == [("408", "downloaded"), ("409", "downloaded")]
+        with seed.core.image_downloads(False):
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="408", model=old["clxh"])[0] == \
+                "skipped_existing"
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="407", model=old["clxh"]) is None
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="408", model="WRONG") is None
+    assert old_path.read_bytes() == old_bytes
+
+
+@pytest.mark.parametrize('correct', [True, False])
+def test_detail_identity_is_recorded_and_failure_keeps_model_partial(tmp_path, correct):
+    args, payload = setup(tmp_path)
+    args.detail_html = True
+    source = fake_download([])
+
+    def detail(row, folder):
+        folder.mkdir(parents=True)
+        path = folder / 'detail.html'
+        product_id = row['cpid'] if correct else 'wrong'
+        path.write_text(f'<table><tr><td>产品ID</td><td>{product_id}</td><td>批次</td><td>409</td></tr>'
+                        f'<tr><td>车辆型号</td><td>{row["clxh"]}</td></tr></table>', encoding='utf-8')
+        return path
+
+    source.detail = detail
+    assert cached.collect(args, payload, source=source) == (0 if correct else 2)
+    result = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert result['detail_status'] == ('verified' if correct else 'failed')
+    assert bool(result['detail_path']) == correct
+    with sqlite3.connect(args.site_db) as conn:
+        assert conn.execute('SELECT status FROM run_models').fetchone()[0] == ('done' if correct else 'partial')
+
+
 def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatch):
     source = ScriptedSource()
     from miit_gonggao import images

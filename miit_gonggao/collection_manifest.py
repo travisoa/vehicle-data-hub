@@ -16,6 +16,7 @@ import signal
 import sqlite3
 import sys
 import time
+import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -26,14 +27,14 @@ if __package__:
     from . import collection as seed
     from .vehicle_categories import CHANNEL_LABELS, derive_channel, normalize_energy
     from .collection_report import write_report
-    from .announcement_source import OFFICIAL, AnnouncementSource
+    from .announcement_source import OFFICIAL, AnnouncementSource, EvidenceOfficialSource
     from .collection_run import CollectionRun
     from .vehicle_classification import classify_vehicle, energy_group, energy_scope
 else:
     from miit_gonggao import collection as seed
     from miit_gonggao.vehicle_categories import CHANNEL_LABELS, derive_channel, normalize_energy
     from miit_gonggao.collection_report import write_report
-    from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource
+    from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource, EvidenceOfficialSource
     from miit_gonggao.collection_run import CollectionRun
     from miit_gonggao.vehicle_classification import classify_vehicle, energy_group, energy_scope
 
@@ -135,14 +136,44 @@ def signal_handlers(stop: StopFlag):
             signal.signal(sig, handler)
 
 
-def local_document(conn: sqlite3.Connection, product_id: str, pdf_root: Path) -> tuple[str, str, int] | None:
-    """只跳过实际文件有效的 PDF；已有 PDF 的解析问题保留供专项处理。"""
-    row = conn.execute(
+def local_document(conn: sqlite3.Connection, product_id: str, pdf_root: Path, *,
+                   batch: str | None = None, model: str | None = None) -> tuple[str, str, int] | None:
+    """只跳过身份及文件均有效的 PDF；按批次查历史，不能拿同 ID 的另一批代替。"""
+    current = conn.execute(
         "SELECT d.relative_path,d.is_pdf,d.bytes,d.sha256,d.error,f.fields_json,f.parse_error,a.raw_json "
         "FROM announcements a JOIN documents d ON d.announcement_id=a.id "
-        "LEFT JOIN announcement_fields f ON f.announcement_id=a.id WHERE a.source_product_id=?",
-        (product_id,),
+        "LEFT JOIN announcement_fields f ON f.announcement_id=a.id "
+        "LEFT JOIN batches b ON b.id=a.batch_id WHERE a.source_product_id=? "
+        "AND (? IS NULL OR b.batch=?) AND (? IS NULL OR a.model_code=?)",
+        (product_id, batch, batch, model, model),
     ).fetchone()
+
+    # 同身份的当前记录是权威结局；历史不能掩盖其损坏或解析异常。
+    if current:
+        return _verified_document(current, product_id, pdf_root)
+    candidates = []
+    # 历史版本仅在调用者给出完整型号和批次身份时参与缓存命中。
+    if batch is not None and model is not None:
+        candidates.extend(conn.execute(
+            "SELECT relative_path,is_pdf,bytes,sha256,error,fields_json,parse_error,raw_json "
+            "FROM announcement_observations WHERE source_product_id=? AND batch=? AND model_code=? "
+            "AND is_pdf=1 ORDER BY CASE WHEN status='downloaded' THEN 0 ELSE 1 END,id DESC",
+            (product_id, batch, model),
+        ).fetchall())
+    partial = None
+    for row in candidates:
+        result = _verified_document(row, product_id, pdf_root)
+        if result and result[0] == "image_failed":
+            # 图片重试入口按当前产品记录定位，不能拿它重试历史批次。
+            continue
+        if result and result[0] in {"skipped_existing", "image_failed"}:
+            return result
+        if result and partial is None:
+            partial = result
+    return partial
+
+
+def _verified_document(row: tuple, product_id: str, pdf_root: Path) -> tuple[str, str, int] | None:
     if not row or row[1] != 1 or row[2] <= 0 or not row[3]:
         return None
     path = (pdf_root / row[0]).resolve()
@@ -283,11 +314,12 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             if stop.reason:
                                 break
                             item_started = time.monotonic()
-                            cached = local_document(conn, row["cpid"], args.pdf_root)
+                            batch = str(row.get("gppc") or row.get("pc"))
+                            cached = local_document(conn, row["cpid"], args.pdf_root, batch=batch, model=model)
                             image_retried = bool(cached and cached[0] == "image_failed"
                                                  and retry_document_images(conn, row["cpid"], args.pdf_root))
                             if image_retried:
-                                cached = local_document(conn, row["cpid"], args.pdf_root)
+                                cached = local_document(conn, row["cpid"], args.pdf_root, batch=batch, model=model)
                             attempted = cached is None
                             stored_image_failed = False
                             if cached:
@@ -303,7 +335,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                     ok, message = outcome
                                     stored_image_failed = outcome.image_failed
                                     status = outcome.status
-                                    current = local_document(conn, row["cpid"], args.pdf_root)
+                                    current = local_document(conn, row["cpid"], args.pdf_root, batch=batch, model=model)
                                     byte_count = current[2] if current else 0
                                     if ok and (not current or current[0] not in {"skipped_existing", "image_failed"}):
                                         status, message = "parse_failed", "下载返回成功但本地 PDF/解析校验未通过"
@@ -332,6 +364,24 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                 print(f"[{processed}/{manifest['expected_products']}] {model} "
                                       f"{row['cpid']} {status}: {message}",
                                       file=sys.stderr, flush=True)
+                            detail_status, detail_path, detail_error = "not_requested", "", ""
+                            if getattr(args, "detail_html", False) and not stop.reason:
+                                try:
+                                    from miit_gonggao.images import validate_detail_identity
+
+                                    folder = args.run_dir / "details" / seed.safe_part(row["cpid"]) / uuid.uuid4().hex
+                                    saved = source.detail(row, folder)
+                                    validate_detail_identity(saved.read_bytes(), row)
+                                    detail_path = str(saved.relative_to(args.run_dir))
+                                    detail_status = "verified"
+                                except Exception as exc:
+                                    detail_status = "failed"
+                                    detail_error = f"{type(exc).__name__}: {exc}"
+                                    counters["detail_failed"] += 1
+                                    errors.append(f"{row['cpid']} 详情页: {detail_error}")
+                                    pace.slow_down("detail_failed")
+                                    print(f"详情页失败：{model} {row['cpid']} {detail_error}",
+                                          file=sys.stderr, flush=True)
                             consecutive_failures = consecutive_failures + 1 if status == "download_failed" else 0
                             if consecutive_failures >= 3:
                                 stop.reason = "连续 3 次下载失败，停止本次采集"
@@ -339,6 +389,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                       "model_code": model, "batch": str(row.get("gppc") or row.get("pc")),
                                       "status": status, "error": message, "bytes": byte_count,
                                       "image_failed": image_failed, "image_retried": image_retried,
+                                      "detail_status": detail_status, "detail_path": detail_path,
+                                      "detail_error": detail_error,
                                       "attempted_download": attempted, "elapsed_seconds": round(elapsed, 3),
                                       "source_generation_error": source_error}
                             results.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -359,7 +411,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
             finally:
                 run.finish(stop.reason)
                 all_successful = (sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
-                                  and not counters["image_failed"])
+                                  and not counters["image_failed"] and not counters["detail_failed"])
                 state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
                 atomic_json(progress_path, progress(state))
             try:
@@ -385,8 +437,12 @@ def main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL
     parser.add_argument("--min-interval", type=float, help="本进程请求最小间隔（秒），须与最大间隔同时给出")
     parser.add_argument("--max-interval", type=float, help="本进程请求最大间隔（秒），遇下载失败/非 PDF 恢复默认")
     parser.add_argument("--no-images", action="store_true", help="只下载 PDF，不获取或重试详情页原图")
+    parser.add_argument("--http-evidence", action="store_true", help="在轮次目录保存逐次下载请求和原始响应")
+    parser.add_argument("--detail-html", action="store_true", help="保存并核验同产品正式详情 HTML（需 --http-evidence）")
     args = parser.parse_args(argv)
     try:
+        if args.detail_html and not args.http_evidence:
+            raise ValueError("--detail-html 需要 --http-evidence 保存原始请求证据")
         manifest = load_manifest(args.manifest, args.manifest_sha256, catalog_db=args.catalog_db)
         interval = requested_interval(args)
         if not args.apply:
@@ -398,6 +454,8 @@ def main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL
                               "download_images": not getattr(args, "no_images", False)},
                              ensure_ascii=False))
             return 0
+        if args.http_evidence and source is OFFICIAL:
+            source = EvidenceOfficialSource(args.run_dir / "http_evidence.jsonl")
         with signal_handlers(stop := StopFlag()):
             return collect(args, manifest, stop, source=source)
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:

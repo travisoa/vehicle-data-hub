@@ -161,6 +161,24 @@ CREATE TABLE IF NOT EXISTS announcement_fields (
     fields_json TEXT NOT NULL,
     parse_error TEXT
 );
+CREATE TABLE IF NOT EXISTS announcement_observations (
+    id INTEGER PRIMARY KEY,
+    source_product_id TEXT NOT NULL,
+    model_code TEXT NOT NULL,
+    batch TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    relative_path TEXT,
+    is_pdf INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    sha256 TEXT,
+    fields_json TEXT,
+    parse_error TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observations_product_batch
+    ON announcement_observations(source_product_id, batch);
 CREATE TABLE IF NOT EXISTS run_models (
     run_id INTEGER NOT NULL REFERENCES ingestion_runs(id),
     sort_order INTEGER NOT NULL,
@@ -660,6 +678,39 @@ class StoreOutcome(tuple):
         return self.status in {"downloaded", "parse_failed"}
 
 
+def record_announcement_observation(conn: sqlite3.Connection, *, row: dict[str, Any], batch: str,
+                                    path: str | None, is_pdf: bool, byte_count: int, digest: str | None,
+                                    fields: dict[str, str], parse_error: str, status: str, error: str) -> None:
+    """只追加当次产品结果；由调用方所在事务提交，不推断任何车辆字段。"""
+    conn.execute(
+        "INSERT INTO announcement_observations(source_product_id,model_code,batch,raw_json,relative_path,"
+        "is_pdf,bytes,sha256,fields_json,parse_error,status,error,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (source_product_id(row), str(row.get("clxh") or ""), batch,
+         json.dumps(row, ensure_ascii=False, sort_keys=True), path, int(is_pdf), byte_count, digest,
+         json.dumps(fields, ensure_ascii=False, sort_keys=True) if is_pdf else None,
+         parse_error or None, status, error or None, utc_now()),
+    )
+
+
+def preserve_current_observation(conn: sqlite3.Connection, product_id: str) -> None:
+    """更新旧产品之前留存原业务记录；已有相同快照时不重复伪造历史。"""
+    conn.execute(
+        "INSERT INTO announcement_observations(source_product_id,model_code,batch,raw_json,relative_path,"
+        "is_pdf,bytes,sha256,fields_json,parse_error,status,error,observed_at) "
+        "SELECT a.source_product_id,a.model_code,COALESCE(b.batch,''),a.raw_json,d.relative_path,"
+        "COALESCE(d.is_pdf,0),COALESCE(d.bytes,0),d.sha256,f.fields_json,f.parse_error,"
+        "'prior_current_snapshot',d.error,COALESCE(d.downloaded_at,a.first_seen_at) "
+        "FROM announcements a LEFT JOIN batches b ON b.id=a.batch_id "
+        "LEFT JOIN documents d ON d.announcement_id=a.id "
+        "LEFT JOIN announcement_fields f ON f.announcement_id=a.id "
+        "WHERE a.source_product_id=? AND NOT EXISTS (SELECT 1 FROM announcement_observations o "
+        "WHERE o.source_product_id=a.source_product_id AND o.batch=COALESCE(b.batch,'') "
+        "AND o.raw_json=a.raw_json AND COALESCE(o.relative_path,'')=COALESCE(d.relative_path,'') "
+        "AND COALESCE(o.sha256,'')=COALESCE(d.sha256,'') "
+        "AND COALESCE(o.fields_json,'')=COALESCE(f.fields_json,''))", (product_id,),
+    )
+
+
 def store_announcement(
     conn: sqlite3.Connection,
     *,
@@ -738,8 +789,11 @@ def store_announcement(
                 # 发布失败不能把暂存路径作为正式文档写入；保留原文件供恢复并记录位置。
                 keep_staging = True
                 retained = relative_pdf_path(path, pdf_root)
-                return StoreOutcome(False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}",
-                                    status="publish_failed")
+                message = f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}"
+                record_announcement_observation(conn, row=row, batch=batch, path=retained, is_pdf=is_pdf,
+                                                byte_count=byte_count, digest=digest, fields=fields,
+                                                parse_error=parse_error, status="publish_failed", error=message)
+                return StoreOutcome(False, message, status="publish_failed")
 
             # 失败重采不改写旧版本：图片与历史索引照常发布，已有的当前图片索引保持不变。
             replace_current = not (previous and error)
@@ -754,11 +808,16 @@ def store_announcement(
 
         if previous and error:
             # 失败重采不改写任何旧版本，包括 HTML 和仅回填了目录字段的记录。
+            record_announcement_observation(conn, row=row, batch=batch, path=relative_path if byte_count else None,
+                                            is_pdf=is_pdf,
+                                            byte_count=byte_count, digest=digest, fields=fields,
+                                            parse_error=parse_error, status=status, error=error)
             return StoreOutcome(False, "; ".join(value for value in (error, image_error) if value),
                                 bool(image_error), status=status)
 
         conn.execute("SAVEPOINT store_announcement")
         try:
+            preserve_current_observation(conn, product_id)
             brand_id = get_or_create_id(conn, "brands", trademark)
             batch_id = get_or_create_id(conn, "batches", batch, "batch")
             conn.execute(
@@ -789,6 +848,9 @@ def store_announcement(
                     "parse_error=excluded.parse_error",
                     (announcement_id, json.dumps(fields, ensure_ascii=False, sort_keys=True), parse_error),
                 )
+            record_announcement_observation(conn, row=row, batch=batch, path=relative_path, is_pdf=is_pdf,
+                                            byte_count=byte_count, digest=digest, fields=fields,
+                                            parse_error=parse_error, status=status, error=error)
         except BaseException as exc:
             # RAISE(ROLLBACK) 等错误可能已经撤销整个事务；清理不能掩盖原始异常。
             if conn.in_transaction:

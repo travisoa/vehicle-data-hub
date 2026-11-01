@@ -252,6 +252,10 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
 - 需要逐次查询证据的采集策略可使用 `EvidenceOfficialSource`；它只追加请求/响应正文及尝试状态，
   不保存会话头，日志写入失败则中断该查询；不得把它当成独立采集入口。
+- 固定清单可用 `--http-evidence` 保存参数页请求证据与响应原文；同产品不同批次的实际结果在业务库
+  `announcement_observations` 中追加留存，缓存复用须核验产品 ID、型号、批次及文件内容。
+- 当 PDF 版面截断或需补正文时，固定清单可加 `--http-evidence --detail-html`，保存并核验同产品正式
+  详情 HTML；不下载图片，详情失败单独标记，不能视作完整。
 - `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有 PDF 或图片异常）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
 - 工信部 PDF 接口的 `NECaptchaValidate` 沿用现有随机 token 方式，不要改动
