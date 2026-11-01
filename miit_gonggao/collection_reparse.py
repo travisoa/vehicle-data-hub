@@ -163,7 +163,8 @@ def build_plan(conn: sqlite3.Connection, pdf_root: Path, layout: str, *, workers
                 continue  # 版式本身变了，归版式刷新处理
             merged = merge_engine_fields(old, new)
             if merged == old:
-                continue  # 发动机块已是当前解析结果
+                plan.unchanged += 1  # 发动机块已是当前解析结果
+                continue
         elif new.get("pdf_layout") != layout:
             continue  # 不是本次要刷新的版式
         else:

@@ -238,7 +238,10 @@ def test_engine_target_refreshes_only_the_engine_block(env):
                          parser=parser, now=lambda: datetime(2026, 11, 1, tzinfo=timezone.utc))
     assert result["applied"] == 1
     assert result["summary"].parent.name.endswith("reparse-engine_columns")
-    assert result["plan"].summary()["changed_keys"] == {"engine_model": 1, "engine_power": 1}
+    summary = result["plan"].summary()
+    assert summary["changed_keys"] == {"engine_model": 1, "engine_power": 1}
+    # PLAIN1 的发动机块已是当前结果，要计入「已是新结果」，不能从汇总里消失。
+    assert (summary["unchanged"], summary["skipped"]) == (1, {"parse_error": 1})
     stored = fields(env["db"])
     assert stored["GLUED"] == {"model_code": "HFC6511REV5C7J", "engine_power": "85;110",
                                "chassis": "承载式车身", "range_km": "400"}
