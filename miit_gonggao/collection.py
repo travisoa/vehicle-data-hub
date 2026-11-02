@@ -18,7 +18,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -414,6 +415,79 @@ def request_pace(args: argparse.Namespace):
         yield pace
     finally:
         core.set_request_interval(original)
+
+
+def _begin_frozen_model(conn: sqlite3.Connection, run: CollectionRun,
+                        index: int, item: dict[str, str], total: int) -> int:
+    """仅调度线程认领型号并写入 SQLite；工作线程不接触业务库。"""
+    conn.execute(
+        "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
+        "catalog_category, catalog_seq, catalog_company) VALUES ('',?,'冻结型号清单','','','','') "
+        "ON CONFLICT(announcement_model_code) DO NOTHING", (item["model_code"],))
+    vehicle_id = int(conn.execute("SELECT id FROM vehicles WHERE announcement_model_code=?",
+                                 (item["model_code"],)).fetchone()[0])
+    run.begin_model(index, vehicle_id)
+    print(f"[{index}/{total}] {item['common_name']} / {item['model_code']}", flush=True)
+    return vehicle_id
+
+
+def _collect_frozen_query_workers(conn: sqlite3.Connection, run: CollectionRun,
+                                   selected: list[dict[str, str]], source: AnnouncementSource,
+                                   workers: int, pace: RequestPace) -> tuple[int, int]:
+    """有界并发查询，按冻结顺序单写结果；熔断后收齐已认领的在途查询。"""
+    def query(model: str) -> list[dict[str, Any]]:
+        try:
+            return [row for row in source.query(model) if str(row.get("clxh") or "") == model]
+        except Exception:
+            # 不等主线程消费较早型号的结果，失败线程立即恢复全局保守节流。
+            pace.slow_down("query_failed")
+            raise
+
+    attempted = announcements = consecutive_failures = 0
+    stopped = False
+    models = iter(enumerate(selected, start=1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="frozen-query") as pool:
+        pending = deque()
+
+        def submit() -> bool:
+            nonlocal attempted
+            item_with_index = next(models, None)
+            if item_with_index is None:
+                return False
+            index, item = item_with_index
+            vehicle_id = _begin_frozen_model(conn, run, index, item, len(selected))
+            pending.append((item["model_code"], vehicle_id, pool.submit(query, item["model_code"])))
+            attempted += 1
+            return True
+
+        for _ in range(workers):
+            if not submit():
+                break
+        while pending:
+            model_code, vehicle_id, future = pending.popleft()
+            try:
+                rows = future.result()
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                run.query_failed(vehicle_id, message)
+                print(f"  {model_code} 查询失败：{message}", file=sys.stderr, flush=True)
+                consecutive_failures += 1
+                if consecutive_failures >= 3 and not stopped:
+                    stopped = True
+                    print("连续 3 个型号查询失败，停止派发；收齐已认领的在途查询后结束本片，"
+                          "其余型号仍为待查询。", file=sys.stderr, flush=True)
+            else:
+                consecutive_failures = 0
+                if rows:
+                    announcements += len(rows)
+                    run.finish_model(vehicle_id, "partial", f"查询精确命中 {len(rows)} 条，参数页待下载和解析")
+                    print(f"  {model_code} 精确命中 {len(rows)} 条；参数页待下载和解析。", flush=True)
+                else:
+                    run.finish_model(vehicle_id, "no_match")
+                    print(f"  {model_code} 公告接口未找到精确型号。", flush=True)
+            if not stopped:
+                submit()
+    return attempted, announcements
 
 
 def _existing_vehicle_item(site_db: Path, model_code: str) -> dict[str, str] | None:
@@ -932,6 +1006,8 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
                         help="只校验冻结型号清单及分片，不查询、不下载、不写业务库")
     parser.add_argument("--query-frozen-models", type=Path,
                         help="按冻结清单查询一片正式公告，记录证据；不下载参数页")
+    parser.add_argument("--workers", type=core.positive_int, default=1,
+                        help="冻结型号查询的工作线程数，1–8，默认1；所有线程共享HTTP节流，SQLite单写")
     parser.add_argument("--frozen-run-dir", type=Path, help="冻结型号查询证据目录，须为 var/runs 下的新目录")
     parser.add_argument("--frozen-sha256", help="冻结型号清单原始字节的 SHA256")
     parser.add_argument("--all-categories", action="store_true", help="覆盖乘用车、专用车、客车和货车")
@@ -978,6 +1054,10 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
     parser.add_argument("--no-report", action="store_true", help="跳过本轮的 Markdown 采集报告")
     parser.add_argument("--download-root", type=Path, default=DEFAULT_DOWNLOAD_ROOT)
     args = parser.parse_args(argv)
+    if args.workers > 8:
+        parser.error("--workers 必须为 1–8")
+    if args.workers != 1 and not args.query_frozen_models:
+        parser.error("--workers 大于1只适用于 --query-frozen-models")
     if (args.limit is not None and args.limit < 1) or args.offset < 0:
         parser.error("--limit 必须大于 0，--offset 不得小于 0")
     if args.validate_frozen_models:
@@ -1182,6 +1262,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
     if args.query_frozen_models:
         selector.update({"mode": "frozen_query_only", "catalog": "冻结型号清单", "category": "",
                          "limit": args.limit,
+                         "workers": args.workers,
                          "frozen_sha256": args.frozen_selection["sha256"],
                          "frozen_total_models": args.frozen_selection["total_models"],
                          "selection_snapshot": str(selection_path.relative_to(UPSTREAM_ROOT)),
@@ -1215,19 +1296,20 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
         # 提速与 --no-images 只覆盖本进程；查询、下载、图片或非 PDF 异常会自动恢复默认间隔。
         with request_pace(args) as pace, core.image_downloads(not getattr(args, "no_images", False)):
             run.pace = pace
-            for index, item in enumerate(selected, start=1):
+            if args.query_frozen_models and args.workers > 1:
+                attempted_models, announcement_count = _collect_frozen_query_workers(
+                    conn, run, selected, source, args.workers, pace)
+                iteration = ()
+            else:
+                iteration = enumerate(selected, start=1)
+            for index, item in iteration:
                 if args.query_frozen_models:
-                    conn.execute(
-                        "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
-                        "catalog_category, catalog_seq, catalog_company) VALUES ('',?,'冻结型号清单','','','','') "
-                        "ON CONFLICT(announcement_model_code) DO NOTHING", (item["model_code"],))
-                    vehicle_id = int(conn.execute("SELECT id FROM vehicles WHERE announcement_model_code=?",
-                                                  (item["model_code"],)).fetchone()[0])
+                    vehicle_id = _begin_frozen_model(conn, run, index, item, len(selected))
                 else:
                     vehicle_id = upsert_vehicle(conn, item)
-                run.begin_model(index, vehicle_id)
+                    run.begin_model(index, vehicle_id)
+                    print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
                 attempted_models += 1
-                print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
                 try:
                     if republish_mode:
                         rows = query_republished_candidate_batches(
