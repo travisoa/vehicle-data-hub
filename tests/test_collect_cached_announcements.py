@@ -777,6 +777,37 @@ def test_detail_only_three_identity_failures_stop(tmp_path):
     assert '连续 3 次详情失败' in progress(args)['stop_reason']
 
 
+def test_detail_only_three_nonconsecutive_request_failures_stop(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(6)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = _detail_only_source(args, calls)
+    normal_detail = source.detail
+
+    def detail(row, folder):
+        if row['cpid'] not in {'p0', 'p2', 'p4'}:
+            return normal_detail(row, folder)
+        calls.append(row['cpid'])
+        operation = 'failure-' + row['cpid']
+        events = [{'type': 'detail_started', 'operation_id': operation, 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': operation, 'response_status': 503,
+                   'error': 'HTTP 503'},
+                  {'type': 'detail_failed', 'operation_id': operation, 'error': 'HTTP 503'}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        raise OSError('HTTP 503')
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0', 'p1', 'p2', 'p3', 'p4']
+    assert '3 个不同产品请求失败' in progress(args)['stop_reason']
+
+
 def test_detail_only_pdf_backfill_reuses_detail_evidence(tmp_path):
     args, manifest = setup(tmp_path)
     args.pdf_root = tmp_path

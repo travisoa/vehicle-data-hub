@@ -293,6 +293,22 @@ def detail_access_limit(log: Path, row: dict[str, Any]) -> str:
     return ""
 
 
+def detail_request_failed(log: Path, row: dict[str, Any]) -> bool:
+    """区分请求失败与 HTTP 200 后的身份校验问题。"""
+    if not log.is_file():
+        return False
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    starts = [e for e in events if e.get("type") == "detail_started"
+              and e.get("product_id") == row["cpid"] and e.get("model_code") == row["clxh"]
+              and e.get("batch") == str(row.get("gppc") or row.get("pc"))]
+    if not starts:
+        return False
+    operation = starts[-1]["operation_id"]
+    attempts = [e for e in events if e.get("type") == "detail_http_attempt" and e.get("operation_id") == operation]
+    return (any(e.get("type") == "detail_failed" and e.get("operation_id") == operation for e in events)
+            and bool(attempts) and not any(e.get("response_status") == 200 and not e.get("error") for e in attempts))
+
+
 def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag | None = None, *,
             source: AnnouncementSource = OFFICIAL) -> int:
     stop = stop or StopFlag()
@@ -321,6 +337,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
             processed = pdf_bytes = downloaded_bytes = attempts = source_errors = 0
             download_seconds = 0.0
             consecutive_failures = 0
+            request_failed_products: set[tuple[str, str]] = set()
 
             def progress(state: str) -> dict[str, Any]:
                 remaining = manifest["expected_products"] - processed
@@ -391,9 +408,13 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                     errors.append(f"{row['cpid']} 详情页: {detail_error}")
                                     pace.slow_down("detail_failed")
                                     consecutive_failures += 1
+                                    if detail_request_failed(args.run_dir / "http_evidence.jsonl", row):
+                                        request_failed_products.add((row["cpid"], batch))
                                     restriction = detail_access_limit(args.run_dir / "http_evidence.jsonl", row)
                                     if restriction:
                                         stop.reason = f"站点访问限制：{restriction}"
+                                    elif len(request_failed_products) >= 3:
+                                        stop.reason = "本片 3 个不同产品请求失败，停止本次采集"
                                     elif consecutive_failures >= 3:
                                         stop.reason = "连续 3 次详情失败，停止本次采集"
                                 processed += 1
