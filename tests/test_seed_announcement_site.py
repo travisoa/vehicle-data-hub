@@ -823,6 +823,15 @@ def test_failed_refresh_preserves_complete_previous_version(monkeypatch, tmp_pat
     assert old_state == [conn.execute(f'SELECT * FROM {table}').fetchall()
                          for table in ['announcements', 'documents', 'announcement_fields']]
     assert old_path.read_bytes() == b'%PDF old'
+    observations = conn.execute('SELECT batch,status,raw_json,relative_path FROM announcement_observations '
+                                'ORDER BY id').fetchall()
+    assert [(row[0], row[1]) for row in observations] == [
+        ('408', 'downloaded'), ('409', {'network': 'download_failed', 'html': 'non_pdf',
+                                        'parse': 'parse_failed', 'publish': 'publish_failed'}[failure])]
+    assert json.loads(observations[0][2])['clmc'] == 'old'
+    assert json.loads(observations[1][2])['clmc'] == 'new'
+    if failure == 'network':
+        assert observations[1][3] is None
     conn.close()
 
 
@@ -852,9 +861,14 @@ def test_successful_same_path_refresh_preserves_old_pdf(monkeypatch, tmp_path):
     assert old_path != new_path
     assert old_path.read_bytes() == b'%PDF old'
     assert new_path.read_bytes() == content
+    versions = conn.execute('SELECT batch,relative_path,fields_json FROM announcement_observations ORDER BY id').fetchall()
+    assert len(versions) == 2
+    assert [tmp_path / row[1] for row in versions] == [old_path, new_path]
+    assert [json.loads(row[2])['gross_mass'] for row in versions] == [str(len(b'%PDF old')), str(len(content))]
     assert json.loads(conn.execute('SELECT fields_json FROM announcement_fields').fetchone()[0]) == {
         'gross_mass': str(len(content))}
     conn.commit()
+    assert conn.execute('SELECT count(*) FROM announcement_observations').fetchone()[0] == 2
     saved = [conn.execute(f'SELECT * FROM {table}').fetchall()
              for table in ['announcements', 'documents', 'announcement_fields']]
     conn.execute("CREATE TRIGGER reject_document BEFORE UPDATE ON documents "

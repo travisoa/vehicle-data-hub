@@ -29,12 +29,26 @@ def image_folder(row: dict[str, Any], output_dir: Path) -> Path:
     return output_dir / "images" / "_".join(core.safe_part(str(value)) for value in identity)
 
 
-def parse_image_links(content: bytes, row: dict[str, Any]) -> list[dict[str, str]]:
-    """不猜测连续编号，也不把验证页、错误车型或外站链接当成照片清单。
+def is_access_verification_page(content: bytes) -> bool:
+    """识别访问验证页；普通详情中的文本不作为验证码判断。"""
+    lowered = content.lower()
+    if '访问行为验证'.encode() in content or b'<title>captcha' in lowered:
+        return True
+    soup = BeautifulSoup(content, 'html.parser')
+    title = soup.title.get_text(' ', strip=True).lower() if soup.title else ''
+    if any(word in title for word in ('captcha', '验证码', '访问验证', '安全验证')):
+        return True
+    for element in soup.select('input, iframe'):
+        attributes = ' '.join(str(element.get(key) or '') for key in ('id', 'name', 'src', 'placeholder')).lower()
+        if any(word in attributes for word in ('captcha', '验证码', 'verifycode')):
+            return True
+    return False
 
-    只收同源 getPic 链接；页面上的其他图片（标志、装饰图、外站图片）不是公告照片，直接略过。
-    getPic 链接的产品 ID、批次与本产品不符时拒绝整页，避免登记别的产品的照片。
-    """
+
+def validate_detail_identity(content: bytes, row: dict[str, Any]) -> None:
+    """只读核验正式详情页产品 ID、批次及型号，不请求或下载图片。"""
+    if is_access_verification_page(content):
+        raise ValueError("详情页产品 ID/批次不符或返回访问验证页，未取得图片清单")
     soup = BeautifulSoup(content, "html.parser")
     fields = {}
     for tr in soup.find_all("tr"):
@@ -43,10 +57,21 @@ def parse_image_links(content: bytes, row: dict[str, Any]) -> list[dict[str, str
             fields[left.get_text(strip=True)] = right.get_text(strip=True)
     gid = str(row.get("cpid") or row.get("gid") or "")
     batch = str(row.get("gppc") or row.get("pc") or "")
-    if not gid or not batch or fields.get("产品ID") != gid or fields.get("批次") != batch:
+    model = str(row.get("clxh") or "")
+    chassis = str(row.get("dataTag") or "").upper() == "D"
+    id_label, model_label = ("底盘ID", "底盘型号") if chassis else ("产品ID", "车辆型号")
+    if not gid or not batch or fields.get(id_label) != gid or fields.get("批次") != batch:
         raise ValueError("详情页产品 ID/批次不符或返回访问验证页，未取得图片清单")
-    if fields.get("车辆型号") != str(row.get("clxh") or ""):
+    if not model or fields.get(model_label) != model:
         raise ValueError("详情页车辆型号不符，未取得图片清单")
+
+
+def parse_image_links(content: bytes, row: dict[str, Any]) -> list[dict[str, str]]:
+    """不猜测连续编号，也不把验证页、错误车型或外站链接当成照片清单。"""
+    validate_detail_identity(content, row)
+    soup = BeautifulSoup(content, "html.parser")
+    gid = str(row.get("cpid") or row.get("gid") or "")
+    batch = str(row.get("gppc") or row.get("pc") or "")
     base = urlsplit(core.BASE_URL)
     links = []
     seen = set()

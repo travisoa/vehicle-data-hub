@@ -434,7 +434,16 @@ Website 只读构建站点派生库。强制复用约束见 [AGENTS.md](AGENTS.m
 | 收录数量、缺口与历史变化 | `gonggao status`、`--json`、`--history` | 默认读取持久统计；需要重新计算时显式 `--refresh` |
 | 本地 PDF 旧解析结果修复 | `gonggao reparse --layout converted_vehicle` 或 `--layout engine_columns` | 默认只读预览；`--apply` 写回解析字段，不下载、不改 PDF 或文档登记 |
 | 估算、筛选与核验 | 先读持久统计及候选清单，再核验必要的源记录 | 不另建统计台账，不附带 PDF 下载 |
+| 冻结型号清单校验 | `gonggao collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` | 只校验原文字节、字面值和分片，不查询、不采集；输出 JSON 含全集数量和本片型号 |
+| 冻结型号查询 | `gonggao collect --query-frozen-models <文件> --frozen-sha256 <哈希> --frozen-run-dir var/runs/<新目录> --offset <起点> --limit <数量> --no-images` | 仅查正式接口并保留分页证据；精确命中记为参数页待处理，不下载、不解析 PDF；不能视为采集完成 |
 | 批次产品枚举 | `scripts/announcement_catalog_gap.py` | 保存官方清单；不增加 PDF 下载功能 |
+
+经用户明确授权，冻结型号查询可追加 `--workers 4`（范围1–8，默认1）。工作线程复用正式查询、
+分页及HTTP证据，每个型号的原始请求响应分别归属其查询ID；所有线程共享全局请求起始节流，
+不会变成每线程各自限速。SQLite认领和结果记录仍在调度线程执行，轮次选择记录实际workers数。
+查询失败的工作线程立即恢复默认请求间隔。按清单顺序连续3个型号失败后停止派发，已派发的
+至多workers-1个在途型号仍前台收齐并记下真实结局，未派发型号保持待查询；中断会等待工作
+线程退出并沿用轮次收尾。该参数不用于PDF下载或其他采集模式。
 
 Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整车可收录历史正式公告，
 非新能源收录第 408 批及以后；范围待核验不冒充符合。网站公开范围与本轮下载授权分别核实。
@@ -485,7 +494,11 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 下载异常恢复默认间隔，连续三次下载失败停止。该模式不会重新按型号搜索或增加其他批次。
 固定清单使用 schema_version=1。`nev_complete_manifest_v1`（及兼容旧 scope）仅接受新能源；
 `automotive_complete_manifest_v1` 在第 408 批及以后接受燃油、普通混动与动力未知整车，更早批次仍须新能源。
-各 scope 均执行整车判定，不依赖清单自报能源；恢复时 scope 与清单哈希必须一致。
+整车 scope 执行整车判定，不依赖清单自报能源；恢复时 scope 与清单哈希必须一致。
+明确需要采集正式查询中同型号的新能源底盘时，可单独使用 `nev_chassis_manifest_v1`：
+只接受公告 `dataTag=D` 且名称以“汽车底盘”结尾的新能源产品，记录原产品 ID 和批次；
+详情页严格核对底盘 ID、底盘型号及批次；整车仍核对产品 ID、车辆型号及批次。
+该采集不改变网站的整车范围判定。
 需要核验新能源范围时优先按官方产品名判断；产品名只写混合动力等无法确认类型时，只读查询
 `--catalog-db`（默认 `data/jianmian_catalog.sqlite`）中精确同型号的具体能源证据。
 通用“新能源/新能源汽车”标签不单独证明类型；具体能源冲突、普通混动或无证据均拒绝。
@@ -498,6 +511,20 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 提速后遇到查询失败、下载失败、图片异常或未核验为源站生成异常的非 PDF，三个入口都恢复默认间隔。
 三个入口和 `store_announcement` 经 `announcement_source` 访问工信部公告接口：生产用 `OfficialSource`
 （委托 `core` 的查询、节流、重试与原图下载），测试注入 `ScriptedSource`，不再替换 `core` 的模块函数。
+`EvidenceOfficialSource` 可供采集策略显式启用逐次查询证据：请求和响应原始字节以 base64 追加到 JSONL，
+记录分页、尝试次数、时间及错误，不保存响应头和请求身份凭据；写入失败会使查询失败，不伪报成功。
+同一实例可供多个线程使用，日志追加有锁；统一 HTTP 节流也跨线程共用锁。该类本身不启动采集。
+固定清单采集传 `--http-evidence` 时，参数页每次请求和响应另记轮次日志，响应原文字节按 SHA256
+保存在轮次 `http_blobs/`；下载或证据写入失败分别保留错误。`announcement_observations` 只追加产品和批次的
+每次结果及旧版当前记录快照；现有 `announcements` 仍提供当前视图，历史不依赖该视图。缓存复用时同时核对
+产品 ID、型号、批次、文件大小、魔数与哈希，不用另一公告批次的同 ID 文件冒充本批结果。
+固定清单可同时指定 `--http-evidence --detail-html` 保存正式详情页；先核对产品 ID、型号和批次，
+不下载图片。详情失败单独标记且型号保持部分完成；详情请求与响应同样记录在轮次目录中。
+固定清单加 `--detail-only --http-evidence --no-images` 只获取详情，不请求参数 PDF，也不建立 PDF 文档或解析记录。
+`results.jsonl` 将详情核验成功记为 `detail_verified_pdf_pending`，失败记为 `detail_failed`；前者仍需补采 PDF。
+成功详情的产品 ID、批次、型号、内容哈希、相对路径和请求证据追加到业务库的 `verified_detail_cache`。
+续跑或以后用 `--detail-html` 补 PDF 时，只有身份、哈希、请求、响应和完成证据均能重新校验才复用详情；
+详情失败会降速，连续三次失败停止本轮，访问验证页或 403/429 立即停止。
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 

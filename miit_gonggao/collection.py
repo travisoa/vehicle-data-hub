@@ -18,7 +18,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,7 +44,7 @@ for _path in (UPSTREAM_ROOT, Path(__file__).resolve().parent):
         sys.path.insert(0, str(_path))
 
 from miit_gonggao import core, republished  # noqa: E402
-from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource  # noqa: E402
+from miit_gonggao.announcement_source import OFFICIAL, AnnouncementSource, EvidenceOfficialSource  # noqa: E402
 from miit_gonggao.collection_run import PRODUCT_OUTCOMES, CollectionRun, unfinished_runs  # noqa: E402
 from miit_gonggao.review_export import lookup_catalog, parse_gonggao_pdf  # noqa: E402
 
@@ -161,6 +162,24 @@ CREATE TABLE IF NOT EXISTS announcement_fields (
     fields_json TEXT NOT NULL,
     parse_error TEXT
 );
+CREATE TABLE IF NOT EXISTS announcement_observations (
+    id INTEGER PRIMARY KEY,
+    source_product_id TEXT NOT NULL,
+    model_code TEXT NOT NULL,
+    batch TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    relative_path TEXT,
+    is_pdf INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    sha256 TEXT,
+    fields_json TEXT,
+    parse_error TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observations_product_batch
+    ON announcement_observations(source_product_id, batch);
 CREATE TABLE IF NOT EXISTS run_models (
     run_id INTEGER NOT NULL REFERENCES ingestion_runs(id),
     sort_order INTEGER NOT NULL,
@@ -306,6 +325,30 @@ def select_models_from_file(
     return f"清单{list_path.name}", selected
 
 
+def validate_frozen_models(path: Path, expected_sha256: str, *, offset: int = 0,
+                           limit: int | None = None) -> dict[str, Any]:
+    """校验原文清单并切片；不改写型号、不查网络、不依赖目录库。"""
+    raw = path.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) or actual != expected_sha256.lower():
+        raise ValueError("冻结型号清单 SHA256 不匹配")
+    if offset < 0 or (limit is not None and limit < 1):
+        raise ValueError("offset 不得小于 0，limit 必须大于 0")
+    models = raw.decode("utf-8").splitlines()
+    if not models or any(not model or model != model.strip() for model in models):
+        raise ValueError("冻结型号清单存在空行或首尾空白")
+    if len(set(models)) != len(models):
+        raise ValueError("冻结型号清单存在重复字面值")
+    # 现有采集器按大写核对接口型号；冲突必须先解决，不能静默合并。
+    if len({model.upper() for model in models}) != len(models):
+        raise ValueError("冻结型号清单存在大小写冲突")
+    if offset >= len(models):
+        raise ValueError("offset 超出冻结清单范围")
+    selected = models[offset:offset + limit if limit is not None else None]
+    return {"sha256": actual, "total_models": len(models), "offset": offset,
+            "limit": limit, "selected_count": len(selected), "models": selected}
+
+
 def derive_catalog_category(model_code: str, product_name: str) -> str:
     """在变更公示型号不属于新能源目录时，用公告型号类别码提供最小分类。"""
     match = re.match(r"^[A-Za-z]+(\d)", model_code or "")
@@ -357,7 +400,7 @@ class RequestPace:
     warning: str = ""
 
     def slow_down(self, status: str) -> None:
-        core.REQUEST_MIN_INTERVAL = self.default
+        core.set_request_interval(self.default)
         self.warning = f"发生 {status}，本次执行后续请求恢复默认间隔 {self.default[0]}–{self.default[1]} 秒"
 
 
@@ -368,10 +411,83 @@ def request_pace(args: argparse.Namespace):
     pace = RequestPace(requested_interval(args), original)
     try:
         if pace.requested is not None:
-            core.REQUEST_MIN_INTERVAL = pace.requested
+            core.set_request_interval(pace.requested)
         yield pace
     finally:
-        core.REQUEST_MIN_INTERVAL = original
+        core.set_request_interval(original)
+
+
+def _begin_frozen_model(conn: sqlite3.Connection, run: CollectionRun,
+                        index: int, item: dict[str, str], total: int) -> int:
+    """仅调度线程认领型号并写入 SQLite；工作线程不接触业务库。"""
+    conn.execute(
+        "INSERT INTO vehicles(market_name, announcement_model_code, catalog_name, catalog_batch, "
+        "catalog_category, catalog_seq, catalog_company) VALUES ('',?,'冻结型号清单','','','','') "
+        "ON CONFLICT(announcement_model_code) DO NOTHING", (item["model_code"],))
+    vehicle_id = int(conn.execute("SELECT id FROM vehicles WHERE announcement_model_code=?",
+                                 (item["model_code"],)).fetchone()[0])
+    run.begin_model(index, vehicle_id)
+    print(f"[{index}/{total}] {item['common_name']} / {item['model_code']}", flush=True)
+    return vehicle_id
+
+
+def _collect_frozen_query_workers(conn: sqlite3.Connection, run: CollectionRun,
+                                   selected: list[dict[str, str]], source: AnnouncementSource,
+                                   workers: int, pace: RequestPace) -> tuple[int, int]:
+    """有界并发查询，按冻结顺序单写结果；熔断后收齐已认领的在途查询。"""
+    def query(model: str) -> list[dict[str, Any]]:
+        try:
+            return [row for row in source.query(model) if str(row.get("clxh") or "") == model]
+        except Exception:
+            # 不等主线程消费较早型号的结果，失败线程立即恢复全局保守节流。
+            pace.slow_down("query_failed")
+            raise
+
+    attempted = announcements = consecutive_failures = 0
+    stopped = False
+    models = iter(enumerate(selected, start=1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="frozen-query") as pool:
+        pending = deque()
+
+        def submit() -> bool:
+            nonlocal attempted
+            item_with_index = next(models, None)
+            if item_with_index is None:
+                return False
+            index, item = item_with_index
+            vehicle_id = _begin_frozen_model(conn, run, index, item, len(selected))
+            pending.append((item["model_code"], vehicle_id, pool.submit(query, item["model_code"])))
+            attempted += 1
+            return True
+
+        for _ in range(workers):
+            if not submit():
+                break
+        while pending:
+            model_code, vehicle_id, future = pending.popleft()
+            try:
+                rows = future.result()
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                run.query_failed(vehicle_id, message)
+                print(f"  {model_code} 查询失败：{message}", file=sys.stderr, flush=True)
+                consecutive_failures += 1
+                if consecutive_failures >= 3 and not stopped:
+                    stopped = True
+                    print("连续 3 个型号查询失败，停止派发；收齐已认领的在途查询后结束本片，"
+                          "其余型号仍为待查询。", file=sys.stderr, flush=True)
+            else:
+                consecutive_failures = 0
+                if rows:
+                    announcements += len(rows)
+                    run.finish_model(vehicle_id, "partial", f"查询精确命中 {len(rows)} 条，参数页待下载和解析")
+                    print(f"  {model_code} 精确命中 {len(rows)} 条；参数页待下载和解析。", flush=True)
+                else:
+                    run.finish_model(vehicle_id, "no_match")
+                    print(f"  {model_code} 公告接口未找到精确型号。", flush=True)
+            if not stopped:
+                submit()
+    return attempted, announcements
 
 
 def _existing_vehicle_item(site_db: Path, model_code: str) -> dict[str, str] | None:
@@ -636,6 +752,39 @@ class StoreOutcome(tuple):
         return self.status in {"downloaded", "parse_failed"}
 
 
+def record_announcement_observation(conn: sqlite3.Connection, *, row: dict[str, Any], batch: str,
+                                    path: str | None, is_pdf: bool, byte_count: int, digest: str | None,
+                                    fields: dict[str, str], parse_error: str, status: str, error: str) -> None:
+    """只追加当次产品结果；由调用方所在事务提交，不推断任何车辆字段。"""
+    conn.execute(
+        "INSERT INTO announcement_observations(source_product_id,model_code,batch,raw_json,relative_path,"
+        "is_pdf,bytes,sha256,fields_json,parse_error,status,error,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (source_product_id(row), str(row.get("clxh") or ""), batch,
+         json.dumps(row, ensure_ascii=False, sort_keys=True), path, int(is_pdf), byte_count, digest,
+         json.dumps(fields, ensure_ascii=False, sort_keys=True) if is_pdf else None,
+         parse_error or None, status, error or None, utc_now()),
+    )
+
+
+def preserve_current_observation(conn: sqlite3.Connection, product_id: str) -> None:
+    """更新旧产品之前留存原业务记录；已有相同快照时不重复伪造历史。"""
+    conn.execute(
+        "INSERT INTO announcement_observations(source_product_id,model_code,batch,raw_json,relative_path,"
+        "is_pdf,bytes,sha256,fields_json,parse_error,status,error,observed_at) "
+        "SELECT a.source_product_id,a.model_code,COALESCE(b.batch,''),a.raw_json,d.relative_path,"
+        "COALESCE(d.is_pdf,0),COALESCE(d.bytes,0),d.sha256,f.fields_json,f.parse_error,"
+        "'prior_current_snapshot',d.error,COALESCE(d.downloaded_at,a.first_seen_at) "
+        "FROM announcements a LEFT JOIN batches b ON b.id=a.batch_id "
+        "LEFT JOIN documents d ON d.announcement_id=a.id "
+        "LEFT JOIN announcement_fields f ON f.announcement_id=a.id "
+        "WHERE a.source_product_id=? AND NOT EXISTS (SELECT 1 FROM announcement_observations o "
+        "WHERE o.source_product_id=a.source_product_id AND o.batch=COALESCE(b.batch,'') "
+        "AND o.raw_json=a.raw_json AND COALESCE(o.relative_path,'')=COALESCE(d.relative_path,'') "
+        "AND COALESCE(o.sha256,'')=COALESCE(d.sha256,'') "
+        "AND COALESCE(o.fields_json,'')=COALESCE(f.fields_json,''))", (product_id,),
+    )
+
+
 def store_announcement(
     conn: sqlite3.Connection,
     *,
@@ -714,8 +863,11 @@ def store_announcement(
                 # 发布失败不能把暂存路径作为正式文档写入；保留原文件供恢复并记录位置。
                 keep_staging = True
                 retained = relative_pdf_path(path, pdf_root)
-                return StoreOutcome(False, f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}",
-                                    status="publish_failed")
+                message = f"发布失败：{type(exc).__name__}: {exc}；原文件保留于 {retained}"
+                record_announcement_observation(conn, row=row, batch=batch, path=retained, is_pdf=is_pdf,
+                                                byte_count=byte_count, digest=digest, fields=fields,
+                                                parse_error=parse_error, status="publish_failed", error=message)
+                return StoreOutcome(False, message, status="publish_failed")
 
             # 失败重采不改写旧版本：图片与历史索引照常发布，已有的当前图片索引保持不变。
             replace_current = not (previous and error)
@@ -730,11 +882,16 @@ def store_announcement(
 
         if previous and error:
             # 失败重采不改写任何旧版本，包括 HTML 和仅回填了目录字段的记录。
+            record_announcement_observation(conn, row=row, batch=batch, path=relative_path if byte_count else None,
+                                            is_pdf=is_pdf,
+                                            byte_count=byte_count, digest=digest, fields=fields,
+                                            parse_error=parse_error, status=status, error=error)
             return StoreOutcome(False, "; ".join(value for value in (error, image_error) if value),
                                 bool(image_error), status=status)
 
         conn.execute("SAVEPOINT store_announcement")
         try:
+            preserve_current_observation(conn, product_id)
             brand_id = get_or_create_id(conn, "brands", trademark)
             batch_id = get_or_create_id(conn, "batches", batch, "batch")
             conn.execute(
@@ -765,6 +922,9 @@ def store_announcement(
                     "parse_error=excluded.parse_error",
                     (announcement_id, json.dumps(fields, ensure_ascii=False, sort_keys=True), parse_error),
                 )
+            record_announcement_observation(conn, row=row, batch=batch, path=relative_path, is_pdf=is_pdf,
+                                            byte_count=byte_count, digest=digest, fields=fields,
+                                            parse_error=parse_error, status=status, error=error)
         except BaseException as exc:
             # RAISE(ROLLBACK) 等错误可能已经撤销整个事务；清理不能掩盖原始异常。
             if conn.in_transaction:
@@ -842,6 +1002,14 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
         help="按型号清单采集（一行一个车辆型号，# 开头为注释）；"
              "可直接用 build_site_db.py 产出的 dist/catalog_gap_*.txt",
     )
+    parser.add_argument("--validate-frozen-models", type=Path,
+                        help="只校验冻结型号清单及分片，不查询、不下载、不写业务库")
+    parser.add_argument("--query-frozen-models", type=Path,
+                        help="按冻结清单查询一片正式公告，记录证据；不下载参数页")
+    parser.add_argument("--workers", type=core.positive_int, default=1,
+                        help="冻结型号查询的工作线程数，1–8，默认1；所有线程共享HTTP节流，SQLite单写")
+    parser.add_argument("--frozen-run-dir", type=Path, help="冻结型号查询证据目录，须为 var/runs 下的新目录")
+    parser.add_argument("--frozen-sha256", help="冻结型号清单原始字节的 SHA256")
     parser.add_argument("--all-categories", action="store_true", help="覆盖乘用车、专用车、客车和货车")
     parser.add_argument(
         "--republished-from-status",
@@ -886,13 +1054,48 @@ def catalog_main(argv: list[str] | None = None, *, source: AnnouncementSource = 
     parser.add_argument("--no-report", action="store_true", help="跳过本轮的 Markdown 采集报告")
     parser.add_argument("--download-root", type=Path, default=DEFAULT_DOWNLOAD_ROOT)
     args = parser.parse_args(argv)
+    if args.workers > 8:
+        parser.error("--workers 必须为 1–8")
+    if args.workers != 1 and not args.query_frozen_models:
+        parser.error("--workers 大于1只适用于 --query-frozen-models")
     if (args.limit is not None and args.limit < 1) or args.offset < 0:
         parser.error("--limit 必须大于 0，--offset 不得小于 0")
+    if args.validate_frozen_models:
+        if not args.frozen_sha256:
+            parser.error("--validate-frozen-models 需要 --frozen-sha256")
+        if args.query_frozen_models or args.from_file or args.republished_from_status or args.republished_batch:
+            parser.error("冻结清单校验不能与采集选择模式同时使用")
+        try:
+            result = validate_frozen_models(args.validate_frozen_models, args.frozen_sha256,
+                                            offset=args.offset, limit=args.limit)
+        except (OSError, UnicodeError, ValueError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.query_frozen_models:
+        if not args.frozen_sha256 or not args.frozen_run_dir or args.limit is None:
+            parser.error("冻结型号查询必须指定 --frozen-sha256、--frozen-run-dir 和 --limit")
+        if (args.from_file or args.republished_from_status or args.republished_batch or args.catalog_batch
+                or args.through_earlier_batches or args.exclude_existing or args.dry_run or args.verify):
+            parser.error("冻结型号查询不能与其他选择模式同时使用")
+        try:
+            args.frozen_selection = validate_frozen_models(args.query_frozen_models, args.frozen_sha256,
+                                                            offset=args.offset, limit=args.limit)
+        except (OSError, UnicodeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.frozen_run_dir = args.frozen_run_dir.expanduser().resolve()
+        runs_root = (UPSTREAM_ROOT / "var" / "runs").resolve()
+        if not args.frozen_run_dir.is_relative_to(runs_root) or args.frozen_run_dir == runs_root:
+            parser.error("--frozen-run-dir 必须为上游 var/runs 下的新目录")
+        if args.frozen_run_dir.exists():
+            parser.error("冻结型号轮次目录已存在，不能覆盖历史证据")
+    elif args.frozen_sha256 or args.frozen_run_dir:
+        parser.error("--frozen-sha256 或 --frozen-run-dir 需要冻结型号模式")
     try:
         requested_interval(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if not args.catalog_db.exists():
+    if not args.catalog_db.exists() and not args.query_frozen_models:
         parser.error(f"目录数据库不存在：{args.catalog_db}")
     args.catalog_db = args.catalog_db.expanduser().resolve()
     args.site_db = args.site_db.expanduser().resolve()
@@ -960,6 +1163,11 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
         if not selected:
             parser.error("正式发布重发清单为空：本地没有被更高批次重新发布的产品")
         batch = republished_source.label
+    elif args.query_frozen_models:
+        batch = "冻结型号清单"
+        selected = [{"model_code": model, "catalog": batch, "batch": "", "category": "",
+                     "seq": "", "company": "", "trademark": "", "common_name": ""}
+                    for model in args.frozen_selection["models"]]
     elif args.from_file:
         batch, selected = select_models_from_file(args.catalog_db, args.from_file, args.limit)
     else:
@@ -974,7 +1182,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
             exclude_existing=args.exclude_existing,
         )
     args.site_db.parent.mkdir(parents=True, exist_ok=True)
-    args.download_root.mkdir(parents=True, exist_ok=True)
+    if not args.query_frozen_models:
+        args.download_root.mkdir(parents=True, exist_ok=True)
     if republished_source is not None:
         verification = None
         if args.verify:
@@ -1007,6 +1216,17 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                   + "、".join(f"第{batch_no}批 {count} 个" for batch_no, count in sorted(by_batch.items()))
                   + f"\n清单快照：{selection_path}\n预演模式：{checked}未下载 PDF，未写业务库。", flush=True)
             return 0
+    elif args.query_frozen_models:
+        raw = args.query_frozen_models.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != args.frozen_selection["sha256"]:
+            raise RuntimeError("冻结清单在校验后发生变化")
+        args.frozen_run_dir.mkdir(parents=True, exist_ok=False)
+        selection_path = args.frozen_run_dir / "models.txt"
+        selection_path.write_bytes(raw)
+        (args.frozen_run_dir / "selection.json").write_text(
+            json.dumps(args.frozen_selection, ensure_ascii=False, indent=2), encoding="utf-8")
+        if source is OFFICIAL:
+            source = EvidenceOfficialSource(args.frozen_run_dir / "query_evidence.jsonl")
     else:
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"batch{batch}".replace("及更早", "_and_earlier"))
         selection_path = args.download_root / f"seed_{scope}_{len(selected)}_offset{args.offset}.json"
@@ -1039,6 +1259,15 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
         "offset": args.offset,
         "request_interval": list(requested_interval(args) or core.REQUEST_MIN_INTERVAL),
     }
+    if args.query_frozen_models:
+        selector.update({"mode": "frozen_query_only", "catalog": "冻结型号清单", "category": "",
+                         "limit": args.limit,
+                         "workers": args.workers,
+                         "frozen_sha256": args.frozen_selection["sha256"],
+                         "frozen_total_models": args.frozen_selection["total_models"],
+                         "selection_snapshot": str(selection_path.relative_to(UPSTREAM_ROOT)),
+                         "query_evidence": str((args.frozen_run_dir / "query_evidence.jsonl")
+                                               .relative_to(UPSTREAM_ROOT))})
     if republished_source is not None:
         selector["republished"] = {
             "origin": republished_source.origin,
@@ -1051,7 +1280,7 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
             "selected_product_ids": [row["product_id"] for row in republished_source.rows],
         }
     # 回填可重复执行，放在认领轮次之前：回填失败或被中断时不留下未完成轮次挡住后续采集。
-    backfilled = backfill_catalog_fields(conn, args.catalog_db)
+    backfilled = 0 if args.query_frozen_models else backfill_catalog_fields(conn, args.catalog_db)
     conn.commit()
     if backfilled:
         print(f"已补齐 {backfilled} 份既有公告的目录参数。", flush=True)
@@ -1060,15 +1289,27 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
     run_id = run.claim(selector, len(selected))
 
     announcement_count = pdf_count = 0
+    consecutive_frozen_failures = 0
+    attempted_models = 0
     pace_warning = ""
     try:
         # 提速与 --no-images 只覆盖本进程；查询、下载、图片或非 PDF 异常会自动恢复默认间隔。
         with request_pace(args) as pace, core.image_downloads(not getattr(args, "no_images", False)):
             run.pace = pace
-            for index, item in enumerate(selected, start=1):
-                vehicle_id = upsert_vehicle(conn, item)
-                run.begin_model(index, vehicle_id)
-                print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
+            if args.query_frozen_models and args.workers > 1:
+                attempted_models, announcement_count = _collect_frozen_query_workers(
+                    conn, run, selected, source, args.workers, pace)
+                iteration = ()
+            else:
+                iteration = enumerate(selected, start=1)
+            for index, item in iteration:
+                if args.query_frozen_models:
+                    vehicle_id = _begin_frozen_model(conn, run, index, item, len(selected))
+                else:
+                    vehicle_id = upsert_vehicle(conn, item)
+                    run.begin_model(index, vehicle_id)
+                    print(f"[{index}/{len(selected)}] {item['common_name']} / {item['model_code']}", flush=True)
+                attempted_models += 1
                 try:
                     if republish_mode:
                         rows = query_republished_candidate_batches(
@@ -1076,12 +1317,21 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                         )
                     else:
                         rows = source.query(item["model_code"])
-                    rows = [row for row in rows if str(row.get("clxh") or "").upper() == item["model_code"].upper()]
+                    rows = [row for row in rows if (str(row.get("clxh") or "") == item["model_code"]
+                            if args.query_frozen_models else
+                            str(row.get("clxh") or "").upper() == item["model_code"].upper())]
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
                     run.query_failed(vehicle_id, message)
                     print(f"  查询失败：{message}", file=sys.stderr, flush=True)
+                    if args.query_frozen_models:
+                        consecutive_frozen_failures += 1
+                        if consecutive_frozen_failures >= 3:
+                            print("连续 3 个型号查询失败，停止本片；余下型号仍为待查询。", file=sys.stderr,
+                                  flush=True)
+                            break
                     continue
+                consecutive_frozen_failures = 0
                 if not rows:
                     if republish_mode:
                         run.count("awaiting_effective")
@@ -1093,6 +1343,12 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
                         continue
                     run.finish_model(vehicle_id, "no_match")
                     print("  公告接口未找到精确型号。", flush=True)
+                    continue
+
+                if args.query_frozen_models:
+                    announcement_count += len(rows)
+                    run.finish_model(vehicle_id, "partial", f"查询精确命中 {len(rows)} 条，参数页待下载和解析")
+                    print(f"  精确命中 {len(rows)} 条；参数页待下载和解析。", flush=True)
                     continue
 
                 unresolved: list[str] = []
@@ -1145,7 +1401,8 @@ def _collect_catalog(args: argparse.Namespace, parser: argparse.ArgumentParser,
 
     counts = run.counts
     print(
-        f"完成：选中 {len(selected)} 个目录车型，公告 {announcement_count} 条，PDF {pdf_count} 份，"
+        f"完成：选中 {len(selected)} 个{'冻结型号' if args.query_frozen_models else '目录车型'}，"
+        f"已尝试 {attempted_models} 个，公告 {announcement_count} 条，PDF {pdf_count} 份，"
         f"接口与记录不一致 {counts['awaiting_effective']}，查询失败 {counts['query_failures']}，"
         f"下载失败 {counts['download_failures']}，解析失败 {counts['parse_failures']}，"
         f"发布失败 {counts['publish_failures']}，"

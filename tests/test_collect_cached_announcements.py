@@ -49,6 +49,27 @@ def test_legacy_manifest_keeps_its_scope_when_resuming(tmp_path, monkeypatch):
         assert selector['scope'] == cached.LEGACY_SCOPE
 
 
+def test_explicit_nev_chassis_scope_collects_without_changing_vehicle_gate(tmp_path):
+    row = product("c1", clmc="换电式纯电动自卸汽车底盘", dataTag="D")
+    args, _ = setup(tmp_path, [row], scope=cached.NEV_CHASSIS_SCOPE)
+    manifest = cached.load_manifest(args.manifest, args.manifest_sha256)
+    calls = []
+    assert cached.collect(args, manifest, source=fake_download(calls)) == 0
+    assert calls == ["c1"]
+    assert cached.classify_vehicle(row["clxh"], row["clmc"], row)["inclusion_gate"] == "excluded"
+
+
+@pytest.mark.parametrize("row", [
+    {"clmc": "换电式纯电动自卸汽车底盘", "dataTag": "Z"},
+    {"clmc": "纯电动客车", "dataTag": "D"},
+    {"clmc": "燃油载货汽车底盘", "dataTag": "D"},
+])
+def test_explicit_chassis_scope_rejects_other_products(tmp_path, row):
+    args, _ = setup(tmp_path, [product(**row)], scope=cached.NEV_CHASSIS_SCOPE)
+    with pytest.raises(ValueError):
+        cached.load_manifest(args.manifest, args.manifest_sha256)
+
+
 @pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
     def fail(*_args, **_kwargs):
@@ -96,6 +117,50 @@ def seed_existing(args, row, *, source: ScriptedSource, parse_error: str = "") -
         conn.commit()
         path = args.pdf_root / conn.execute("SELECT relative_path FROM documents").fetchone()[0]
     return path, path.read_bytes()
+
+
+def test_same_product_id_in_different_batch_does_not_skip_and_history_is_reusable(tmp_path):
+    old = product("p1", gppc="408", pc="408")
+    new = product("p1", gppc="409", pc="409")
+    args, payload = setup(tmp_path, [new])
+    calls = []
+    source = fake_download(calls)
+    old_path, old_bytes = seed_existing(args, old, source=source)
+    assert cached.collect(args, payload, source=source) == 0
+    assert calls == ["p1", "p1"]
+    with closing(sqlite3.connect(args.site_db)) as conn:
+        observations = conn.execute("SELECT batch,relative_path,status FROM announcement_observations "
+                                    "ORDER BY id").fetchall()
+        assert [(r[0], r[2]) for r in observations] == [("408", "downloaded"), ("409", "downloaded")]
+        with seed.core.image_downloads(False):
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="408", model=old["clxh"])[0] == \
+                "skipped_existing"
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="407", model=old["clxh"]) is None
+            assert cached.local_document(conn, "p1", args.pdf_root, batch="408", model="WRONG") is None
+    assert old_path.read_bytes() == old_bytes
+
+
+@pytest.mark.parametrize('correct', [True, False])
+def test_detail_identity_is_recorded_and_failure_keeps_model_partial(tmp_path, correct):
+    args, payload = setup(tmp_path)
+    args.detail_html = True
+    source = fake_download([])
+
+    def detail(row, folder):
+        folder.mkdir(parents=True)
+        path = folder / 'detail.html'
+        product_id = row['cpid'] if correct else 'wrong'
+        path.write_text(f'<table><tr><td>产品ID</td><td>{product_id}</td><td>批次</td><td>409</td></tr>'
+                        f'<tr><td>车辆型号</td><td>{row["clxh"]}</td></tr></table>', encoding='utf-8')
+        return path
+
+    source.detail = detail
+    assert cached.collect(args, payload, source=source) == (0 if correct else 2)
+    result = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert result['detail_status'] == ('verified' if correct else 'failed')
+    assert bool(result['detail_path']) == correct
+    with sqlite3.connect(args.site_db) as conn:
+        assert conn.execute('SELECT status FROM run_models').fetchone()[0] == ('done' if correct else 'partial')
 
 
 def test_image_failure_is_partial_and_resume_cannot_hide_it(tmp_path, monkeypatch):
@@ -606,3 +671,259 @@ def test_only_verified_source_generation_html_keeps_fast_pace(tmp_path, monkeypa
     assert result["source_generation_error"] is known
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("SELECT non_pdf_documents FROM ingestion_runs").fetchone()[0] == 1
+
+
+def _detail_only_source(args, calls, *, invalid=False):
+    source = ScriptedSource()
+
+    def detail(row, folder):
+        calls.append(row['cpid'])
+        folder.mkdir(parents=True)
+        content = (f'<table><tr><td>产品ID</td><td>{"wrong" if invalid else row["cpid"]}</td>'
+                   f'<td>批次</td><td>{row["pc"]}</td></tr><tr><td>车辆型号</td>'
+                   f'<td>{row["clxh"]}</td></tr></table>').encode()
+        saved = folder / 'detail.html'
+        saved.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        blob = args.run_dir / 'http_blobs' / digest
+        blob.parent.mkdir(exist_ok=True)
+        blob.write_bytes(content)
+        operation = 'operation-' + row['cpid']
+        events = [{'type': 'detail_started', 'operation_id': operation, 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': operation, 'response_status': 200,
+                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest},
+                  {'type': 'detail_finished', 'operation_id': operation, 'bytes': len(content)}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        return saved
+
+    source.detail = detail
+    return source
+
+
+def test_detail_only_no_pdf_and_resume_uses_verified_cache(tmp_path, monkeypatch):
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = _detail_only_source(args, calls)
+    monkeypatch.setattr(seed, 'store_announcement', lambda **_: pytest.fail('不应下载 PDF'))
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == ['p1']
+    with sqlite3.connect(args.site_db) as conn:
+        assert conn.execute('SELECT count(*) FROM documents').fetchone()[0] == 0
+        assert conn.execute('SELECT status FROM run_models').fetchone()[0] == 'partial'
+    args.resume_run = 1
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == ['p1']
+    records = [json.loads(line) for line in (args.run_dir / 'results.jsonl').read_text().splitlines()]
+    assert [r['status'] for r in records] == ['detail_verified_pdf_pending'] * 2
+    assert [r['attempted_detail'] for r in records] == [True, False]
+
+
+def test_detail_only_uses_real_evidence_source_with_mock_http(tmp_path, monkeypatch):
+    from miit_gonggao import core
+    from miit_gonggao.announcement_source import EvidenceOfficialSource
+
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    row = manifest['products'][0]
+    content = (f'<table><tr><td>产品ID</td><td>{row["cpid"]}</td>'
+               f'<td>批次</td><td>{row["pc"]}</td></tr><tr><td>车辆型号</td>'
+               f'<td>{row["clxh"]}</td></tr></table>').encode()
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self):
+            return content
+
+    monkeypatch.setattr(core, '_throttle', lambda: None)
+    monkeypatch.setattr(core.request, 'urlopen', lambda req, **_kw: calls.append(req.full_url) or Response())
+    monkeypatch.setattr(core, 'post_form', lambda url, data: core.http_request(url, data=data))
+    monkeypatch.setattr(seed, 'store_announcement', lambda **_: pytest.fail('不应下载 PDF'))
+    source = EvidenceOfficialSource(args.run_dir / 'http_evidence.jsonl')
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == [core.DETAIL_URL]
+    events = [json.loads(line) for line in (args.run_dir / 'http_evidence.jsonl').read_text().splitlines()]
+    assert [e['type'] for e in events] == ['detail_started', 'detail_http_attempt', 'detail_finished']
+    args.resume_run = 1
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == [core.DETAIL_URL]
+
+
+def test_detail_only_three_identity_failures_stop(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(4)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    assert cached.collect(args, manifest, source=_detail_only_source(args, calls, invalid=True)) == 130
+    assert calls == ['p0', 'p1', 'p2']
+    assert '连续 3 次详情失败' in progress(args)['stop_reason']
+
+
+def test_detail_only_three_nonconsecutive_request_failures_stop(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(6)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = _detail_only_source(args, calls)
+    normal_detail = source.detail
+
+    def detail(row, folder):
+        if row['cpid'] not in {'p0', 'p2', 'p4'}:
+            return normal_detail(row, folder)
+        calls.append(row['cpid'])
+        operation = 'failure-' + row['cpid']
+        events = [{'type': 'detail_started', 'operation_id': operation, 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': operation, 'response_status': 503,
+                   'error': 'HTTP 503'},
+                  {'type': 'detail_failed', 'operation_id': operation, 'error': 'HTTP 503'}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        raise OSError('HTTP 503')
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0', 'p1', 'p2', 'p3', 'p4']
+    assert '3 个不同产品请求失败' in progress(args)['stop_reason']
+
+
+def test_detail_only_pdf_backfill_reuses_detail_evidence(tmp_path):
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    detail_calls = []
+    source = _detail_only_source(args, detail_calls)
+    assert cached.collect(args, manifest, source=source) == 0
+    pdf_calls = []
+    pdf_source = fake_download(pdf_calls)
+    pdf_source.detail = lambda *_: pytest.fail('不得重复请求详情')
+    args.detail_only = False
+    args.detail_html = True
+    args.run_dir = tmp_path / 'pdf-run'
+    assert cached.collect(args, manifest, source=pdf_source) == 0
+    assert pdf_calls == ['p1'] and detail_calls == ['p1']
+    record = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert record['status'] == 'downloaded' and record['detail_status'] == 'verified'
+    assert (args.pdf_root / record['detail_root_relative']).is_file()
+    args.detail_only = True
+    args.detail_html = False
+    args.run_dir = tmp_path / 'detail-again'
+    assert cached.collect(args, manifest, source=source) == 0
+    assert detail_calls == ['p1'] and pdf_calls == ['p1']
+    record = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert record['status'] == 'pdf_and_detail_verified'
+
+
+def test_detail_cache_survives_backup_restore_and_rejects_tampering(tmp_path):
+    import shutil
+
+    args, manifest = setup(tmp_path)
+    original = tmp_path / 'original'
+    original.mkdir()
+    args.pdf_root = original
+    args.site_db = original / 'site.sqlite'
+    args.run_dir = original / 'runs' / 'first'
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    assert cached.collect(args, manifest, source=_detail_only_source(args, calls)) == 0
+    restored = tmp_path / 'restored'
+    shutil.copytree(original, restored, ignore=shutil.ignore_patterns('site.sqlite*'))
+    with sqlite3.connect(args.site_db) as source_db, sqlite3.connect(restored / 'site.sqlite') as target_db:
+        source_db.backup(target_db)
+        assert target_db.execute('pragma integrity_check').fetchone() == ('ok',)
+    args.pdf_root = restored
+    args.site_db = restored / 'site.sqlite'
+    args.run_dir = restored / 'runs' / 'after-restore'
+    no_network = ScriptedSource()
+    no_network.detail = lambda *_: pytest.fail('恢复后不得重复请求已验证详情')
+    assert cached.collect(args, manifest, source=no_network) == 0
+    result = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert result['status'] == 'detail_verified_pdf_pending' and not result['attempted_detail']
+    from miit_gonggao.detail_cache import find_detail
+
+    with sqlite3.connect(args.site_db) as conn:
+        assert find_detail(conn, manifest['products'][0], root=restored)
+        conn.execute("update verified_detail_cache set html_path='../outside.html'")
+        assert find_detail(conn, manifest['products'][0], root=restored) is None
+
+
+def test_detail_only_http_403_stops_immediately(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(4)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = ScriptedSource()
+
+    def detail(row, _folder):
+        calls.append(row['cpid'])
+        events = [{'type': 'detail_started', 'operation_id': 'op', 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': 'op', 'response_status': 403}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        raise RuntimeError('HTTP 403')
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0']
+    assert 'HTTP 403' in progress(args)['stop_reason']
+
+
+def test_detail_only_validation_page_stops_immediately(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(2)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    source = ScriptedSource()
+    calls = []
+
+    def detail(row, folder):
+        calls.append(row['cpid'])
+        folder.mkdir(parents=True)
+        content = '<title>captcha</title>'.encode()
+        saved = folder / 'detail.html'
+        saved.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        blob = args.run_dir / 'http_blobs' / digest
+        blob.parent.mkdir(exist_ok=True)
+        blob.write_bytes(content)
+        events = [{'type': 'detail_started', 'operation_id': 'op', 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': 'op', 'response_status': 200,
+                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        return saved
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0']
+    assert '访问验证页' in progress(args)['stop_reason']

@@ -107,6 +107,14 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 - 网站批量采集统一使用 `main.py gonggao collect`；近期事件沿用
   `python -m miit_gonggao.collection_tracking`。不得因日期、批次、车型范围、补采或提速
   新建独立批量下载入口，也不得复制已有下载循环。
+- `collect --validate-frozen-models <文件> --frozen-sha256 <哈希>` 只读核验冻结型号清单和
+  `--offset`/`--limit` 分片；不依赖目录库，不发请求，也不代表这些型号已被采集。
+- `collect --query-frozen-models <文件> --frozen-sha256 <哈希> --frozen-run-dir var/runs/<新目录>`
+  须显式指定 `--limit`，只查该冻结分片并保存证据；精确命中仍需后续下载和解析。
+  用户明确授权并行时可加 `--workers 4`（1–8，默认1）：冻结查询使用有界线程池，所有线程共享
+  HTTP节流，每次查询证据独立，SQLite仍由调度线程单写。连续3个型号查询失败后停止派发，
+  收齐已认领的在途查询后结束本片；至多额外处理workers-1个已派发型号，不把余下型号算作已尝试。
+  该参数目前仅用于冻结型号查询，不改变参数页下载或其他采集模式。
 - 公示（变更扩展公示、新产品公示）只用于提前了解，不作为任何采集入口：不登记事件、不下载、
   不进业务库。已有参数页被官方变更后要刷新时，用 `collect --republished-from-status`
   （读已落盘统计记录）或 `--republished-batch <批次>`（按批次枚举缓存现算），
@@ -135,6 +143,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   不得删改清单校验、并发锁或失败保护来完成运行；跨轮按最好结局避免重复下载。
 - 固定清单 `nev_complete_manifest_v1` 及旧 scope 均仅接受新能源；
   `automotive_complete_manifest_v1` 在第 408 批及以后允许非新能源/未知整车，更早批次仍须新能源。
+  用户明确要求同型号新能源底盘时可使用独立 `nev_chassis_manifest_v1`，仅接受官方
+  `dataTag=D` 且名称以“汽车底盘”结尾的新能源产品，不改变网站整车范围判定。
   能源分组和非新能源授权批次只在 `vehicle_classification.py`（`energy_scope`）定义，
   固定清单、近期事件、收录统计与 Website 构库都读它，调整授权时不在别处另写批次集合。
   需要新能源证据但产品名未明确时，仅允许通过 `--catalog-db` 的精确同型号具体能源补证。
@@ -246,6 +256,12 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   默认间隔并在结尾说明，本轮实际节奏记入 `ingestion_runs.selector_json`。默认不提速，必须显式传参
 - 例外：`scripts/announcement_catalog_gap.py` 的全量批次枚举是一次性只读大作业（约 2.9 万次请求），经项目所有者授权可用 `--fast`（0.2~0.4 秒）或 `--min-interval/--max-interval` 提速。它只覆盖该进程内的 `core.REQUEST_MIN_INTERVAL`，不改 `core.py` 默认值，PDF 下载等其他功能不受影响；仍然串行（同等平均 QPS 下比并发对服务端更平滑），且连续 3 次请求异常会自动降回保守节流。默认不提速，必须显式传参
 - 工信部/EIDC 全部 HTTP 走 `core.http_request`（统一节流 0.8~1.8s + 5xx/网络错误/响应截断（chunked `IncompleteRead`）退避重试，4xx 直接抛出），新增请求不要绕开它
+- 需要逐次查询证据的采集策略可使用 `EvidenceOfficialSource`；它只追加请求/响应正文及尝试状态，
+  不保存会话头，日志写入失败则中断该查询；不得把它当成独立采集入口。
+- 固定清单可用 `--http-evidence` 保存参数页请求证据与响应原文；同产品不同批次的实际结果在业务库
+  `announcement_observations` 中追加留存，缓存复用须核验产品 ID、型号、批次及文件内容。
+- 当 PDF 版面截断或需补正文时，固定清单可加 `--http-evidence --detail-html`，保存并核验同产品正式
+  详情 HTML；不下载图片，详情失败单独标记，不能视作完整。
 - `query --download` 单条 PDF 重试后仍失败只跳过并在结尾汇总，不中断整批。退出码区分三档：**0** 全部成功 / **1** 全失败（一份 PDF 都没拿到，含查询结果为空）/ **2** 部分成功（已拿到 PDF，另有 PDF 或图片异常）。`jianmian search --download` 同一套语义（`core.download_exit_code`）；`main.py fetch` 把 2 当成功，只在结尾单独列出「部分成功」车型，不计入失败
 - 优先 `requests + BeautifulSoup` / 标准库；只有确认必要才用 Playwright
 - 工信部 PDF 接口的 `NECaptchaValidate` 沿用现有随机 token 方式，不要改动
