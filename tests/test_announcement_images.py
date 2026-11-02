@@ -38,6 +38,24 @@ def test_sparse_duplicate_links_and_identity():
         images.parse_image_links(detail("a"), {**ROW, "clxh": "other"})
 
 
+def test_chassis_detail_requires_matching_chassis_identity():
+    row = {**ROW, "dataTag": "D"}
+    page = detail("a").replace("产品ID".encode(), "底盘ID".encode()).replace(
+        "车辆型号".encode(), "底盘型号".encode())
+    images.validate_detail_identity(page, row)
+    for changed in ({"cpid": "other"}, {"gppc": "407"}, {"clxh": "other"}, {"clxh": ""}):
+        with pytest.raises(ValueError):
+            images.validate_detail_identity(page, {**row, **changed})
+    with pytest.raises(ValueError):
+        images.validate_detail_identity(page, ROW)
+    with pytest.raises(ValueError):
+        images.validate_detail_identity(detail("a"), row)
+    with pytest.raises(ValueError):
+        images.validate_detail_identity(b"<title>captcha</title>", row)
+    with pytest.raises(ValueError):
+        images.validate_detail_identity(page + "访问行为验证".encode(), row)
+
+
 @pytest.mark.parametrize("source", [
     "getPic?gid=OTHER&pc=408&zpname=a",
     "getPic?gid=AB123&pc=407&zpname=a",

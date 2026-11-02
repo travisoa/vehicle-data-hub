@@ -49,6 +49,27 @@ def test_legacy_manifest_keeps_its_scope_when_resuming(tmp_path, monkeypatch):
         assert selector['scope'] == cached.LEGACY_SCOPE
 
 
+def test_explicit_nev_chassis_scope_collects_without_changing_vehicle_gate(tmp_path):
+    row = product("c1", clmc="换电式纯电动自卸汽车底盘", dataTag="D")
+    args, _ = setup(tmp_path, [row], scope=cached.NEV_CHASSIS_SCOPE)
+    manifest = cached.load_manifest(args.manifest, args.manifest_sha256)
+    calls = []
+    assert cached.collect(args, manifest, source=fake_download(calls)) == 0
+    assert calls == ["c1"]
+    assert cached.classify_vehicle(row["clxh"], row["clmc"], row)["inclusion_gate"] == "excluded"
+
+
+@pytest.mark.parametrize("row", [
+    {"clmc": "换电式纯电动自卸汽车底盘", "dataTag": "Z"},
+    {"clmc": "纯电动客车", "dataTag": "D"},
+    {"clmc": "燃油载货汽车底盘", "dataTag": "D"},
+])
+def test_explicit_chassis_scope_rejects_other_products(tmp_path, row):
+    args, _ = setup(tmp_path, [product(**row)], scope=cached.NEV_CHASSIS_SCOPE)
+    with pytest.raises(ValueError):
+        cached.load_manifest(args.manifest, args.manifest_sha256)
+
+
 @pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
     def fail(*_args, **_kwargs):

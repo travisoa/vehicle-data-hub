@@ -31,6 +31,8 @@ def image_folder(row: dict[str, Any], output_dir: Path) -> Path:
 
 def validate_detail_identity(content: bytes, row: dict[str, Any]) -> None:
     """只读核验正式详情页产品 ID、批次及型号，不请求或下载图片。"""
+    if "访问行为验证".encode() in content or b"<title>captcha" in content.lower():
+        raise ValueError("详情页产品 ID/批次不符或返回访问验证页，未取得图片清单")
     soup = BeautifulSoup(content, "html.parser")
     fields = {}
     for tr in soup.find_all("tr"):
@@ -39,9 +41,12 @@ def validate_detail_identity(content: bytes, row: dict[str, Any]) -> None:
             fields[left.get_text(strip=True)] = right.get_text(strip=True)
     gid = str(row.get("cpid") or row.get("gid") or "")
     batch = str(row.get("gppc") or row.get("pc") or "")
-    if not gid or not batch or fields.get("产品ID") != gid or fields.get("批次") != batch:
+    model = str(row.get("clxh") or "")
+    chassis = str(row.get("dataTag") or "").upper() == "D"
+    id_label, model_label = ("底盘ID", "底盘型号") if chassis else ("产品ID", "车辆型号")
+    if not gid or not batch or fields.get(id_label) != gid or fields.get("批次") != batch:
         raise ValueError("详情页产品 ID/批次不符或返回访问验证页，未取得图片清单")
-    if fields.get("车辆型号") != str(row.get("clxh") or ""):
+    if not model or fields.get(model_label) != model:
         raise ValueError("详情页车辆型号不符，未取得图片清单")
 
 

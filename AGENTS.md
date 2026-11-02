@@ -143,6 +143,8 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
   不得删改清单校验、并发锁或失败保护来完成运行；跨轮按最好结局避免重复下载。
 - 固定清单 `nev_complete_manifest_v1` 及旧 scope 均仅接受新能源；
   `automotive_complete_manifest_v1` 在第 408 批及以后允许非新能源/未知整车，更早批次仍须新能源。
+  用户明确要求同型号新能源底盘时可使用独立 `nev_chassis_manifest_v1`，仅接受官方
+  `dataTag=D` 且名称以“汽车底盘”结尾的新能源产品，不改变网站整车范围判定。
   能源分组和非新能源授权批次只在 `vehicle_classification.py`（`energy_scope`）定义，
   固定清单、近期事件、收录统计与 Website 构库都读它，调整授权时不在别处另写批次集合。
   需要新能源证据但产品名未明确时，仅允许通过 `--catalog-db` 的精确同型号具体能源补证。

@@ -41,6 +41,7 @@ else:
 SCOPE = "nev_complete_manifest_v1"
 LEGACY_SCOPE = "uncollected_nev_complete_20260912"
 AUTOMOTIVE_SCOPE = "automotive_complete_manifest_v1"
+NEV_CHASSIS_SCOPE = "nev_chassis_manifest_v1"
 SUCCESS = {"downloaded", "skipped_existing"}
 
 
@@ -81,7 +82,8 @@ def load_manifest(path: Path, expected_hash: str, catalog_db: Path | None = None
         raise ValueError("manifest SHA256 不符，拒绝下载")
     manifest = json.loads(content)
     scope = manifest.get("scope")
-    if manifest.get("schema_version") != 1 or scope not in {SCOPE, LEGACY_SCOPE, AUTOMOTIVE_SCOPE}:
+    if manifest.get("schema_version") != 1 or scope not in {SCOPE, LEGACY_SCOPE, AUTOMOTIVE_SCOPE,
+                                                            NEV_CHASSIS_SCOPE}:
         raise ValueError("manifest schema_version 或 scope 不符")
     products = manifest.get("products")
     if not isinstance(products, list) or not products:
@@ -100,7 +102,12 @@ def load_manifest(path: Path, expected_hash: str, catalog_db: Path | None = None
             raise ValueError(f"产品 ID/型号/数字批次不合法或 ID 重复：{product_id!r}")
         if product_id != row["cpid"] or model != row["clxh"]:
             raise ValueError(f"产品 ID 和型号必须为无首尾空白的字符串：{product_id!r}")
-        if classify_vehicle(model, name, row)["inclusion_gate"] != "accepted":
+        classification = classify_vehicle(model, name, row)
+        chassis = (str(row.get("dataTag", "")).upper() == "D"
+                   and name.endswith("汽车底盘")
+                   and classification["scope_reason"] == "incomplete_vehicle_or_component")
+        if ((scope == NEV_CHASSIS_SCOPE and not chassis)
+                or (scope != NEV_CHASSIS_SCOPE and classification["inclusion_gate"] != "accepted")):
             raise ValueError(f"清单含非汽车整车或范围待确认产品：{product_id}")
         energy = energy_scope(normalize_energy("", name, "", "")[0], batch)
         if energy != "nev" and not (scope == AUTOMOTIVE_SCOPE and energy == "non_nev_batch"):
