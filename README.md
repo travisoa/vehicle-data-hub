@@ -520,6 +520,11 @@ Website 收录范围由其 `docs/collection-boundary.md` 定义：新能源整�
 产品 ID、型号、批次、文件大小、魔数与哈希，不用另一公告批次的同 ID 文件冒充本批结果。
 固定清单可同时指定 `--http-evidence --detail-html` 保存正式详情页；先核对产品 ID、型号和批次，
 不下载图片。详情失败单独标记且型号保持部分完成；详情请求与响应同样记录在轮次目录中。
+固定清单加 `--detail-only --http-evidence --no-images` 只获取详情，不请求参数 PDF，也不建立 PDF 文档或解析记录。
+`results.jsonl` 将详情核验成功记为 `detail_verified_pdf_pending`，失败记为 `detail_failed`；前者仍需补采 PDF。
+成功详情的产品 ID、批次、型号、内容哈希、相对路径和请求证据追加到业务库的 `verified_detail_cache`。
+续跑或以后用 `--detail-html` 补 PDF 时，只有身份、哈希、请求、响应和完成证据均能重新校验才复用详情；
+详情失败会降速，连续三次失败停止本轮，访问验证页或 403/429 立即停止。
 `collection_manifest.py` 是固定清单策略模块，不再另建独立下载脚本。
 `scripts/announcement_catalog_gap.py` 只负责官方批次枚举和缓存，不下载 PDF。
 

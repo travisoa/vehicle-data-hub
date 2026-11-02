@@ -36,7 +36,12 @@ def _verify(row: dict[str, Any], html_path: Path, evidence_path: Path, operation
                (str(e.get('product_id')), str(e.get('batch')), e.get('model_code')) == (product_id, batch, model)]
     http = [e for e in events if e.get('type') == 'detail_http_attempt' and
             e.get('response_status') == 200 and e.get('response_sha256') == digest]
-    if not started or not http:
+    finished = [e for e in events if e.get('type') == 'detail_finished'
+                and e.get('bytes') == len(content)]
+    failed = [e for e in events if e.get('type') == 'detail_failed']
+    if (len(started) != 1 or not http or len(finished) != 1 or failed
+            or events[0] is not started[0] or events[-1] is not finished[0]
+            or any(e.get('response_bytes', len(content)) != len(content) for e in http)):
         raise ValueError('缺少匹配的详情请求响应证据')
     blob = (evidence_path.parent / http[-1]['response_blob']).resolve()
     if not blob.is_relative_to(evidence_path.parent.resolve()) or hashlib.sha256(blob.read_bytes()).hexdigest() != digest:

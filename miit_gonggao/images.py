@@ -29,9 +29,25 @@ def image_folder(row: dict[str, Any], output_dir: Path) -> Path:
     return output_dir / "images" / "_".join(core.safe_part(str(value)) for value in identity)
 
 
+def is_access_verification_page(content: bytes) -> bool:
+    """识别访问验证页；普通详情中的文本不作为验证码判断。"""
+    lowered = content.lower()
+    if '访问行为验证'.encode() in content or b'<title>captcha' in lowered:
+        return True
+    soup = BeautifulSoup(content, 'html.parser')
+    title = soup.title.get_text(' ', strip=True).lower() if soup.title else ''
+    if any(word in title for word in ('captcha', '验证码', '访问验证', '安全验证')):
+        return True
+    for element in soup.select('input, iframe'):
+        attributes = ' '.join(str(element.get(key) or '') for key in ('id', 'name', 'src', 'placeholder')).lower()
+        if any(word in attributes for word in ('captcha', '验证码', 'verifycode')):
+            return True
+    return False
+
+
 def validate_detail_identity(content: bytes, row: dict[str, Any]) -> None:
     """只读核验正式详情页产品 ID、批次及型号，不请求或下载图片。"""
-    if "访问行为验证".encode() in content or b"<title>captcha" in content.lower():
+    if is_access_verification_page(content):
         raise ValueError("详情页产品 ID/批次不符或返回访问验证页，未取得图片清单")
     soup = BeautifulSoup(content, "html.parser")
     fields = {}

@@ -692,7 +692,8 @@ def _detail_only_source(args, calls, *, invalid=False):
         events = [{'type': 'detail_started', 'operation_id': operation, 'product_id': row['cpid'],
                    'model_code': row['clxh'], 'batch': row['pc']},
                   {'type': 'detail_http_attempt', 'operation_id': operation, 'response_status': 200,
-                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest}]
+                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest},
+                  {'type': 'detail_finished', 'operation_id': operation, 'bytes': len(content)}]
         with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
             for event in events:
                 log.write(json.dumps(event) + '\n')
@@ -721,6 +722,47 @@ def test_detail_only_no_pdf_and_resume_uses_verified_cache(tmp_path, monkeypatch
     records = [json.loads(line) for line in (args.run_dir / 'results.jsonl').read_text().splitlines()]
     assert [r['status'] for r in records] == ['detail_verified_pdf_pending'] * 2
     assert [r['attempted_detail'] for r in records] == [True, False]
+
+
+def test_detail_only_uses_real_evidence_source_with_mock_http(tmp_path, monkeypatch):
+    from miit_gonggao import core
+    from miit_gonggao.announcement_source import EvidenceOfficialSource
+
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    row = manifest['products'][0]
+    content = (f'<table><tr><td>产品ID</td><td>{row["cpid"]}</td>'
+               f'<td>批次</td><td>{row["pc"]}</td></tr><tr><td>车辆型号</td>'
+               f'<td>{row["clxh"]}</td></tr></table>').encode()
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self):
+            return content
+
+    monkeypatch.setattr(core, '_throttle', lambda: None)
+    monkeypatch.setattr(core.request, 'urlopen', lambda req, **_kw: calls.append(req.full_url) or Response())
+    monkeypatch.setattr(core, 'post_form', lambda url, data: core.http_request(url, data=data))
+    monkeypatch.setattr(seed, 'store_announcement', lambda **_: pytest.fail('不应下载 PDF'))
+    source = EvidenceOfficialSource(args.run_dir / 'http_evidence.jsonl')
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == [core.DETAIL_URL]
+    events = [json.loads(line) for line in (args.run_dir / 'http_evidence.jsonl').read_text().splitlines()]
+    assert [e['type'] for e in events] == ['detail_started', 'detail_http_attempt', 'detail_finished']
+    args.resume_run = 1
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == [core.DETAIL_URL]
 
 
 def test_detail_only_three_identity_failures_stop(tmp_path):
@@ -754,6 +796,13 @@ def test_detail_only_pdf_backfill_reuses_detail_evidence(tmp_path):
     record = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
     assert record['status'] == 'downloaded' and record['detail_status'] == 'verified'
     assert (args.pdf_root / record['detail_root_relative']).is_file()
+    args.detail_only = True
+    args.detail_html = False
+    args.run_dir = tmp_path / 'detail-again'
+    assert cached.collect(args, manifest, source=source) == 0
+    assert detail_calls == ['p1'] and pdf_calls == ['p1']
+    record = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert record['status'] == 'pdf_and_detail_verified'
 
 
 def test_detail_only_http_403_stops_immediately(tmp_path):

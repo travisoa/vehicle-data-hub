@@ -283,11 +283,12 @@ def detail_access_limit(log: Path, row: dict[str, Any]) -> str:
             return f"HTTP {event['response_status']}"
         blob = event.get("response_blob")
         if blob:
+            from miit_gonggao.images import is_access_verification_page
+
             path = (log.parent / blob).resolve()
             if not path.is_relative_to(log.parent.resolve()):
                 raise ValueError("详情响应证据路径越界")
-            content = path.read_bytes().lower()
-            if "访问行为验证".encode() in content or b"<title>captcha" in content:
+            if is_access_verification_page(path.read_bytes()):
                 return "访问验证页"
     return ""
 
@@ -326,7 +327,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 return {"run_id": run_id, "pid": os.getpid(), "status": state, "updated_at": seed.utc_now(),
                         "manifest_sha256": args.manifest_sha256.lower(), "selected": manifest["expected_products"],
                         "selected_models": len(grouped), "processed": processed, "remaining": remaining,
-                        "successful": (counters["detail_verified_pdf_pending"] if getattr(args, "detail_only", False)
+                        "successful": (counters["detail_verified_pdf_pending"] + counters["pdf_and_detail_verified"]
+                                       if getattr(args, "detail_only", False)
                                        else counters["downloaded"] + counters["skipped_existing"]),
                         "results": dict(counters), "accepted_pdf_bytes": pdf_bytes,
                         "downloaded_bytes": downloaded_bytes,
@@ -376,7 +378,11 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                         saved = cached_detail
                                     detail_path = str(saved.resolve().relative_to(args.pdf_root.resolve()))
                                     consecutive_failures = 0
-                                    status = "detail_verified_pdf_pending"
+                                    existing_pdf = local_document(conn, row["cpid"], args.pdf_root,
+                                                                  batch=batch, model=model)
+                                    status = ("pdf_and_detail_verified" if existing_pdf
+                                              and existing_pdf[0] == "skipped_existing"
+                                              else "detail_verified_pdf_pending")
                                 except Exception as exc:
                                     conn.rollback()
                                     detail_status = "failed"
@@ -506,7 +512,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 print(stop.reason, file=sys.stderr, flush=True)
             finally:
                 run.finish(stop.reason)
-                all_successful = ((counters["detail_verified_pdf_pending"] if getattr(args, "detail_only", False)
+                all_successful = ((counters["detail_verified_pdf_pending"] + counters["pdf_and_detail_verified"]
+                                   if getattr(args, "detail_only", False)
                                    else sum(counters[key] for key in SUCCESS)) == manifest["expected_products"]
                                   and not counters["image_failed"] and not counters["detail_failed"])
                 state = "interrupted" if stop.reason else "complete" if all_successful else "partial"

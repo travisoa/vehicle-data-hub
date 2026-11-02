@@ -23,7 +23,8 @@ def sample(tmp_path):
     events = [{'type': 'detail_started', 'operation_id': 'op', 'product_id': 'A123',
                'batch': '400', 'model_code': 'ABC123'},
               {'type': 'detail_http_attempt', 'operation_id': 'op', 'response_status': 200,
-               'response_sha256': digest, 'response_blob': 'http_blobs/' + digest}]
+               'response_sha256': digest, 'response_blob': 'http_blobs/' + digest},
+              {'type': 'detail_finished', 'operation_id': 'op', 'bytes': len(content)}]
     log.write_text(''.join(json.dumps(e) + '\n' for e in events))
     return row, html, log, blob
 
@@ -48,3 +49,25 @@ def test_mismatched_or_verification_page_is_not_cached(tmp_path, sample):
         html.write_text('<title>captcha</title>')
         with pytest.raises(ValueError):
             remember_detail(conn, row, html, log, 'op', root=tmp_path)
+
+
+def test_unfinished_or_failed_operation_is_never_reused(tmp_path, sample):
+    row, html, log, _ = sample
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    with sqlite3.connect(tmp_path / 'test.sqlite') as conn:
+        log.write_text(''.join(json.dumps(e) + '\n' for e in events[:-1]))
+        with pytest.raises(ValueError):
+            remember_detail(conn, row, html, log, 'op', root=tmp_path)
+        events.append({'type': 'detail_failed', 'operation_id': 'op'})
+        log.write_text(''.join(json.dumps(e) + '\n' for e in events))
+        with pytest.raises(ValueError):
+            remember_detail(conn, row, html, log, 'op', root=tmp_path)
+
+
+@pytest.mark.parametrize('page', [b'<title>CAPTCHA required</title>',
+                                  '<title>请输入验证码</title>'.encode(),
+                                  b'<form><input name="verifyCode"></form>'])
+def test_access_verification_page_is_detected(page):
+    from miit_gonggao.images import is_access_verification_page
+
+    assert is_access_verification_page(page)
