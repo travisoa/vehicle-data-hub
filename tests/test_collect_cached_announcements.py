@@ -671,3 +671,145 @@ def test_only_verified_source_generation_html_keeps_fast_pace(tmp_path, monkeypa
     assert result["source_generation_error"] is known
     with closing(sqlite3.connect(args.site_db)) as conn:
         assert conn.execute("SELECT non_pdf_documents FROM ingestion_runs").fetchone()[0] == 1
+
+
+def _detail_only_source(args, calls, *, invalid=False):
+    source = ScriptedSource()
+
+    def detail(row, folder):
+        calls.append(row['cpid'])
+        folder.mkdir(parents=True)
+        content = (f'<table><tr><td>产品ID</td><td>{"wrong" if invalid else row["cpid"]}</td>'
+                   f'<td>批次</td><td>{row["pc"]}</td></tr><tr><td>车辆型号</td>'
+                   f'<td>{row["clxh"]}</td></tr></table>').encode()
+        saved = folder / 'detail.html'
+        saved.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        blob = args.run_dir / 'http_blobs' / digest
+        blob.parent.mkdir(exist_ok=True)
+        blob.write_bytes(content)
+        operation = 'operation-' + row['cpid']
+        events = [{'type': 'detail_started', 'operation_id': operation, 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': operation, 'response_status': 200,
+                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        return saved
+
+    source.detail = detail
+    return source
+
+
+def test_detail_only_no_pdf_and_resume_uses_verified_cache(tmp_path, monkeypatch):
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = _detail_only_source(args, calls)
+    monkeypatch.setattr(seed, 'store_announcement', lambda **_: pytest.fail('不应下载 PDF'))
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == ['p1']
+    with sqlite3.connect(args.site_db) as conn:
+        assert conn.execute('SELECT count(*) FROM documents').fetchone()[0] == 0
+        assert conn.execute('SELECT status FROM run_models').fetchone()[0] == 'partial'
+    args.resume_run = 1
+    assert cached.collect(args, manifest, source=source) == 0
+    assert calls == ['p1']
+    records = [json.loads(line) for line in (args.run_dir / 'results.jsonl').read_text().splitlines()]
+    assert [r['status'] for r in records] == ['detail_verified_pdf_pending'] * 2
+    assert [r['attempted_detail'] for r in records] == [True, False]
+
+
+def test_detail_only_three_identity_failures_stop(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(4)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    assert cached.collect(args, manifest, source=_detail_only_source(args, calls, invalid=True)) == 130
+    assert calls == ['p0', 'p1', 'p2']
+    assert '连续 3 次详情失败' in progress(args)['stop_reason']
+
+
+def test_detail_only_pdf_backfill_reuses_detail_evidence(tmp_path):
+    args, manifest = setup(tmp_path)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    detail_calls = []
+    source = _detail_only_source(args, detail_calls)
+    assert cached.collect(args, manifest, source=source) == 0
+    pdf_calls = []
+    pdf_source = fake_download(pdf_calls)
+    pdf_source.detail = lambda *_: pytest.fail('不得重复请求详情')
+    args.detail_only = False
+    args.detail_html = True
+    args.run_dir = tmp_path / 'pdf-run'
+    assert cached.collect(args, manifest, source=pdf_source) == 0
+    assert pdf_calls == ['p1'] and detail_calls == ['p1']
+    record = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert record['status'] == 'downloaded' and record['detail_status'] == 'verified'
+    assert (args.pdf_root / record['detail_root_relative']).is_file()
+
+
+def test_detail_only_http_403_stops_immediately(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(4)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    source = ScriptedSource()
+
+    def detail(row, _folder):
+        calls.append(row['cpid'])
+        events = [{'type': 'detail_started', 'operation_id': 'op', 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': 'op', 'response_status': 403}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        raise RuntimeError('HTTP 403')
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0']
+    assert 'HTTP 403' in progress(args)['stop_reason']
+
+
+def test_detail_only_validation_page_stops_immediately(tmp_path):
+    rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(2)]
+    args, manifest = setup(tmp_path, rows)
+    args.pdf_root = tmp_path
+    args.detail_only = True
+    args.no_images = True
+    source = ScriptedSource()
+    calls = []
+
+    def detail(row, folder):
+        calls.append(row['cpid'])
+        folder.mkdir(parents=True)
+        content = '<title>captcha</title>'.encode()
+        saved = folder / 'detail.html'
+        saved.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        blob = args.run_dir / 'http_blobs' / digest
+        blob.parent.mkdir(exist_ok=True)
+        blob.write_bytes(content)
+        events = [{'type': 'detail_started', 'operation_id': 'op', 'product_id': row['cpid'],
+                   'model_code': row['clxh'], 'batch': row['pc']},
+                  {'type': 'detail_http_attempt', 'operation_id': 'op', 'response_status': 200,
+                   'response_sha256': digest, 'response_blob': 'http_blobs/' + digest}]
+        with (args.run_dir / 'http_evidence.jsonl').open('a') as log:
+            for event in events:
+                log.write(json.dumps(event) + '\n')
+        return saved
+
+    source.detail = detail
+    assert cached.collect(args, manifest, source=source) == 130
+    assert calls == ['p0']
+    assert '访问验证页' in progress(args)['stop_reason']

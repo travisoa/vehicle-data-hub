@@ -244,11 +244,13 @@ def claim_run(run: CollectionRun, args: argparse.Namespace, manifest: dict[str, 
     selector = {"mode": "cached_product_manifest", "scope": manifest['scope'],
                 "manifest_sha256": sha256, "manifest": str(args.manifest.resolve()),
                 "expected_products": manifest["expected_products"], "run_dir": str(args.run_dir.resolve()),
-                "source_boundary": manifest.get("source_boundary")}
+                "source_boundary": manifest.get("source_boundary"),
+                "detail_only": bool(getattr(args, "detail_only", False))}
     return run.claim(
         selector, manifest["expected_models"], resume_run=args.resume_run,
         resume_matches=lambda old: (old.get("manifest_sha256") == sha256 and old.get("scope") == manifest['scope']
-                                    and old.get("mode") == "cached_product_manifest"),
+                                    and old.get("mode") == "cached_product_manifest"
+                                    and old.get("detail_only", False) == bool(getattr(args, "detail_only", False))),
         mismatch_message="恢复轮次不存在或 manifest SHA256/scope 不匹配",
     )
 
@@ -261,6 +263,33 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def detail_access_limit(log: Path, row: dict[str, Any]) -> str:
+    """Inspect this product's latest raw attempts for a global access restriction."""
+    if not log.is_file():
+        return ""
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    starts = [e for e in events if e.get("type") == "detail_started"
+              and e.get("product_id") == row["cpid"] and e.get("model_code") == row["clxh"]
+              and e.get("batch") == str(row.get("gppc") or row.get("pc"))]
+    if not starts:
+        return ""
+    operation = starts[-1]["operation_id"]
+    for event in events:
+        if event.get("type") != "detail_http_attempt" or event.get("operation_id") != operation:
+            continue
+        if event.get("response_status") in (403, 429):
+            return f"HTTP {event['response_status']}"
+        blob = event.get("response_blob")
+        if blob:
+            path = (log.parent / blob).resolve()
+            if not path.is_relative_to(log.parent.resolve()):
+                raise ValueError("详情响应证据路径越界")
+            content = path.read_bytes().lower()
+            if "访问行为验证".encode() in content or b"<title>captcha" in content:
+                return "访问验证页"
+    return ""
 
 
 def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag | None = None, *,
@@ -297,7 +326,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 return {"run_id": run_id, "pid": os.getpid(), "status": state, "updated_at": seed.utc_now(),
                         "manifest_sha256": args.manifest_sha256.lower(), "selected": manifest["expected_products"],
                         "selected_models": len(grouped), "processed": processed, "remaining": remaining,
-                        "successful": counters["downloaded"] + counters["skipped_existing"],
+                        "successful": (counters["detail_verified_pdf_pending"] if getattr(args, "detail_only", False)
+                                       else counters["downloaded"] + counters["skipped_existing"]),
                         "results": dict(counters), "accepted_pdf_bytes": pdf_bytes,
                         "downloaded_bytes": downloaded_bytes,
                         "attempted_downloads": attempts, "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -322,6 +352,58 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                 break
                             item_started = time.monotonic()
                             batch = str(row.get("gppc") or row.get("pc"))
+                            if getattr(args, "detail_only", False):
+                                from miit_gonggao.detail_cache import find_detail, remember_detail
+                                from miit_gonggao.images import validate_detail_identity
+
+                                detail_status, detail_path, detail_error = "verified", "", ""
+                                cached_detail = find_detail(conn, row, root=args.pdf_root)
+                                try:
+                                    if cached_detail is None:
+                                        folder = args.run_dir / "details" / seed.safe_part(row["cpid"]) / uuid.uuid4().hex
+                                        saved = source.detail(row, folder)
+                                        validate_detail_identity(saved.read_bytes(), row)
+                                        log = args.run_dir / "http_evidence.jsonl"
+                                        events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                                        starts = [e for e in events if e.get("type") == "detail_started"
+                                                  and e.get("product_id") == row["cpid"]
+                                                  and e.get("model_code") == model and e.get("batch") == batch]
+                                        if not starts:
+                                            raise ValueError("缺少详情请求证据")
+                                        remember_detail(conn, row, saved, log, starts[-1]["operation_id"], root=args.pdf_root)
+                                        conn.commit()
+                                    else:
+                                        saved = cached_detail
+                                    detail_path = str(saved.resolve().relative_to(args.pdf_root.resolve()))
+                                    consecutive_failures = 0
+                                    status = "detail_verified_pdf_pending"
+                                except Exception as exc:
+                                    conn.rollback()
+                                    detail_status = "failed"
+                                    detail_error = f"{type(exc).__name__}: {exc}"
+                                    status = "detail_failed"
+                                    errors.append(f"{row['cpid']} 详情页: {detail_error}")
+                                    pace.slow_down("detail_failed")
+                                    consecutive_failures += 1
+                                    restriction = detail_access_limit(args.run_dir / "http_evidence.jsonl", row)
+                                    if restriction:
+                                        stop.reason = f"站点访问限制：{restriction}"
+                                    elif consecutive_failures >= 3:
+                                        stop.reason = "连续 3 次详情失败，停止本次采集"
+                                processed += 1
+                                model_processed += 1
+                                counters[status] += 1
+                                record = {"run_id": run_id, "pid": os.getpid(), "at": seed.utc_now(),
+                                          "cpid": row["cpid"], "model_code": model, "batch": batch,
+                                          "status": status, "detail_status": detail_status,
+                                          "detail_root_relative": detail_path, "detail_error": detail_error,
+                                          "attempted_detail": cached_detail is None,
+                                          "elapsed_seconds": round(time.monotonic() - item_started, 3)}
+                                results.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                results.flush()
+                                os.fsync(results.fileno())
+                                atomic_json(progress_path, progress("running"))
+                                continue
                             cached = local_document(conn, row["cpid"], args.pdf_root, batch=batch, model=model)
                             image_retried = bool(cached and cached[0] == "image_failed"
                                                  and retry_document_images(conn, row["cpid"], args.pdf_root))
@@ -372,14 +454,21 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                       f"{row['cpid']} {status}: {message}",
                                       file=sys.stderr, flush=True)
                             detail_status, detail_path, detail_error = "not_requested", "", ""
+                            detail_root_relative = ""
                             if getattr(args, "detail_html", False) and not stop.reason:
                                 try:
                                     from miit_gonggao.images import validate_detail_identity
 
-                                    folder = args.run_dir / "details" / seed.safe_part(row["cpid"]) / uuid.uuid4().hex
-                                    saved = source.detail(row, folder)
-                                    validate_detail_identity(saved.read_bytes(), row)
-                                    detail_path = str(saved.relative_to(args.run_dir))
+                                    from miit_gonggao.detail_cache import find_detail
+
+                                    cached_detail = find_detail(conn, row, root=args.pdf_root)
+                                    if cached_detail is not None:
+                                        detail_root_relative = str(cached_detail.relative_to(args.pdf_root.resolve()))
+                                    else:
+                                        folder = args.run_dir / "details" / seed.safe_part(row["cpid"]) / uuid.uuid4().hex
+                                        saved = source.detail(row, folder)
+                                        validate_detail_identity(saved.read_bytes(), row)
+                                        detail_path = str(saved.relative_to(args.run_dir))
                                     detail_status = "verified"
                                 except Exception as exc:
                                     detail_status = "failed"
@@ -397,7 +486,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                                       "status": status, "error": message, "bytes": byte_count,
                                       "image_failed": image_failed, "image_retried": image_retried,
                                       "detail_status": detail_status, "detail_path": detail_path,
-                                      "detail_error": detail_error,
+                                      "detail_root_relative": detail_root_relative, "detail_error": detail_error,
                                       "attempted_download": attempted, "elapsed_seconds": round(elapsed, 3),
                                       "source_generation_error": source_error}
                             results.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -407,7 +496,7 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                             if processed % 50 == 0:
                                 print(json.dumps(progress("running"), ensure_ascii=False), flush=True)
                         if model_processed == len(rows):
-                            run.finish_model(vid, "partial" if errors else "done", "; ".join(errors))
+                            run.finish_model(vid, "partial" if errors or getattr(args, "detail_only", False) else "done", "; ".join(errors))
             except (KeyboardInterrupt, InterruptedError) as exc:
                 conn.rollback()
                 stop.reason = stop.reason or f"进程中断：{type(exc).__name__}"
@@ -417,7 +506,8 @@ def collect(args: argparse.Namespace, manifest: dict[str, Any], stop: StopFlag |
                 print(stop.reason, file=sys.stderr, flush=True)
             finally:
                 run.finish(stop.reason)
-                all_successful = (sum(counters[key] for key in SUCCESS) == manifest["expected_products"]
+                all_successful = ((counters["detail_verified_pdf_pending"] if getattr(args, "detail_only", False)
+                                   else sum(counters[key] for key in SUCCESS)) == manifest["expected_products"]
                                   and not counters["image_failed"] and not counters["detail_failed"])
                 state = "interrupted" if stop.reason else "complete" if all_successful else "partial"
                 atomic_json(progress_path, progress(state))
@@ -446,8 +536,11 @@ def main(argv: list[str] | None = None, *, source: AnnouncementSource = OFFICIAL
     parser.add_argument("--no-images", action="store_true", help="只下载 PDF，不获取或重试详情页原图")
     parser.add_argument("--http-evidence", action="store_true", help="在轮次目录保存逐次下载请求和原始响应")
     parser.add_argument("--detail-html", action="store_true", help="保存并核验同产品正式详情 HTML（需 --http-evidence）")
+    parser.add_argument("--detail-only", action="store_true", help="只采详情，保留证据，PDF 待补")
     args = parser.parse_args(argv)
     try:
+        if args.detail_only and (not args.http_evidence or not args.no_images):
+            raise ValueError("--detail-only 需要 --http-evidence 和 --no-images")
         if args.detail_html and not args.http_evidence:
             raise ValueError("--detail-html 需要 --http-evidence 保存原始请求证据")
         manifest = load_manifest(args.manifest, args.manifest_sha256, catalog_db=args.catalog_db)
