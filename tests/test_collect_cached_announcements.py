@@ -805,6 +805,40 @@ def test_detail_only_pdf_backfill_reuses_detail_evidence(tmp_path):
     assert record['status'] == 'pdf_and_detail_verified'
 
 
+def test_detail_cache_survives_backup_restore_and_rejects_tampering(tmp_path):
+    import shutil
+
+    args, manifest = setup(tmp_path)
+    original = tmp_path / 'original'
+    original.mkdir()
+    args.pdf_root = original
+    args.site_db = original / 'site.sqlite'
+    args.run_dir = original / 'runs' / 'first'
+    args.detail_only = True
+    args.no_images = True
+    calls = []
+    assert cached.collect(args, manifest, source=_detail_only_source(args, calls)) == 0
+    restored = tmp_path / 'restored'
+    shutil.copytree(original, restored, ignore=shutil.ignore_patterns('site.sqlite*'))
+    with sqlite3.connect(args.site_db) as source_db, sqlite3.connect(restored / 'site.sqlite') as target_db:
+        source_db.backup(target_db)
+        assert target_db.execute('pragma integrity_check').fetchone() == ('ok',)
+    args.pdf_root = restored
+    args.site_db = restored / 'site.sqlite'
+    args.run_dir = restored / 'runs' / 'after-restore'
+    no_network = ScriptedSource()
+    no_network.detail = lambda *_: pytest.fail('恢复后不得重复请求已验证详情')
+    assert cached.collect(args, manifest, source=no_network) == 0
+    result = json.loads((args.run_dir / 'results.jsonl').read_text().strip())
+    assert result['status'] == 'detail_verified_pdf_pending' and not result['attempted_detail']
+    from miit_gonggao.detail_cache import find_detail
+
+    with sqlite3.connect(args.site_db) as conn:
+        assert find_detail(conn, manifest['products'][0], root=restored)
+        conn.execute("update verified_detail_cache set html_path='../outside.html'")
+        assert find_detail(conn, manifest['products'][0], root=restored) is None
+
+
 def test_detail_only_http_403_stops_immediately(tmp_path):
     rows = [product(f'p{i}', model=f'ABC650{i}EV') for i in range(4)]
     args, manifest = setup(tmp_path, rows)
