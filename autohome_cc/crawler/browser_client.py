@@ -45,14 +45,14 @@ class BrowserAutohomeClient:
     ) -> None:
         self.logger = logger
         self.user_data_dir = Path(user_data_dir).expanduser()
-        self.channel = channel.strip()
+        # 默认用本机 Google Chrome（随系统自动更新），不用 Playwright 自带、只随 Playwright 发版更新的 Chromium。
+        self.channel = channel.strip() or "chrome"
         self.timeout_ms = timeout_ms
         self.headless = headless
 
         if importlib.util.find_spec("playwright.sync_api") is None:
             raise BrowserUnavailableError(
-                "未安装 playwright。请先执行 `pip install playwright`，再执行 "
-                "`python3 -m playwright install chromium`。"
+                "未安装 playwright。请先执行 `pip install -r requirements-browser.txt`。"
             )
 
     def interactive_login(self) -> dict[str, str]:
@@ -166,15 +166,17 @@ class BrowserAutohomeClient:
         launch_kwargs = {
             "user_data_dir": str(self.user_data_dir),
             "headless": headless,
+            "channel": self.channel,
+            # Playwright 默认不开 Chromium 沙箱（会加 --no-sandbox），访问公开网站必须显式开启。
+            "chromium_sandbox": True,
         }
-        if self.channel:
-            launch_kwargs["channel"] = self.channel
         try:
             return playwright.chromium.launch_persistent_context(**launch_kwargs)
         except Exception as exc:  # noqa: BLE001
             raise BrowserUnavailableError(
-                "无法启动 Playwright 浏览器。请确认已执行 "
-                "`python3 -m playwright install chromium`，或传入可用的浏览器 channel。"
+                f"无法启动 Playwright 浏览器（channel={self.channel}）。默认使用本机 Google Chrome，"
+                "请确认已安装；如需 Playwright 自带 Chromium，传 `--browser-channel chromium` 并先执行 "
+                "`python3 -m playwright install chromium`。"
             ) from exc
 
     def _goto(self, page, url: str) -> None:

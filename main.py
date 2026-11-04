@@ -74,7 +74,7 @@ def build_fetch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-login", action="store_true", help="抓取前先打开浏览器扫码登录 Autohome")
     parser.add_argument("--browser-fallback", action="store_true", help="requests 失败时启用浏览器兜底")
     parser.add_argument("--browser-profile-dir", help="浏览器登录态目录，默认 .browser/autohome")
-    parser.add_argument("--browser-channel", help="Playwright channel，例如 chrome 或 msedge")
+    parser.add_argument("--browser-channel", help="Playwright 浏览器 channel，默认 chrome（本机 Google Chrome，随系统自动更新）；也可 msedge，或 chromium（Playwright 自带，需先 playwright install chromium）")
     parser.add_argument("--autohome-output-dir", help="汽车之家 Excel 输出目录，默认 output/")
     parser.add_argument("--gonggao-output-dir", help="工信部公告下载根目录，默认 downloads/announcement_site/")
     return parser

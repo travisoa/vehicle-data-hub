@@ -17,9 +17,8 @@ echo "[bootstrap] installing base requirements"
 .venv/bin/python -m pip install -r requirements.txt
 
 if [[ "${INSTALL_PLAYWRIGHT:-0}" == "1" ]]; then
-  echo "[bootstrap] installing browser requirements + Playwright Chromium"
+  echo "[bootstrap] installing browser requirements（浏览器默认用本机 Google Chrome，不下载 Playwright 自带 Chromium）"
   .venv/bin/python -m pip install -r requirements-browser.txt
-  .venv/bin/python -m playwright install chromium
 else
   echo "[bootstrap] skip browser install (set INSTALL_PLAYWRIGHT=1 to enable)"
 fi

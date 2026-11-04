@@ -233,7 +233,7 @@ Website 独占写入其派生站点库、前后端、站点构建/部署产物�
 
 命中权限/验证页时，直接告知用户并给出选项，不要静默重试：
 
-1. `--browser-login`：调起浏览器扫码登录（需先 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 装 Chromium），登录态在 `.browser/autohome`
+1. `--browser-login`：调起浏览器扫码登录（需先 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 装 Playwright，浏览器用本机 Google Chrome），登录态在 `.browser/autohome`
 2. `--cookie-file ./cookies.txt`：用户导出 cookies（header 或 Netscape 格式均可；Netscape 的 `#HttpOnly_` 行会按 cookie 解析）
 3. `--browser-fallback`：requests 失败时浏览器渲染兜底
 

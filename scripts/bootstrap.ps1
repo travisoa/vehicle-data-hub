@@ -21,9 +21,8 @@ Write-Host "[bootstrap] installing base requirements"
 & $VenvPython -m pip install -r requirements.txt
 
 if ($env:INSTALL_PLAYWRIGHT -eq "1") {
-    Write-Host "[bootstrap] installing browser requirements + Playwright Chromium"
+    Write-Host "[bootstrap] installing browser requirements（浏览器默认用本机 Google Chrome，不下载 Playwright 自带 Chromium）"
     & $VenvPython -m pip install -r requirements-browser.txt
-    & $VenvPython -m playwright install chromium
 } else {
     Write-Host "[bootstrap] skip browser install (set INSTALL_PLAYWRIGHT=1 to enable)"
 }

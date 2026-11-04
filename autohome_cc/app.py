@@ -415,7 +415,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-fallback", action="store_true", help="requests/search API 失败时，允许调用浏览器渲染页面抓取")
     parser.add_argument("--browser-login", action="store_true", help="抓取前先打开浏览器进行扫码登录，并复用登录态")
     parser.add_argument("--browser-profile-dir", help="浏览器登录态目录，默认 .browser/autohome")
-    parser.add_argument("--browser-channel", help="Playwright 浏览器 channel，例如 chrome 或 msedge")
+    parser.add_argument("--browser-channel", help="Playwright 浏览器 channel，默认 chrome（本机 Google Chrome，随系统自动更新）；也可 msedge，或 chromium（Playwright 自带，需先 playwright install chromium）")
     parser.add_argument("--output-dir", help="Excel 输出目录，默认 output/")
     return parser
 

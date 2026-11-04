@@ -266,7 +266,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 | 依赖层 | 内容 | 适用场景 |
 | --- | --- | --- |
 | `requirements.txt` | requests / bs4 / openpyxl / pdfplumber 等 | 默认安装 |
-| `requirements-browser.txt` | Playwright（含 Chromium） | 仅 `--browser-login` / `--browser-fallback` 需要，通过 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 |
+| `requirements-browser.txt` | Playwright（驱动本机 Google Chrome，并开启 Chromium 沙箱） | 仅 `--browser-login` / `--browser-fallback` 需要，通过 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 |
 | `requirements-dev.txt` | pytest / ruff | 开发与测试，通过 `INSTALL_DEV=1 ./scripts/bootstrap.sh` 安装 |
 
 目录同步需要 LibreOffice：macOS `brew install --cask libreoffice`、Windows `winget install TheDocumentFoundation.LibreOffice`、Linux 用发行版包管理器。
@@ -858,7 +858,7 @@ cp data/vehicle_profiles.example.json data/vehicle_profiles.json
 
 Autohome 返回权限或验证页时，有三种处理方式：
 
-1. `--browser-login`：调起浏览器扫码登录（需先执行 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 Chromium），登录态保存至 `.browser/autohome`
+1. `--browser-login`：调起浏览器扫码登录（需先执行 `INSTALL_PLAYWRIGHT=1 ./scripts/bootstrap.sh` 安装 Playwright，浏览器用本机 Google Chrome），登录态保存至 `.browser/autohome`
 2. `--cookie-file ./cookies.txt`：导入浏览器导出的 cookies（支持 header 与 Netscape 两种格式；Netscape 的 `#HttpOnly_` 行会按 cookie 解析）
 3. `--browser-fallback`：requests 请求失败时由浏览器渲染页面兜底
 
