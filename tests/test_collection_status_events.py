@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -55,8 +55,15 @@ def data(tmp_path, monkeypatch):
         def now(cls, tz=None):
             return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
 
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return now.date()
+
     monkeypatch.setattr(status, '_now', lambda: now)
     monkeypatch.setattr(inventory, 'datetime', FixedDateTime)
+    # 跟踪的 60 天窗口和重查日期按 date.today() 算；与统计同处夹具时间，命令行入口才不随真实日期过期。
+    monkeypatch.setattr(tracking, 'date', FixedDate)
     monkeypatch.setattr(collection, 'UPSTREAM_ROOT', data.pdf_root)
     monkeypatch.setattr(gap, 'CACHE_DIR', data.cache)
 
@@ -174,8 +181,6 @@ def test_legacy_notice_events_never_enter_the_retry_plan(data):
 
 def test_tracking_batch_filter_isolates_plan_and_collect(data, monkeypatch, capsys):
     """单批采集不查询另一批，也不更新另一批已找到 PDF 的事件。"""
-    from datetime import date
-
     url = 'https://www.miit.gov.cn/example.html'
     data.announcement(product('already', model='TEST4101BEV', batch=410))
     with sqlite3.connect(data.db) as conn:
