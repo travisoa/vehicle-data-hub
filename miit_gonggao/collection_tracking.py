@@ -27,6 +27,11 @@ else:
 DAYS = 60
 BATCHES = 2
 KINDS = {'formal'}  # 公示不作为入口，事件只接受正式发布
+# 购置税目录「新车型」会滞后收录公告早已发布的型号（TZ5030TSYHEV 公告第408批，却在随第410批
+# 合刊的购置税目录第34批）。目录事件按合刊批次查无、官方正式公告只在其他批次时记为此终态：
+# 本批次没有这一版，不再重试，也不在网站上占位。官方接口每个产品只返回最近一次发布的批次，
+# 早批次发布、后来重新发布的型号只能查到更晚那批，所以「其他批次」不限于更早。
+CATALOG_LAG = 'catalog_lag'
 # 工信部公告里汽车、摩托车、挂车、三轮汽车、低速汽车是彼此独立的产品序列，各有各的
 # 型号编制规则。本站只做汽车四频道（范围见 Website/docs/collection-boundary.md），其余序列
 # 不登记、不采集、不入库。判定必须看产品名称：摩托车型号同样是「字母+数字」结构，
@@ -129,6 +134,12 @@ def in_window(event: dict, latest_batch: int, *, today: date | None = None) -> b
     return latest_batch - BATCHES + 1 <= event['batch'] <= latest_batch
 
 
+def event_identity(model_code: str, batch: int, kind: str, product_id: str = '') -> str:
+    """事件 ID；来源 URL 不参与身份，文章路径变化也不会反复重置同批同型号的完成记录。"""
+    key = json.dumps([model_code.strip().upper(), batch, kind, product_id], ensure_ascii=False)
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
 def register_event(conn: sqlite3.Connection, *, model_code: str, batch: int, kind: str,
                    source_url: str, product_id: str = '', title: str = '', event_date: str = '',
                    metadata: dict | None = None) -> str:
@@ -139,9 +150,7 @@ def register_event(conn: sqlite3.Connection, *, model_code: str, batch: int, kin
                for suffix in ('miit.gov.cn', 'miit-eidc.org.cn')):
         raise ValueError('公告事件必须使用官方来源 URL')
     model_code = model_code.strip().upper()
-    # 来源 URL 不参与身份，文章路径变化也不会反复重置同批同型号的完成记录。
-    key = json.dumps([model_code, batch, kind, product_id], ensure_ascii=False)
-    event_id = hashlib.sha256(key.encode()).hexdigest()[:24]
+    event_id = event_identity(model_code, batch, kind, product_id)
     conn.execute(
         'insert into tracking_events (event_id,model_code,batch,kind,product_id,source_url,title,'
         'event_date,first_seen_at,metadata_json) values (?,?,?,?,?,?,?,?,?,?) '
@@ -207,6 +216,53 @@ def register_catalog(conn: sqlite3.Connection, catalog_db: Path, latest_batch: i
                            title=title, event_date=day.isoformat(), metadata=metadata)
             count += 1
     return count
+
+
+def catalog_lag_batches(conn: sqlite3.Connection, source: AnnouncementSource,
+                        model: str, batch: int) -> list[int]:
+    """目录事件按合刊批次查无时，核对官方正式公告是否只在其他批次；返回那些批次。
+
+    只在业务库已有该型号其他批次的正式公告、且没有本批次时多查一次（不带批次），
+    官方结果同样只在其他批次才算目录滞后；口径不一致或官方也查无时返回空，不下结论。
+    """
+    local = {int(value) for (value,) in conn.execute(
+        'select b.batch from announcements a join batches b on b.id=a.batch_id '
+        'where upper(a.model_code)=?', (model,)) if str(value).isdigit()}
+    if not local or batch in local:
+        return []
+    found = {str(r.get('gppc') or r.get('pc') or '') for r in source.query(model)
+             if str(r.get('clxh') or '').strip().upper() == model}
+    official = {int(value) for value in found if value.isdigit()}
+    if batch in official:
+        return []
+    return sorted(official)
+
+
+PRODUCT_BATCH_SQL = ('select a.source_product_id,b.batch from announcements a '
+                     'join batches b on b.id=a.batch_id')
+
+
+def product_batches(conn: sqlite3.Connection) -> dict[str, int]:
+    """业务库里每个产品 ID 当前所在的正式批次（入库只前进，记最近一次发布的批次）。"""
+    return {str(pid): int(value) for pid, value in conn.execute(PRODUCT_BATCH_SQL)
+            if str(value).isdigit()}
+
+
+def stored_batch(conn: sqlite3.Connection, product_id: str) -> int | None:
+    """单个产品 ID 当前入库的正式批次；同一轮里先入库的较新发布也算。"""
+    row = conn.execute(PRODUCT_BATCH_SQL + ' where a.source_product_id=?', (product_id,)).fetchone()
+    return int(row[1]) if row and str(row[1]).isdigit() else None
+
+
+def superseded_batch(event: dict, products: dict[str, int]) -> int | None:
+    """带产品 ID 的事件：同一产品已按更高正式批次入库时返回那一批。
+
+    不带批次查询时，官方接口每个产品只返回最近一次发布的批次；按批次查询仍查得到早批次那次发布。
+    第408批清单里登记的产品后来在第410批重新发布、并以第410批入库，第408批那次发布就被取代了，
+    不再查询，也不在网站上另占一行。同一轮里两批都待取时由 collect 在写入前再核对一次。
+    """
+    newer = products.get(event['product_id']) if event['product_id'] else None
+    return newer if newer is not None and newer > event['batch'] else None
 
 
 def matching_documents(conn: sqlite3.Connection, event: dict) -> list[tuple]:
@@ -309,10 +365,11 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
                 raise ValueError(f'事件不是正式公告: {event_id}')
             if batch is not None and event['batch'] != batch:
                 raise ValueError(f'事件批次与 --batch 不符: {event_id} / {event["batch"]}')
-    pending, dormant, resolved, deferred, remaining = [], [], [], [], []
-    excluded, scope_review, legacy_notice = [], [], []
+    pending, dormant, resolved, deferred, remaining, catalog_lag = [], [], [], [], [], []
+    excluded, scope_review, legacy_notice, superseded = [], [], [], []
     groups: set[tuple] = set()
     evidence = scope_evidence(conn)
+    products = product_batches(conn)
     for event in sorted(all_events, key=lambda e: (e['last_checked_at'] or '', e['event_id'])):
         if selected_ids is not None and event['event_id'] not in selected_ids:
             continue
@@ -326,6 +383,12 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
         scope = event_scope(event, evidence)
         if scope['inclusion_gate'] != 'accepted':
             (excluded if scope['inclusion_gate'] == 'excluded' else scope_review).append(event['event_id'])
+            continue
+        if event['status'] == CATALOG_LAG:
+            catalog_lag.append(event['event_id'])  # 终态：本批次没有这一版，不再查询
+            continue
+        if superseded_batch(event, products) is not None:
+            superseded.append(event['event_id'])  # 同一产品已按更高批次入库，本批次发布已被取代
             continue
         if not in_window(event, maximum, today=today):
             if event['status'] != 'done':
@@ -348,7 +411,8 @@ def retry_plan(conn: sqlite3.Connection, pdf_root: Path, *, today: date | None =
                       'nev_only': nev_only,
                       'days': DAYS, 'batches': BATCHES,
                       'pending': pending, 'dormant': dormant, 'resolved': resolved,
-                      'deferred': deferred, 'remaining': remaining,
+                      'deferred': deferred, 'remaining': remaining, 'catalog_lag': catalog_lag,
+                      'superseded': superseded,
                       'excluded': excluded, 'scope_review': scope_review,
                       'legacy_notice': legacy_notice,
                       'query_groups': len(groups)}, conn, evidence, data_version)
@@ -453,6 +517,13 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             needed = {e['product_id'] for e in group if e['product_id']}
             if rows and all(e['product_id'] for e in group):
                 rows = [r for r in rows if str(r.get('cpid')) in needed]
+            lagged, lag_error = [], ''
+            if status != 'query_failed' and not rows and not all(e['product_id'] for e in group):
+                try:
+                    lagged = catalog_lag_batches(conn, source, model, batch)
+                except Exception as exc:
+                    # 核对失败不能断言滞后；本批次查询本身成功，仍按查无七天后重查。
+                    lag_error = f'目录滞后核对查询失败: {exc}'
             # 产品 ID -> (PDF 是否可用, 说明, 图片是否异常, 单产品结局)
             results: dict[str, tuple[bool, str, bool, str]] = {}
             for row in rows:
@@ -480,6 +551,13 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                             f'{name or "缺少产品名称 clmc"} ({exc})', False, 'out_of_scope',
                         )
                         continue
+                current = stored_batch(conn, str(row['cpid']))
+                if current is not None and current > batch:
+                    # 计划之后同一轮先处理了这个产品的较新发布：早批次那次发布不回写、不再下载。
+                    run.record_product('skipped_existing', live=False)
+                    results[str(row['cpid'])] = (
+                        True, f'同一产品已按第{current}批入库，第{batch}批发布已被取代', False, 'superseded')
+                    continue
                 probe = {**group[0], 'product_id': str(row['cpid'])}
                 if has_valid_documents(conn, probe, pdf_root):
                     image_error = document_image_error(conn, probe, pdf_root)
@@ -499,8 +577,15 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                     selected = list(results.values())
                 event_status, event_error = status, error
                 if status != 'query_failed':
-                    if not selected:
+                    event_error = '; '.join(msg for _, msg, _, _ in selected if msg)
+                    if not selected and lagged and not event['product_id']:
+                        event_status = CATALOG_LAG
+                        event_error = (f'购置税目录随第{batch}批合刊收录，官方正式公告在第'
+                                       + '、'.join(str(value) for value in lagged) + '批')
+                    elif not selected:
                         event_status = 'no_match'
+                        if not event['product_id']:
+                            event_error = lag_error
                     elif all(ok and not image_failed for ok, _, image_failed, _ in selected):
                         event_status = 'done'
                     elif any(not ok for ok, _, _, _ in selected) and all(
@@ -508,7 +593,6 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
                         event_status = 'no_document'
                     else:
                         event_status = 'partial'
-                    event_error = '; '.join(msg for _, msg, _, _ in selected if msg)
                 conn.execute(
                     'update tracking_events set status=?,last_checked_at=?,next_check_at=?, '
                     'attempts=attempts+1,last_error=? where event_id=?',
@@ -520,7 +604,8 @@ def collect(conn: sqlite3.Connection, plan: dict, *, catalog_db: Path, pdf_root:
             event_outcomes = conn.execute(
                 'select t.status,t.error from tracking_attempts t join tracking_events e using(event_id) '
                 'where t.run_id=? and e.model_code=?', [run_id, model]).fetchall()
-            event_states = [row[0] for row in event_outcomes]
+            # 目录滞后说明的是别的批次，不是本批次产品的结局；只剩它时如实记为本批次查无。
+            event_states = [row[0] for row in event_outcomes if row[0] != CATALOG_LAG] or ['no_match']
             model_error = '; '.join(dict.fromkeys(row[1] for row in event_outcomes if row[1]))
             model_status = ('query_failed' if 'query_failed' in event_states else 'done'
                             if all(s == 'done' for s in event_states) else 'awaiting_effective'

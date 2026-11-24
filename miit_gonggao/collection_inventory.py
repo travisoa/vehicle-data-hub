@@ -403,6 +403,7 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
 
     # ---------------------------------------------------------------- 逐事件跟踪
     event_scopes = {ev['event_id']: T.event_scope(ev, evidence) for ev in events}
+    product_batch = {pid: item['batch'] for pid, item in ann.items() if item['batch'] is not None}
     cache_model_batches = {pair for entry in products.values() for pair in entry['model_batches']}
     ev_by_pid: dict[str, list[dict]] = defaultdict(list)
     tracking: Counter = Counter()
@@ -416,6 +417,10 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         valid = bool(matched) and all(a['state'] in VALID_PDF_STATES for a in matched)
         if scope['inclusion_gate'] != 'accepted':
             bucket = scope['inclusion_gate']
+        elif ev['status'] == T.CATALOG_LAG:
+            bucket = 'catalog_lag'
+        elif T.superseded_batch(ev, product_batch) is not None:
+            bucket = 'superseded'
         elif not T.in_window(ev, latest_batch, today=today):
             bucket = 'out_of_window_done' if ev['status'] == 'done' else 'dormant'
         elif valid:
@@ -431,7 +436,8 @@ def compute_inventory(db_path: Path, catalog_db: Path, cache_dir: Path, pdf_root
         else:
             listed = 'in_official_batch_list' if key in cache_model_batches else 'not_in_official_batch_list'
             model_only_events[(bucket, listed)] += 1
-        if scope['inclusion_gate'] == 'accepted' and ev['status'] != 'done':
+        if scope['inclusion_gate'] == 'accepted' and bucket not in {'catalog_lag', 'superseded'} \
+                and ev['status'] != 'done':
             event_day = T.parse_date(ev['event_date'] or '')
             basis = event_day or T.parse_date(ev['first_seen_at'] or '')
             until = (basis + timedelta(days=T.DAYS)).isoformat() if basis else 'unknown'
